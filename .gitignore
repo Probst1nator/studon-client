@@ -1,0 +1,28 @@
+# ===== Claude Code / AI Assistants =====
+.claude/
+.gemini-cli/
+.cli-agent/
+CLAUDE.md
+
+# ===== KDE/Dolphin =====
+.directory
+
+# ===== Environment Configuration =====
+.env
+
+# ===== StudOn Scraper Generated Content =====
+studon_downloads/
+RECENT_UPDATES.md
+.studon_updater_state.json
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.pyc
+venv/
+.venv
+env/
+ENV/
+
+# ===== Logs =====
+*.log
