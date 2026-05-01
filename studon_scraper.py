@@ -1,6 +1,8 @@
 import os
 import re
 import sys
+import json
+import email.utils
 import shutil
 import subprocess
 import time
@@ -26,13 +28,27 @@ try:
 except ImportError:
     py7zr = None
 
+try:
+    import questionary
+except ImportError:
+    questionary = None
+
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
+import imaplib
+import email as email_mod
+from email.header import decode_header
+import getpass
+
 # --- LOGGING SETUP ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('studon_sync.log', encoding='utf-8'),
-        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -304,9 +320,29 @@ class UpdateState:
     last_success: bool = False
 
 # --- CONFIGURATION ---
-DOWNLOAD_FOLDER = "studon_downloads"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(_SCRIPT_DIR, "config.json")
+
+def load_config() -> dict:
+    """Load persistent config from config.json next to the script."""
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+def save_config(config: dict) -> None:
+    """Write config dict to config.json next to the script."""
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+        f.write("\n")
+
+_config = load_config()
+DOWNLOAD_FOLDER = str(Path(_config.get("downloads_path", "studon_downloads")).expanduser())
 STUDON_DOMAIN = 'studon.fau.de'
-CONFIRMATION_THRESHOLD = int(os.getenv("CONFIRMATION_THRESHOLD", "50"))  # Ask for confirmation if more than this many files are found
+CAMPO_TIMETABLE_URL = 'https://www.campo.fau.de/qisserver/pages/plan/individualTimetable.xhtml?_flowId=individualTimetableSchedule-flow'
 RECENT_UPDATES_FILE = os.path.join(DOWNLOAD_FOLDER, "RECENT_UPDATES.md")
 
 # --- PLATFORM DETECTION ---
@@ -384,10 +420,8 @@ def find_all_metadata_files(base_folder: str) -> List[Tuple[str, str, str]]:
                         source_url = match.group(1).strip()
                         course_folder = root
                         metadata_files.append((metadata_path, source_url, course_folder))
-                        print(f"   Found: {metadata_path}")
-                        print(f"      Source: {source_url}")
             except Exception as e:
-                print(f"   ⚠️ Could not read {metadata_path}: {e}")
+                logger.warning(f"Could not read {metadata_path}: {e}")
 
     return metadata_files
 
@@ -597,6 +631,28 @@ def format_file_size(size_bytes: int) -> str:
         size_bytes /= 1024.0
     return f"{size_bytes:.1f} TB"
 
+def _check_remote_modified(session: requests.Session, file_url: str, last_fetched: datetime, local_path: str) -> bool:
+    """
+    Returns True if the remote file is newer than last_fetched.
+    Conservative: returns False on any error or when the server gives ambiguous info.
+    Never overwrites local files — caller saves remote version as .new.
+    """
+    try:
+        lf_http = email.utils.formatdate(last_fetched.timestamp(), usegmt=True)
+        head = session.head(file_url, headers={'If-Modified-Since': lf_http},
+                            timeout=10, allow_redirects=True)
+        if head.status_code == 304:
+            return False
+        if head.status_code == 200:
+            remote_size = head.headers.get('Content-Length')
+            if remote_size:
+                local_size = os.path.getsize(local_path)
+                return int(remote_size) != local_size
+        return False
+    except Exception:
+        return False
+
+
 def update_recent_files_log(downloaded_files_info: List[FileRecord], base_download_path: str) -> None:
     """
     Updates the RECENT_UPDATES.md file with newly downloaded files.
@@ -768,13 +824,17 @@ def update_course_metadata(metadata_path: str, course_title: Optional[str], sour
 
 # --- CORE LOGIC ---
 
-def discover_items_recursive(page_url: str, current_path: str, session: requests.Session, file_list: List[Dict[str, str]], course_title: Optional[str] = None, debug: bool = False) -> None:
+def discover_items_recursive(page_url: str, current_path: str, session: requests.Session, file_list: List[Dict[str, str]], course_title: Optional[str] = None, debug: bool = False, _visited: Optional[set] = None) -> None:
     """
     Recursively scans StudOn pages, identifying files and folders.
-    It populates the `file_list` with all files it finds.
-    course_title is stored in file_info for later use in metadata.
+    Supports classic ILIAS (il_ContainerListItem) and ILIAS 7+ (il-std-item, goto.php).
     """
-    print(f"🔎 Scanning: {current_path}")
+    if _visited is None:
+        _visited = set()
+    if page_url in _visited:
+        return
+    _visited.add(page_url)
+
     try:
         response = session.get(page_url)
         response.raise_for_status()
@@ -783,93 +843,129 @@ def discover_items_recursive(page_url: str, current_path: str, session: requests
         print(f"   ❌ Could not access {page_url}. Error: {e}. Skipping.")
         return
 
-    # Try multiple strategies to find items
-    items = soup.find_all('div', class_='il_ContainerListItem')
+    # Detect redirect to ILIAS login page — session expired or not logged in
+    if 'ilstartupgui' in response.url or '/login.php' in response.url:
+        raise StudOnError("Session expired — redirected to login page.", "Log into StudOn in Firefox and retry.")
 
-    if debug or not items:
-        print(f"   [DEBUG] Found {len(items)} items with class 'il_ContainerListItem'")
-        # Try alternative selectors
-        alt_items = soup.find_all('div', class_=re.compile(r'il.*ListItem'))
-        print(f"   [DEBUG] Found {len(alt_items)} items matching 'il.*ListItem' pattern")
-
-        # Look for any links that might be files
+    if debug:
+        debug_file = os.path.join(DOWNLOAD_FOLDER, f"debug_discovery_{abs(hash(page_url)) % 10000}.html")
+        os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+        with open(debug_file, 'w', encoding='utf-8') as f:
+            f.write(response.text)
         all_links = soup.find_all('a', href=True)
-        file_links = [link for link in all_links if 'cmd=sendfile' in link.get('href', '')]
-        print(f"   [DEBUG] Found {len(file_links)} direct file download links")
-        folder_links = [link for link in all_links if 'cmd=view' in link.get('href', '') and 'ref_id' in link.get('href', '')]
-        print(f"   [DEBUG] Found {len(folder_links)} potential folder links")
+        classic_items = soup.find_all('div', class_='il_ContainerListItem')
+        std_items = soup.find_all('div', class_='il-std-item')
+        sendfile_links = [l for l in all_links if 'cmd=sendfile' in l.get('href', '')]
+        goto_file_links = [l for l in all_links if 'target=file_' in l.get('href', '')]
+        goto_fold_links = [l for l in all_links if re.search(r'target=(fold|cat|crs)_', l.get('href', ''))]
+        print(f"   [DEBUG] {page_url[:80]}")
+        print(f"   [DEBUG]   il_ContainerListItem: {len(classic_items)}  il-std-item: {len(std_items)}")
+        print(f"   [DEBUG]   cmd=sendfile: {len(sendfile_links)}  goto file: {len(goto_file_links)}  goto folder: {len(goto_fold_links)}")
+        print(f"   [DEBUG]   Saved HTML → {debug_file}")
 
-    # If no items found with standard selector, try to find any downloadable files directly
-    if not items:
-        print(f"   [INFO] Using fallback strategy to find files and folders")
-        all_links = soup.find_all('a', href=True)
+    def _add_file(url, name):
+        if name:
+            file_list.append({'url': url, 'path': current_path, 'name': name, 'course_title': course_title or 'Unknown Course'})
+            if debug:
+                print(f"   ✓ Found file: {name}")
 
-        for link in all_links:
-            href = link.get('href', '')
-            link_text = link.get_text(strip=True)
+    def _enter_folder(url, name):
+        if name:
+            new_path = os.path.join(current_path, name)
+            if debug:
+                print(f"   ↳ Entering folder: {name}")
+            discover_items_recursive(url, new_path, session, file_list, course_title, debug, _visited)
 
-            # Skip empty links or navigation links
-            if not link_text or len(link_text) < 2:
+    NAV_TEXTS = {'home', 'back', 'up', 'zurück', 'startseite', 'zur übersicht', 'breadcrumb'}
+
+    # --- Strategy 1: Classic ILIAS (il_ContainerListItem) ---
+    classic_items = soup.find_all('div', class_='il_ContainerListItem')
+    if classic_items:
+        for item in classic_items:
+            link_tag = item.find('a', class_='il_ContainerItemTitle')
+            if not link_tag:
                 continue
-
-            # Check if it's a file download link
-            if 'cmd=sendfile' in href:
-                item_url = urljoin(page_url, href)
-                item_name = clean_filename(link_text)
-                if item_name:
-                    file_info: Dict[str, str] = {
-                        'url': item_url,
-                        'path': current_path,
-                        'name': item_name,
-                        'course_title': course_title or 'Unknown Course'
-                    }
-                    file_list.append(file_info)
-                    print(f"   ✓ Found file: {item_name}")
-
-            # Check if it's a folder link
-            elif 'cmd=view' in href and 'ref_id' in href and link_text:
-                # Skip if it looks like a navigation element
-                if link_text.lower() in ['home', 'back', 'up', 'zurück', 'startseite']:
-                    continue
-                item_url = urljoin(page_url, href)
-                item_name = clean_filename(link_text)
-                if item_name:
-                    new_path = os.path.join(current_path, item_name)
-                    print(f"   ↳ Entering folder: {item_name}")
-                    discover_items_recursive(item_url, new_path, session, file_list, course_title, debug)
+            item_url: str = urljoin(page_url, link_tag['href'])
+            item_name: str = clean_filename(link_tag.text)
+            parent_container = item.find_parent('div', class_='ilContainerListItemOuter')
+            is_folder: bool = False
+            if parent_container:
+                is_folder = bool(parent_container.find('img', alt=re.compile(r'Folder|Ordner', re.IGNORECASE)))
+            if is_folder:
+                _enter_folder(item_url, item_name)
+            elif 'cmd=sendfile' in link_tag.get('href', ''):
+                _add_file(item_url, item_name)
+        # Supplement: catch il_ContainerItemTitle sendfile links outside any il_ContainerListItem
+        _captured = {urljoin(page_url, i.find('a', class_='il_ContainerItemTitle')['href'])
+                     for i in classic_items if i.find('a', class_='il_ContainerItemTitle')}
+        for link in soup.find_all('a', class_='il_ContainerItemTitle'):
+            href = link.get('href', '')
+            if 'cmd=sendfile' not in href:
+                continue
+            url = urljoin(page_url, href)
+            if url not in _captured:
+                _add_file(url, clean_filename(link.get_text(strip=True)))
         return
 
-    for item in items:
-        # Find the main link for the item
-        link_tag = item.find('a', class_='il_ContainerItemTitle')
-        if not link_tag:
-            continue
-
-        item_url: str = urljoin(page_url, link_tag['href'])
-        item_name: str = clean_filename(link_tag.text)
-
-        # Check if it's a folder by looking for the folder icon
-        # StudOn uses an image with alt text 'Folder' or 'Ordner'
-        # Look in the parent container for the icon
-        parent_container = item.find_parent('div', class_='ilContainerListItemOuter')
-        is_folder: bool = False
-        if parent_container:
-            is_folder = parent_container.find('img', alt=re.compile(r'Folder|Ordner', re.IGNORECASE))
-
-        if is_folder:
-            new_path: str = os.path.join(current_path, item_name)
-            discover_items_recursive(item_url, new_path, session, file_list, course_title, debug)
-        else:
-            # Check if it's a file download link
-            is_file: bool = "cmd=sendfile" in link_tag['href']
+    # --- Strategy 2: ILIAS 7+ (il-std-item) ---
+    std_items = soup.find_all('div', class_='il-std-item')
+    if std_items:
+        seen: set = set()
+        for item in std_items:
+            title_el = item.find(class_='il-item-title') or item.find('h3')
+            link_tag = title_el.find('a') if title_el else item.find('a', href=True)
+            if not link_tag:
+                continue
+            href = link_tag.get('href', '')
+            if not href or href in seen:
+                continue
+            seen.add(href)
+            item_url = urljoin(page_url, href)
+            item_name = clean_filename(link_tag.get_text(strip=True))
+            if not item_name or item_name.lower() in NAV_TEXTS:
+                continue
+            icon = item.find(class_=re.compile(r'\bicon\b'))
+            icon_classes = icon.get('class', []) if icon else []
+            is_file = ('file' in icon_classes or
+                       bool(re.search(r'target=file_', href)) or
+                       'cmd=sendfile' in href)
+            is_folder = ('fold' in icon_classes or 'cat' in icon_classes or
+                         bool(re.search(r'target=(fold|cat|crs)_', href)) or
+                         ('cmd=view' in href and 'ref_id' in href))
             if is_file:
-                file_info: Dict[str, str] = {
-                    'url': item_url,
-                    'path': current_path,
-                    'name': item_name,
-                    'course_title': course_title or 'Unknown Course'
-                }
-                file_list.append(file_info)
+                _add_file(item_url, item_name)
+            elif is_folder:
+                _enter_folder(item_url, item_name)
+        # Supplement: catch il_ContainerItemTitle sendfile links not covered by il-std-item scan
+        _captured2 = {f['url'] for f in file_list}
+        for link in soup.find_all('a', class_='il_ContainerItemTitle'):
+            href = link.get('href', '')
+            if 'cmd=sendfile' not in href:
+                continue
+            url = urljoin(page_url, href)
+            if url not in _captured2:
+                _add_file(url, clean_filename(link.get_text(strip=True)))
+        return
+
+    # --- Strategy 3: Fallback — scan all links ---
+    seen = set()
+    for link in soup.find_all('a', href=True):
+        href = link.get('href', '')
+        link_text = link.get_text(strip=True)
+        if not link_text or len(link_text) < 2 or href in seen:
+            continue
+        if link_text.lower() in NAV_TEXTS:
+            continue
+        seen.add(href)
+        item_url = urljoin(page_url, href)
+        item_name = clean_filename(link_text)
+        if not item_name:
+            continue
+        if 'cmd=sendfile' in href or bool(re.search(r'target=file_', href)):
+            _add_file(item_url, item_name)
+        elif (('cmd=view' in href and 'ref_id' in href) or
+              bool(re.search(r'target=(fold|cat|crs)_', href))):
+            _enter_folder(item_url, item_name)
 
 def download_all_files(source: str, files_to_download: List[Dict[str, str]], session: requests.Session, course_title: Optional[str] = None, base_path: str = None) -> Tuple[int, List[str]]:
     """Downloads all files from the provided list.
@@ -880,15 +976,19 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
     if not files_to_download:
         return 0, []
 
-    logger.info("-" * 50)
-    logger.info(f"🚀 Starting download of {len(files_to_download)} files...")
     download_count: int = 0
     downloaded_files: List[str] = []
     downloaded_files_info: List[FileRecord] = []  # For logging
+    first_file_printed: bool = False  # Track if we've moved to a new line for file list
 
     # Use provided base_path or fall back to DOWNLOAD_FOLDER
     metadata_folder = base_path if base_path else DOWNLOAD_FOLDER
     metadata_path = os.path.join(metadata_folder, "METADATA.md")
+
+    # Load metadata to check last_fetched and which URLs were previously downloaded
+    existing_metadata = CourseMetadata.from_yaml_markdown(metadata_path)
+    last_fetched = existing_metadata.last_fetched if existing_metadata else None
+    tracked_urls: set = {r.download_url for r in (existing_metadata.file_history if existing_metadata else []) if r.download_url}
 
     for i, file_info in enumerate(files_to_download):
         file_url: str = file_info['url']
@@ -916,11 +1016,41 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
                     break
 
             if file_exists:
+                # For script-downloaded files, check if remote has been updated since last fetch.
+                # Never overwrite — save remote version as .new so local edits are preserved.
+                if last_fetched and file_url in tracked_urls and existing_path:
+                    new_path = existing_path + '.new'
+                    if not os.path.exists(new_path) and _check_remote_modified(session, file_url, last_fetched, existing_path):
+                        if not first_file_printed:
+                            print()
+                            first_file_printed = True
+                        print(f"      ↓ {expected_name} (remote update)", end='', flush=True)
+                        update_resp = session.get(file_url, stream=True)
+                        update_resp.raise_for_status()
+                        with open(new_path, 'wb') as f:
+                            for chunk in update_resp.iter_content(chunk_size=8192):
+                                f.write(chunk)
+                        print("  ✓ (saved as .new)")
+                        download_count += 1
+                        downloaded_files.append(new_path)
+                        try:
+                            file_size = os.path.getsize(new_path)
+                            downloaded_files_info.append(FileRecord(
+                                filepath=Path(new_path),
+                                timestamp=datetime.now(),
+                                course_name=file_info.get('course_title', course_title or 'Unknown Course'),
+                                size_bytes=file_size,
+                                download_url=file_url
+                            ))
+                        except Exception as e:
+                            logger.warning(f"Could not log .new file metadata: {e}")
                 logger.debug(f"   ⏭️  Skipped (already exists): {existing_path}")
                 continue
 
-            # File doesn't exist, proceed with download
-            logger.info(f"      Downloading: {expected_name}")
+            if not first_file_printed:
+                print()
+                first_file_printed = True
+            print(f"      ↓ {expected_name}", end='', flush=True)
             file_response = session.get(file_url, stream=True)
             file_response.raise_for_status()
 
@@ -944,7 +1074,7 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
                 for chunk in file_response.iter_content(chunk_size=8192):
                     f.write(chunk)
 
-            logger.info(f"   ✅ Downloaded: {filename}")
+            print(f" → {filename}" if filename != expected_name else "  ✓")
             download_count += 1
             downloaded_files.append(filepath)
 
@@ -1044,8 +1174,6 @@ def process_single_url(start_url: str, session: requests.Session, base_download_
     Returns:
         Tuple of (downloaded_count, extracted_count, list_of_downloaded_filepaths)
     """
-    # --- Extract Course Title ---
-    print("\n--- Extracting Course Title ---")
     course_title = extract_course_title(start_url, session, debug=debug)
 
     # Check if extracted title is an access-denied placeholder
@@ -1063,14 +1191,11 @@ def process_single_url(start_url: str, session: requests.Session, base_download_
                 existing_metadata = CourseMetadata.from_yaml_markdown(metadata_path)
                 if existing_metadata and not is_access_denied_title(existing_metadata.course_title):
                     real_title = existing_metadata.course_title
-                    print(f"✓ Using existing course title from metadata: {real_title}")
 
-            # If still no title, use the folder name
             if not real_title and os.path.exists(base_download_path):
                 folder_name = os.path.basename(base_download_path)
                 if folder_name and folder_name != DOWNLOAD_FOLDER:
                     real_title = folder_name
-                    print(f"✓ Using folder name as course title: {real_title}")
 
         # Use the real title if we found one
         if real_title:
@@ -1079,54 +1204,33 @@ def process_single_url(start_url: str, session: requests.Session, base_download_
             # Last resort: keep the placeholder but warn
             print(f"⚠️ No existing course title found, using placeholder: {detected_placeholder}")
 
-    if course_title:
-        print(f"📚 Course: {course_title}")
-    else:
-        print("⚠️ Could not determine course title. Using default folder name.")
-        if debug:
-            logger.debug("Enable --debug to save HTML and see detailed title extraction attempts")
+    if not course_title:
+        if create_course_subfolder:
+            print("⚠️ Could not determine course title. Using default folder name.")
         course_title = None
 
-    # --- Prepare download folder ---
-    print("\n--- Preparing Download Folder ---")
-    # Use provided base path or DOWNLOAD_FOLDER
     root_folder = base_download_path if base_download_path else DOWNLOAD_FOLDER
     os.makedirs(root_folder, exist_ok=True)
-    print(f"📁 Download folder: {root_folder}")
 
-    # Create course-specific subfolder if title was found and requested
     if course_title and create_course_subfolder:
         course_folder = os.path.join(root_folder, course_title)
         os.makedirs(course_folder, exist_ok=True)
-        print(f"📁 Course folder: {course_folder}")
         final_download_path = course_folder
     else:
         final_download_path = root_folder
 
-    # --- 1. Discovery Pass ---
-    print("\n--- Starting Discovery Phase ---")
     all_files_to_download: List[Dict[str, str]] = []
-    discover_items_recursive(start_url, final_download_path, session, all_files_to_download, course_title, debug=False)
+    discover_items_recursive(start_url, final_download_path, session, all_files_to_download, course_title, debug=debug)
 
     total_files: int = len(all_files_to_download)
-    print("\n--- Discovery Complete ---")
-    print(f"✅ Found a total of {total_files} file(s) across all folders.")
 
     if total_files == 0:
-        print("No downloadable files found.")
-        # Still update metadata and create link file even if no files found
         metadata_path = os.path.join(final_download_path, "METADATA.md")
         update_course_metadata(metadata_path, course_title, start_url, [])
         return 0, 0, []
 
-    # --- 2. Download Pass ---
     num_downloaded, downloaded_files = download_all_files(start_url, all_files_to_download, session, course_title, final_download_path)
 
-    print("-" * 50)
-    print(f"🎉 Download completed. Successfully downloaded {num_downloaded}/{total_files} file(s).")
-
-    # --- 3. Extract Archives Pass ---
-    print("\n--- Starting Extraction Phase ---")
     num_extracted = 0
 
     # Only extract newly downloaded archives (never re-extract existing ones)
@@ -1137,12 +1241,56 @@ def process_single_url(start_url: str, session: requests.Session, base_download_
                 if extract_archive(filepath):
                     num_extracted += 1
 
-    if num_extracted > 0:
-        print(f"✅ Successfully extracted {num_extracted} archive file(s).")
-    else:
-        print("ℹ️ No archives found to extract.")
-
     return num_downloaded, num_extracted, downloaded_files
+
+# --- GIT REPO MAINTENANCE ---
+
+def pull_git_repos(base_folder: str) -> Tuple[int, int]:
+    """
+    Walks base_folder recursively, finds every git repo, and runs git pull.
+    Returns (pulled_count, failed_count).
+    """
+    if not shutil.which('git'):
+        logger.debug("git not found in PATH — skipping repo pulls")
+        return 0, 0
+
+    pulled = 0
+    failed = 0
+
+    for root, dirs, _ in os.walk(base_folder):
+        if '.git' in dirs:
+            dirs.remove('.git')  # don't recurse inside .git
+            rel = os.path.relpath(root, base_folder)
+            print(f"  git  {rel}", end='', flush=True)
+            try:
+                result = subprocess.run(
+                    ['git', 'pull'],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                if result.returncode == 0:
+                    lines = result.stdout.strip().splitlines()
+                    summary = lines[-1] if lines else 'ok'
+                    print(f"  — {summary}")
+                    logger.info(f"git pull ok: {root}")
+                    pulled += 1
+                else:
+                    err = (result.stderr.strip() or result.stdout.strip())[:80]
+                    print(f"  — failed: {err}")
+                    logger.warning(f"git pull failed in {root}: {err}")
+                    failed += 1
+            except subprocess.TimeoutExpired:
+                print("  — timed out")
+                logger.warning(f"git pull timed out in {root}")
+                failed += 1
+            except Exception as e:
+                print(f"  — error: {e}")
+                logger.warning(f"git pull error in {root}: {e}")
+                failed += 1
+
+    return pulled, failed
 
 # --- AUTO-UPDATER HELPER FUNCTIONS ---
 
@@ -1200,6 +1348,9 @@ def can_access_studon() -> bool:
             try:
                 response = session.get(url, timeout=10)
                 if response.status_code == 200:
+                    if 'login.php' in response.url or 'ilstartupgui' in response.url:
+                        logger.debug(f"Redirected to login page for {url[:50]}")
+                        continue
                     logger.debug(f"✓ Successfully accessed StudOn via: {url[:50]}...")
                     return True  # Valid login!
             except Exception:
@@ -1242,52 +1393,126 @@ def was_updated_today(state: UpdateState) -> bool:
 
     return last_update_date == today
 
-def update_all_courses(debug: bool = False) -> bool:
-    """Update all courses by scanning METADATA.md files. Returns True if successful."""
+def update_all_courses(debug: bool = False) -> Tuple[bool, int, int, bool]:
+    """Update all courses by scanning METADATA.md files.
+    Returns (success, total_downloaded, total_extracted)."""
     try:
-        logger.info("🔄 Update All Mode: Scanning for existing courses...")
-
-        # Setup session with cookies
         try:
             cj = browser_cookie3.firefox(domain_name=STUDON_DOMAIN)
             session = requests.Session()
             session.cookies.update(cj)
             session.headers.update({'User-Agent': 'Mozilla/5.0'})
-            logger.info("🍪 Firefox cookies loaded successfully.")
         except Exception as e:
             raise FirefoxCookieError(e)
 
         metadata_files = find_all_metadata_files(DOWNLOAD_FOLDER)
 
         if not metadata_files:
-            logger.warning("No METADATA.md files found. Nothing to update.")
-            return False
+            print("No registered courses found.")
+            return False, 0, 0
 
-        logger.info(f"📚 Found {len(metadata_files)} course(s) to update.")
+        n = len(metadata_files)
+        print(f"Updating {n} course{'s' if n != 1 else ''}...")
 
         total_downloaded = 0
         total_extracted = 0
+        total_git_pulled = 0
+        total_git_failed = 0
+        successful_courses = 0
+        session_expired = False
 
         for i, (metadata_path, source_url, course_folder) in enumerate(metadata_files, 1):
-            logger.info(f"📖 Course {i}/{len(metadata_files)}: {os.path.basename(course_folder)}")
-            logger.info(f"   Source: {source_url}")
+            name = os.path.basename(course_folder)
+            print(f"  [{i}/{n}] {name}", end='', flush=True)
 
             try:
                 downloaded, extracted, _ = process_single_url(source_url, session, course_folder, create_course_subfolder=False, debug=debug)
                 total_downloaded += downloaded
                 total_extracted += extracted
+                successful_courses += 1
+                if downloaded:
+                    print(f"  — {downloaded} new file{'s' if downloaded != 1 else ''}" +
+                          (f", {extracted} extracted" if extracted else ""))
+                else:
+                    print("  — up to date")
+            except StudOnError as e:
+                print(f"  — error: {e}")
+                logger.error(f"Error processing {source_url}: {e}")
+                if "Session expired" in str(e):
+                    session_expired = True
+                    print("  Stopping: session expired. Will retry after login.")
+                    break
+                continue
             except Exception as e:
+                print(f"  — error: {e}")
                 logger.error(f"Error processing {source_url}: {e}")
                 continue
 
-        logger.info(f"🎉 Update All Complete! Downloaded: {total_downloaded}, Extracted: {total_extracted}")
+            # Pull git repos inside this course folder immediately after syncing it
+            git_pulled, git_failed = pull_git_repos(course_folder)
+            total_git_pulled += git_pulled
+            total_git_failed += git_failed
 
-        # Return success if we processed at least one course
-        return len(metadata_files) > 0
+        if session_expired:
+            return False, 0, 0, True
+
+        parts = []
+        if total_downloaded:
+            parts.append(f"{total_downloaded} new file{'s' if total_downloaded != 1 else ''} downloaded")
+        if total_extracted:
+            parts.append(f"{total_extracted} extracted")
+        if total_git_pulled:
+            parts.append(f"{total_git_pulled} repo{'s' if total_git_pulled != 1 else ''} pulled")
+        if total_git_failed:
+            parts.append(f"{total_git_failed} git pull error{'s' if total_git_failed != 1 else ''}")
+        print("Done." + (f" {', '.join(parts)}." if parts else " Nothing new."))
+
+        return successful_courses > 0, total_downloaded, total_extracted, False
 
     except Exception as e:
         logger.error(f"Error during update: {e}")
-        return False
+        return False, 0, 0, False
+
+def _send_desktop_notification(n_downloaded: int, n_extracted: int) -> None:
+    """Send a desktop notification via notify-send (Linux)."""
+    if not shutil.which("notify-send"):
+        return
+    if n_downloaded:
+        parts = [f"{n_downloaded} new file{'s' if n_downloaded != 1 else ''} downloaded"]
+        if n_extracted:
+            parts.append(f"{n_extracted} extracted")
+        body = ", ".join(parts) + "."
+    else:
+        body = "Everything already up to date."
+    # notify-send needs DBUS_SESSION_BUS_ADDRESS when run from cron.
+    # Try to inherit it from a running user session.
+    env = os.environ.copy()
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        try:
+            uid = os.getuid()
+            result = subprocess.run(
+                ["grep", "-z", "DBUS_SESSION_BUS_ADDRESS", f"/proc/{uid}/environ"],
+                capture_output=True, text=True
+            )
+            for line in result.stdout.replace('\x00', '\n').splitlines():
+                if line.startswith("DBUS_SESSION_BUS_ADDRESS="):
+                    env["DBUS_SESSION_BUS_ADDRESS"] = line.split("=", 1)[1]
+                    break
+        except Exception:
+            pass
+        # Fallback: common socket path
+        if "DBUS_SESSION_BUS_ADDRESS" not in env:
+            uid = os.getuid()
+            env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    try:
+        subprocess.run(
+            ["notify-send", "--app-name=StudOn Scraper", "--icon=emblem-downloads",
+             "StudOn Sync Complete", body],
+            env=env, timeout=5
+        )
+    except Exception as e:
+        logger.debug(f"Desktop notification failed: {e}")
+
 
 def run_daily_sync(check_interval_seconds: int = 300) -> None:
     """
@@ -1304,29 +1529,53 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
 
     # Check if already updated today
     if was_updated_today(state):
-        logger.info(f"Already updated today at {state.last_update}")
-        logger.info("Exiting.")
+        logger.debug(f"Daily sync: already updated today at {state.last_update}, skipping.")
         return
 
-    logger.info("Daily sync mode started")
-    logger.info(f"  Will check for StudOn login every {check_interval_seconds // 60} minutes")
-    logger.info("  Will exit after successful daily sync")
+    logger.debug(f"Daily sync started, checking every {check_interval_seconds // 60}m")
 
+    firefox_opened = False
+    waiting_logged = False
     while True:
         try:
             if not can_access_studon():
-                logger.debug("Waiting for StudOn login...")
-                time.sleep(check_interval_seconds)
+                if not waiting_logged:
+                    logger.info(f"Daily sync: waiting for StudOn login (checking every {check_interval_seconds // 60}m)")
+                    waiting_logged = True
+                if not firefox_opened:
+                    logger.info("Daily sync: opening Firefox for StudOn login")
+                    try:
+                        proc = subprocess.Popen(["firefox", f"https://{STUDON_DOMAIN}"])
+                        firefox_opened = True
+                        proc.wait()  # block until Firefox is closed
+                        logger.info("Daily sync: Firefox closed, retrying login check")
+                        firefox_opened = False
+                    except FileNotFoundError:
+                        logger.warning("Daily sync: firefox not found in PATH, falling back to polling")
+                        time.sleep(check_interval_seconds)
+                else:
+                    time.sleep(check_interval_seconds)
                 continue
 
-            logger.info("StudOn access verified, starting sync...")
-
-            if update_all_courses():
-                logger.info("Daily sync completed successfully!")
-                logger.info("Exiting.")
+            success, n_downloaded, n_extracted, session_expired = update_all_courses()
+            if success:
+                try:
+                    fb_processed, fb_files = check_and_process_feedback()
+                    if fb_files:
+                        logger.info(f"Feedback sync: downloaded {fb_files} file(s) across {fb_processed} exercise(s).")
+                        n_downloaded += fb_files
+                except Exception as e:
+                    logger.warning(f"Feedback check failed (non-fatal): {e}")
+                logger.info("Daily sync complete.")
+                _send_desktop_notification(n_downloaded, n_extracted)
                 return
+            elif session_expired:
+                logger.warning("Daily sync: session expired during update, re-entering login wait loop in 2 minutes...")
+                waiting_logged = False
+                firefox_opened = False
+                time.sleep(120)
             else:
-                logger.warning("Sync failed, will retry when StudOn login is available...")
+                logger.warning("Daily sync: update_all_courses failed, will retry...")
                 time.sleep(check_interval_seconds)
 
         except KeyboardInterrupt:
@@ -1336,6 +1585,1402 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
             logger.error(f"Error during daily sync: {e}")
             time.sleep(check_interval_seconds)
 
+def _course_folder_stats(folder_path: str) -> Tuple[int, int]:
+    """Return (file_count, total_bytes) for a course folder, skipping meta files."""
+    skip_names = {"METADATA.md", "RECENT_UPDATES.md"}
+    count = 0
+    total = 0
+    for root, _dirs, files in os.walk(folder_path):
+        for f in files:
+            if f not in skip_names and not f.endswith('.html'):
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                    count += 1
+                except OSError:
+                    pass
+    return count, total
+
+
+def show_startup_overview(download_folder: str) -> None:
+    """Render a TUI overview of registered courses and the configured download directory."""
+    # ── ANSI helpers ──────────────────────────────────────────────────────────
+    R  = "\033[0m"
+    B  = "\033[1m"
+    DIM = "\033[2m"
+    CY = "\033[96m"    # bright cyan
+    GR = "\033[92m"    # bright green
+    YE = "\033[93m"    # bright yellow
+    RE = "\033[91m"    # bright red
+    BL = "\033[94m"    # bright blue
+
+    # ── Layout constants ──────────────────────────────────────────────────────
+    try:
+        term_w = shutil.get_terminal_size(fallback=(80, 24)).columns
+    except Exception:
+        term_w = 80
+    W = min(max(term_w - 2, 60), 90)   # total inner+border width, clamped
+
+    # Column widths (status | course | last-sync | files | size)
+    COL_ST = 2
+    COL_SY = 10
+    COL_FI = 5
+    COL_SZ = 7
+    # course name gets the remaining space
+    COL_CO = W - COL_ST - COL_SY - COL_FI - COL_SZ - 6 - 2  # 6 separators, 2 outer walls
+
+    # ── Box-drawing helpers ───────────────────────────────────────────────────
+    def hline(left, mid, sep, right, widths):
+        parts = [mid * (w + 2) for w in widths]
+        return left + sep.join(parts) + right
+
+    HDR_TOP  = hline('╔', '═', '╦', '╗', [COL_ST, COL_CO, COL_SY, COL_FI, COL_SZ])
+    HDR_SEP  = hline('╠', '═', '╬', '╣', [COL_ST, COL_CO, COL_SY, COL_FI, COL_SZ])
+    HDR_MID  = hline('╠', '═', '╦', '╣', [COL_ST, COL_CO, COL_SY, COL_FI, COL_SZ])
+    HDR_BOT  = hline('╚', '═', '╩', '╝', [COL_ST, COL_CO, COL_SY, COL_FI, COL_SZ])
+    WIDE_TOP = '╔' + '═' * (W - 2) + '╗'
+    WIDE_SEP = '╠' + '═' * (W - 2) + '╣'
+    WIDE_BOT = '╚' + '═' * (W - 2) + '╝'
+
+    def wide_row(text, color='', align='<'):
+        inner = W - 4  # two border chars + two spaces
+        truncated = text[:inner]
+        padded = f'{truncated:{align}{inner}}'
+        return f'║ {color}{padded}{R} ║'
+
+    def data_row(st_col, co_col, sy_col, fi_col, sz_col, colors=None):
+        colors = colors or {}
+        def cell(text, width, color='', align='>'):
+            t = str(text)[:width]
+            return f' {color}{t:{align}{width}}{R} '
+        return (
+            '║'
+            + cell(st_col, COL_ST, colors.get('st', ''), '^')
+            + '║'
+            + cell(co_col, COL_CO, colors.get('co', ''), '<')
+            + '║'
+            + cell(sy_col, COL_SY, colors.get('sy', ''), '^')
+            + '║'
+            + cell(fi_col, COL_FI, colors.get('fi', ''), '>')
+            + '║'
+            + cell(sz_col, COL_SZ, colors.get('sz', ''), '>')
+            + '║'
+        )
+
+    # ── Collect course data ───────────────────────────────────────────────────
+    abs_folder = str(Path(download_folder).resolve())
+
+    courses = []  # list of dicts
+    if os.path.isdir(download_folder):
+        for entry in sorted(os.scandir(download_folder), key=lambda e: e.name.lower()):
+            if not entry.is_dir():
+                continue
+            meta_path = os.path.join(entry.path, "METADATA.md")
+            if not os.path.exists(meta_path):
+                continue
+            meta = CourseMetadata.from_yaml_markdown(meta_path)
+            folder_exists = os.path.isdir(entry.path)
+            file_count, total_bytes = _course_folder_stats(entry.path) if folder_exists else (0, 0)
+            courses.append({
+                'name':    meta.course_title if meta else entry.name,
+                'folder':  entry.path,
+                'exists':  folder_exists,
+                'synced':  meta.last_fetched_formatted[:10] if meta else '—',
+                'files':   file_count,
+                'size':    format_file_size(total_bytes) if total_bytes else '—',
+            })
+
+    ok_count      = sum(1 for c in courses if c['exists'])
+    missing_count = len(courses) - ok_count
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    print()
+    print(WIDE_TOP)
+    title = f'{B}{CY}StudOn Scraper{R}'
+    print(wide_row(f'StudOn Scraper', CY + B))
+    print(WIDE_SEP)
+
+    # Directory line
+    dir_display = abs_folder
+    inner = W - 4
+    dir_label = 'Directory: '
+    max_path = inner - len(dir_label)
+    if len(dir_display) > max_path:
+        dir_display = '…' + dir_display[-(max_path - 1):]
+    print(wide_row(f'{dir_label}{dir_display}', DIM))
+
+    print(WIDE_SEP)
+
+    if not courses:
+        print(wide_row('No registered courses found.', YE))
+        print(wide_row(f'Add a course:  python studon_scraper.py <URL>', DIM))
+        print(WIDE_BOT)
+        print()
+        return
+
+    # Courses header
+    course_header = f'Registered Courses  ({ok_count} OK' + (f'  •  {RE}{missing_count} missing{R}' if missing_count else '') + ')'
+    # strip ANSI for width calculation, use raw string for display
+    print(wide_row(f'Registered Courses  ({ok_count} OK' + (f'  •  {missing_count} missing' if missing_count else '') + ')', B))
+
+    # Table header row
+    print(HDR_MID)
+    print(data_row('', 'Course', 'Last sync', 'Files', 'Size',
+                   colors={'co': B, 'sy': B, 'fi': B, 'sz': B}))
+    print(HDR_SEP)
+
+    for c in courses:
+        if c['exists']:
+            st_icon  = '✓'
+            st_color = GR
+            co_color = ''
+        else:
+            st_icon  = '✗'
+            st_color = RE
+            co_color = DIM
+
+        name = c['name']
+        if len(name) > COL_CO:
+            name = name[:COL_CO - 1] + '…'
+
+        print(data_row(
+            st_icon,
+            name,
+            c['synced'],
+            str(c['files']) if c['exists'] else '—',
+            c['size'],
+            colors={'st': st_color, 'co': co_color, 'sy': DIM, 'fi': '', 'sz': ''},
+        ))
+
+    print(HDR_BOT)
+    print()
+
+
+def _is_installed() -> bool:
+    """Return True if the cron job for this script is already registered."""
+    script_path = os.path.abspath(__file__)
+    try:
+        proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        if proc.returncode != 0:
+            return False
+        return any(
+            script_path in line and '--daily-sync' in line
+            for line in proc.stdout.splitlines()
+        )
+    except FileNotFoundError:
+        return False
+
+
+def _run_uninstall() -> None:
+    """Remove the cron job and bashrc function installed by --install."""
+    script_path = os.path.abspath(__file__)
+    # --- Cron ---
+    try:
+        proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        existing = proc.stdout if proc.returncode == 0 else ''
+        clean = [l for l in existing.splitlines()
+                 if not (script_path in l and '--daily-sync' in l)]
+        if len(clean) < len(existing.splitlines()):
+            subprocess.run(['crontab', '-'], input='\n'.join(clean) + '\n',
+                           capture_output=True, text=True)
+            print("  ✅ Cron job removed.")
+        else:
+            print("  No matching cron entry found.")
+    except FileNotFoundError:
+        print("  crontab not available — skipping.")
+
+    # --- Bashrc ---
+    bashrc = Path.home() / '.bashrc'
+    marker = '# studon-scraper quick-fetch'
+    if bashrc.exists():
+        lines = bashrc.read_text().splitlines(keepends=True)
+        filtered = [l for l in lines if marker not in l and 'studon-scraper()' not in l]
+        if len(filtered) < len(lines):
+            bashrc.write_text(''.join(filtered))
+            print("  ✅ Shell function removed from ~/.bashrc.")
+        else:
+            print("  No shell function found in ~/.bashrc.")
+
+
+def _run_install(check_interval: int = 5) -> None:
+    """
+    Unified installer: replaces setup_daily_sync.sh.
+    Installs the @reboot cron job and the 'studon-scraper' bashrc function.
+    """
+    import importlib.util
+
+    script_path = os.path.abspath(__file__)
+    script_dir  = os.path.dirname(script_path)
+    python      = sys.executable
+
+    print("╔════════════════════════════════════════════════════════════╗")
+    print("║          StudOn Daily Sync Setup                          ║")
+    print("╚════════════════════════════════════════════════════════════╝")
+    print()
+
+    # --- Platform ---
+    system     = platform_module.system()
+    distro     = system
+    is_ubuntu  = False
+    if system == "Linux":
+        try:
+            content = Path('/etc/os-release').read_text()
+            for line in content.splitlines():
+                if line.startswith('NAME='):
+                    distro = line.split('=', 1)[1].strip('"\'')
+                    break
+            if 'ubuntu' in content.lower():
+                is_ubuntu = True
+        except OSError:
+            pass
+
+    print(f"Platform: {distro}")
+    print()
+
+    if not is_ubuntu:
+        print("WARNING: Only tested on Kubuntu/Ubuntu Linux.")
+        print(f"  Crontab, Firefox cookies, and path conventions may differ on {distro}.")
+        print()
+        if input("Continue anyway? [y/N]: ").strip().lower() != 'y':
+            print("Setup cancelled.")
+            return
+        print()
+    else:
+        print(f"Running on tested platform: {distro}")
+        print()
+
+    # --- Dependencies ---
+    print("Checking Python dependencies...")
+    REQUIRED = {
+        'requests':       'requests',
+        'bs4':            'beautifulsoup4',
+        'pyperclip':      'pyperclip',
+        'browser_cookie3':'browser-cookie3',
+        'tabulate':       'tabulate',
+        'yaml':           'pyyaml',
+        'keyring':        'keyring',
+    }
+    missing = [pkg for mod, pkg in REQUIRED.items() if importlib.util.find_spec(mod) is None]
+    if missing:
+        print(f"  Missing: {', '.join(missing)}")
+        print(f"  Install: pip install {' '.join(missing)}")
+        if input("  Continue anyway? [y/N]: ").strip().lower() != 'y':
+            print("Setup cancelled.")
+            return
+    else:
+        print("  All dependencies present.")
+    print()
+
+    # --- Download path ---
+    cfg          = load_config()
+    current_path = cfg.get("downloads_path")
+    if current_path:
+        print(f"Download path: {current_path}  (from config.json)")
+    else:
+        print("No download path configured (will use ./studon_downloads).")
+        answer = input("Set a persistent download path now? (leave blank to skip): ").strip()
+        if answer:
+            expanded = str(Path(answer).expanduser().resolve())
+            cfg["downloads_path"] = expanded
+            save_config(cfg)
+            print(f"  Saved: {expanded}")
+    print()
+
+    # --- Cron job ---
+    cron_cmd = f"@reboot cd {script_dir} && {python} {script_path} --daily-sync"
+    if check_interval != 5:
+        cron_cmd += f" --interval {check_interval}"
+
+    print(f"Cron entry:  {cron_cmd}")
+    print()
+
+    cron_ok = False
+    try:
+        proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
+        existing_tab = proc.stdout if proc.returncode == 0 else ''
+    except FileNotFoundError:
+        print("  ERROR: crontab not found — install it manually.")
+        existing_tab = None
+
+    if existing_tab is not None:
+        studon_lines = [l for l in existing_tab.splitlines()
+                        if 'studon' in l and '--daily-sync' in l]
+        if studon_lines and len(studon_lines) == 1 and studon_lines[0] == cron_cmd:
+            print("  Cron job already up to date.")
+            cron_ok = True
+        else:
+            if studon_lines:
+                print(f"  Replacing existing entry:")
+                for l in studon_lines:
+                    print(f"    {l}")
+                if input("  Replace? [Y/n]: ").strip().lower() == 'n':
+                    print("  Keeping existing cron entry.")
+                    cron_ok = True  # treat as ok — user chose to keep it
+                    studon_lines = []  # skip write
+                else:
+                    studon_lines = studon_lines  # will be removed below
+            if not cron_ok:
+                clean = [l for l in existing_tab.splitlines()
+                         if not ('studon' in l and '--daily-sync' in l)]
+                clean.append(cron_cmd)
+                new_tab = '\n'.join(clean) + '\n'
+                result = subprocess.run(['crontab', '-'], input=new_tab,
+                                        capture_output=True, text=True)
+                cron_ok = result.returncode == 0
+                if cron_ok:
+                    print("  Cron job installed.")
+                else:
+                    print(f"  Failed: {result.stderr.strip()}")
+    print()
+
+    # --- Bashrc function ---
+    print("Installing 'studon-scraper' shell function...")
+    bashrc   = Path.home() / '.bashrc'
+    marker   = '# studon-scraper quick-fetch'
+    func_line = f'studon-scraper() {{ {python} {script_path} --clip "$@"; }}'
+
+    if bashrc.exists():
+        content = bashrc.read_text()
+    else:
+        content = ''
+
+    if marker in content:
+        lines     = content.splitlines()
+        new_lines = [func_line if l.startswith('studon-scraper()') else l for l in lines]
+        new_content = '\n'.join(new_lines) + '\n'
+        if new_content == content:
+            print("  Already up to date in ~/.bashrc")
+        else:
+            bashrc.write_text(new_content)
+            print("  Updated in ~/.bashrc")
+    else:
+        bashrc.write_text(content.rstrip('\n') + f'\n\n{marker}\n{func_line}\n')
+        print("  Added to ~/.bashrc")
+    print()
+
+    # --- Summary ---
+    print("╔════════════════════════════════════════════════════════════╗")
+    if cron_ok:
+        print("║              ✅ Setup Completed Successfully!              ║")
+    else:
+        print("║           ⚠️  Setup Completed (cron needs attention)      ║")
+    print("╚════════════════════════════════════════════════════════════╝")
+    print()
+    print("Next steps:")
+    print("   1. source ~/.bashrc")
+    print("   2. Log into StudOn in Firefox")
+    print("   3. Copy a course URL, then run: studon-scraper")
+    print()
+    if not cron_ok:
+        print("To add the cron job manually:")
+        print("   crontab -e")
+        print(f"   # Add: {cron_cmd}")
+        print()
+
+
+# --- FEEDBACK MAIL CHECKER (FAUmail IMAP → StudOn exc page → PDF download) ---
+
+FAUMAIL_IMAP_HOST = "faumail.fau.de"
+FAUMAIL_IMAP_PORT = 993
+KEYRING_SERVICE = "studon-scraper-faumail"
+FEEDBACK_STATE_FILE = os.path.join(_SCRIPT_DIR, ".studon_feedback_state.json")
+FEEDBACK_SUBJECT_PATTERN = re.compile(r"Es wurde eine neue Feedback-Datei", re.IGNORECASE)
+EXC_URL_PATTERN = re.compile(r"https://www\.studon\.fau\.de/studon/goto?\.php\?[^\s]+|https://www\.studon\.fau\.de/studon/go/exc/\d+/\d+")
+UEBUNGSEINHEIT_PATTERN = re.compile(r"Übungseinheit:\s*(.+)", re.IGNORECASE)
+UEBUNG_PATTERN = re.compile(r"^Übung:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
+def _load_feedback_state() -> dict:
+    """Load feedback queue + processed message-ids."""
+    if not os.path.exists(FEEDBACK_STATE_FILE):
+        return {"processed_message_ids": [], "queue": []}
+    try:
+        with open(FEEDBACK_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            data.setdefault("processed_message_ids", [])
+            data.setdefault("queue", [])
+            return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Could not read feedback state file ({e}); starting fresh.")
+        return {"processed_message_ids": [], "queue": []}
+
+
+def _save_feedback_state(state: dict) -> None:
+    with open(FEEDBACK_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+_IMAP_FOLDER_LIST_RE = re.compile(rb'\((?P<flags>[^)]*)\)\s+"(?P<delim>[^"]*)"\s+(?P<name>"(?:[^"\\]|\\.)*"|\S+)')
+_IMAP_SKIP_FLAGS = {b"\\Noselect", b"\\NoSelect"}
+_IMAP_SKIP_NAMES = {"trash", "junk", "spam", "drafts", "sent", "templates", "outbox"}
+
+
+def _list_imap_folders(M: imaplib.IMAP4) -> List[str]:
+    """Return all selectable folder names on the server (skipping Trash/Spam/Sent etc)."""
+    try:
+        typ, data = M.list()
+    except Exception:
+        return ["INBOX"]
+    if typ != "OK" or not data:
+        return ["INBOX"]
+    out: List[str] = []
+    for raw in data:
+        if not raw:
+            continue
+        if isinstance(raw, tuple):
+            raw = b"".join(raw)
+        m = _IMAP_FOLDER_LIST_RE.match(raw)
+        if not m:
+            continue
+        flags = m.group("flags").split()
+        if any(f in _IMAP_SKIP_FLAGS for f in flags):
+            continue
+        name_bytes = m.group("name")
+        if name_bytes.startswith(b'"') and name_bytes.endswith(b'"'):
+            name_bytes = name_bytes[1:-1].replace(b'\\"', b'"').replace(b"\\\\", b"\\")
+        try:
+            name = name_bytes.decode("ascii")
+        except UnicodeDecodeError:
+            name = name_bytes.decode("utf-8", errors="replace")
+        leaf = name.rsplit("/", 1)[-1].rsplit(".", 1)[-1].lower()
+        if leaf in _IMAP_SKIP_NAMES:
+            continue
+        out.append(name)
+    if "INBOX" not in out:
+        out.insert(0, "INBOX")
+    return out
+
+
+def _get_imap_password(email_addr: str) -> Optional[str]:
+    """Return password from keyring, or None if missing."""
+    if keyring is None:
+        logger.error("'keyring' package not installed. Run: pip install keyring")
+        return None
+    try:
+        return keyring.get_password(KEYRING_SERVICE, email_addr)
+    except Exception as e:
+        logger.error(f"Could not read password from keyring: {e}")
+        return None
+
+
+def _decode_header(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    parts = decode_header(value)
+    out = []
+    for chunk, enc in parts:
+        if isinstance(chunk, bytes):
+            try:
+                out.append(chunk.decode(enc or "utf-8", errors="replace"))
+            except (LookupError, TypeError):
+                out.append(chunk.decode("utf-8", errors="replace"))
+        else:
+            out.append(chunk)
+    return "".join(out)
+
+
+def _extract_message_text(msg: "email_mod.message.Message") -> str:
+    """Return the plain-text body of an email message."""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition", "")):
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    try:
+                        return payload.decode(charset, errors="replace")
+                    except (LookupError, TypeError):
+                        return payload.decode("utf-8", errors="replace")
+        # Fallback: HTML stripped
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    html = payload.decode(charset, errors="replace")
+                    return BeautifulSoup(html, "html.parser").get_text("\n")
+        return ""
+    payload = msg.get_payload(decode=True)
+    if not payload:
+        return ""
+    charset = msg.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except (LookupError, TypeError):
+        return payload.decode("utf-8", errors="replace")
+
+
+def _extract_studon_exc_url(text: str) -> Optional[str]:
+    """Find the first studon.fau.de exc/goto link in the email body."""
+    m = re.search(r"https://www\.studon\.fau\.de/studon/(?:go/exc/\d+/\d+|goto[^\s<>\"']+)", text)
+    return m.group(0) if m else None
+
+
+def fetch_feedback_emails(days_back: int = 30, verbose: bool = False) -> List[dict]:
+    """
+    Connect to FAUmail IMAP, find unprocessed feedback notification emails,
+    extract their StudOn URLs and metadata. Returns new entries to queue.
+    Does NOT mark messages as read; that happens after the PDF is downloaded.
+    """
+    cfg = load_config()
+    email_addr = cfg.get("imap_email")
+    if not email_addr:
+        logger.info("No IMAP email configured. Run --install-imap to set it up.")
+        return []
+    password = _get_imap_password(email_addr)
+    if not password:
+        logger.warning(f"No IMAP password in keyring for {email_addr}. Run --install-imap.")
+        return []
+
+    state = _load_feedback_state()
+    processed = set(state.get("processed_message_ids", []))
+    queued_ids = {q.get("message_id") for q in state.get("queue", []) if q.get("message_id")}
+
+    new_entries: List[dict] = []
+    try:
+        M = imaplib.IMAP4_SSL(FAUMAIL_IMAP_HOST, FAUMAIL_IMAP_PORT)
+        M.login(email_addr, password)
+    except (imaplib.IMAP4.error, OSError) as e:
+        logger.error(f"FAUmail IMAP login failed: {e}")
+        return []
+
+    def _say(msg: str) -> None:
+        if verbose:
+            print(msg)
+        logger.debug(msg)
+
+    try:
+        since = (datetime.now() - timedelta(days=days_back)).strftime("%d-%b-%Y")
+        folders = _list_imap_folders(M)
+        _say(f"FAUmail: scanning {len(folders)} folder(s): {folders}")
+        total_subject_matches = 0
+
+        for folder in folders:
+            try:
+                typ, _ = M.select(f'"{folder}"', readonly=False)
+                if typ != "OK":
+                    _say(f"  cannot select folder {folder!r}, skipping")
+                    continue
+            except Exception as e:
+                _say(f"  select failed for {folder!r}: {e}")
+                continue
+
+            typ, data = M.search(None, f'(SINCE "{since}")')
+            if typ != "OK" or not data or not data[0]:
+                _say(f"  [{folder}] 0 messages since {since}")
+                continue
+            uids = data[0].split()
+            if not uids:
+                _say(f"  [{folder}] 0 messages since {since}")
+                continue
+            _say(f"  [{folder}] {len(uids)} message(s) since {since}")
+
+            for uid in uids:
+                try:
+                    typ, msg_data = M.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID)])")
+                    if typ != "OK" or not msg_data or not msg_data[0]:
+                        continue
+                    header_bytes = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
+                    header_msg = email_mod.message_from_bytes(header_bytes)
+                    subject = _decode_header(header_msg.get("Subject", ""))
+                    if not FEEDBACK_SUBJECT_PATTERN.search(subject):
+                        continue
+                    total_subject_matches += 1
+                    early_message_id = (header_msg.get("Message-ID") or "").strip()
+                    if early_message_id and early_message_id in processed:
+                        _say(f"  · skip [{folder}] '{subject[:60]}' — already processed previously")
+                        continue
+                    if early_message_id and early_message_id in queued_ids:
+                        _say(f"  · skip [{folder}] '{subject[:60]}' — already in queue")
+                        continue
+                    typ, msg_data = M.fetch(uid, "(BODY.PEEK[])")
+                    if typ != "OK" or not msg_data or not msg_data[0]:
+                        continue
+                    msg = email_mod.message_from_bytes(msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0])
+                    message_id = (msg.get("Message-ID") or "").strip()
+                    if not message_id:
+                        message_id = f"fallback-{folder}-{uid.decode()}-{subject[:40]}"
+                    if message_id in processed or message_id in queued_ids:
+                        continue
+
+                    body = _extract_message_text(msg)
+                    url = _extract_studon_exc_url(body)
+                    if not url:
+                        logger.warning(f"Feedback email '{subject[:60]}' had no StudOn URL — skipping.")
+                        continue
+
+                    ueb_match = UEBUNG_PATTERN.search(body)
+                    sheet_match = UEBUNGSEINHEIT_PATTERN.search(body)
+                    entry = {
+                        "url": url,
+                        "subject": subject,
+                        "message_id": message_id,
+                        "imap_folder": folder,
+                        "imap_uid": uid.decode(),
+                        "uebung": ueb_match.group(1).strip() if ueb_match else "",
+                        "sheet": sheet_match.group(1).strip() if sheet_match else "",
+                        "first_seen": datetime.now().isoformat(timespec="seconds"),
+                        "attempts": 0,
+                    }
+                    new_entries.append(entry)
+                    queued_ids.add(message_id)
+                    _say(f"  ✓ queued: [{folder}] {entry['sheet'] or subject[:50]} → {url}")
+                except Exception as e:
+                    logger.warning(f"Could not parse message UID {uid!r} in {folder}: {e}")
+                    continue
+    finally:
+        try:
+            M.close()
+        except Exception:
+            pass
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+    if verbose:
+        print(f"FAUmail: {total_subject_matches} subject match(es), {len(new_entries)} new (rest already queued/processed).")
+    if new_entries:
+        state["queue"].extend(new_entries)
+        _save_feedback_state(state)
+    return new_entries
+
+
+_FEEDBACK_DOWNLOAD_HREF = re.compile(
+    r"(cmd=(sendfile|download|downloadFile|downloadFeedbackFile|downloadGlobalFeedbackFile|deliverFile))"
+    r"|(target=file_)"
+    r"|(/download/)",
+    re.IGNORECASE,
+)
+
+
+def discover_feedback_files(exc_url: str, session: requests.Session) -> List[Dict[str, str]]:
+    """
+    Aggressively discover feedback-file download links on an ILIAS exercise page.
+    Recurses one level into linked sub-pages (assignment views, file-feedback subpages).
+    """
+    found: List[Dict[str, str]] = []
+    seen_pages: set = set()
+    seen_dl_urls: set = set()
+
+    def _scan(url: str, depth: int = 0) -> None:
+        if url in seen_pages or depth > 2:
+            return
+        seen_pages.add(url)
+        try:
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            logger.debug(f"feedback discover: GET {url} failed: {e}")
+            return
+        if "ilstartupgui" in resp.url or "/login.php" in resp.url:
+            raise StudOnError("Session expired — redirected to login page.", "Log into StudOn in Firefox and retry.")
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for link in soup.find_all("a", href=True):
+            href = link.get("href", "")
+            if not href or href.startswith("#") or href.startswith("javascript:"):
+                continue
+            full = urljoin(resp.url, href)
+            if STUDON_DOMAIN not in full:
+                continue
+            if _FEEDBACK_DOWNLOAD_HREF.search(href) and full not in seen_dl_urls:
+                seen_dl_urls.add(full)
+                name = clean_filename(link.get_text(strip=True)) or f"feedback_{len(found)+1}"
+                found.append({"url": full, "name": name})
+
+        if depth < 2:
+            for link in soup.find_all("a", href=True):
+                href = link.get("href", "")
+                if not href:
+                    continue
+                full = urljoin(resp.url, href)
+                if STUDON_DOMAIN not in full or full in seen_pages:
+                    continue
+                # Recurse into exercise/assignment sub-views
+                if re.search(r"(cmdClass=ilexercise|ass_id=|cmd=showAssignment|cmd=submissionFeedback|cmd=showOverview|exc_listfeedback|listFeedback)", href, re.IGNORECASE):
+                    _scan(full, depth + 1)
+
+    _scan(exc_url, 0)
+    return found
+
+
+def _resolve_course_name(exc_url: str, session: requests.Session) -> Tuple[str, Optional[str]]:
+    """
+    Fetch the exc page, derive the course name from breadcrumb / page header.
+    Returns (course_name, breadcrumb_course_url_if_found).
+    """
+    try:
+        resp = session.get(exc_url, timeout=15, allow_redirects=True)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning(f"Could not fetch exc page {exc_url}: {e}")
+        return "Unknown Course", None
+
+    if "ilstartupgui" in resp.url or "/login.php" in resp.url:
+        raise StudOnError("Session expired — redirected to login page.", "Log into StudOn in Firefox and retry.")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    course_url = None
+    for link in soup.find_all("a", href=True):
+        href = link.get("href", "")
+        if "target=crs_" in href or re.search(r"/go/crs/\d+", href):
+            text = link.get_text(strip=True)
+            if text:
+                return clean_filename(text), urljoin(resp.url, href)
+    title = extract_course_title(exc_url, session)
+    return clean_filename(title) if title else "Unknown Course", course_url
+
+
+def _process_feedback_queue(session: requests.Session, mark_seen: bool = True, verbose: bool = False) -> Tuple[int, int]:
+    """
+    Walk the feedback queue, download PDFs for any URL we can now reach.
+    On success, mark the IMAP message as read and move the entry to processed.
+    Returns (n_processed, n_downloaded_files).
+    """
+    state = _load_feedback_state()
+    queue = state.get("queue", [])
+    if not queue:
+        return 0, 0
+
+    cfg = load_config()
+    email_addr = cfg.get("imap_email")
+    password = _get_imap_password(email_addr) if email_addr else None
+    M = None
+    if mark_seen and email_addr and password:
+        try:
+            M = imaplib.IMAP4_SSL(FAUMAIL_IMAP_HOST, FAUMAIL_IMAP_PORT)
+            M.login(email_addr, password)
+        except Exception as e:
+            logger.warning(f"Could not connect to IMAP to mark messages seen: {e}")
+            M = None
+    selected_folder: Optional[str] = None
+
+    feedback_root = (Path(DOWNLOAD_FOLDER) / "Feedback").resolve()
+    feedback_root.mkdir(parents=True, exist_ok=True)
+    if verbose:
+        print(f"Feedback output root: {feedback_root}")
+    logger.info(f"Feedback output root: {feedback_root}")
+
+    remaining: List[dict] = []
+    processed_ids = list(state.get("processed_message_ids", []))
+    n_processed = 0
+    n_files = 0
+
+    for entry in queue:
+        url = entry["url"]
+        try:
+            course_name, _ = _resolve_course_name(url, session)
+        except StudOnError as e:
+            logger.warning(f"Feedback queue: {e}. Leaving in queue.")
+            remaining.append(entry)
+            continue
+        except Exception as e:
+            logger.warning(f"Feedback queue: error resolving {url}: {e}. Leaving in queue.")
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            remaining.append(entry)
+            continue
+
+        sheet = clean_filename(entry.get("sheet", "")) or "Feedback"
+        target_path = (feedback_root / course_name / sheet).resolve()
+        target_path.mkdir(parents=True, exist_ok=True)
+        if verbose:
+            print(f"  → {course_name} / {sheet}: {target_path}")
+        logger.info(f"Feedback target: {target_path}  (from {url})")
+
+        try:
+            raw = discover_feedback_files(url, session)
+        except StudOnError as e:
+            logger.warning(f"Feedback queue: {e}. Leaving '{entry.get('sheet', url)}' in queue.")
+            remaining.append(entry)
+            continue
+        except Exception as e:
+            logger.warning(f"Feedback queue: discovery failed for {url}: {e}")
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            remaining.append(entry)
+            continue
+
+        files_to_download: List[Dict[str, str]] = [
+            {"url": f["url"], "path": str(target_path), "name": f["name"], "course_title": course_name}
+            for f in raw
+        ]
+
+        if not files_to_download:
+            logger.info(f"Feedback queue: no files yet on {url} (Übung '{entry.get('sheet', '')}'). Leaving in queue.")
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            if entry["attempts"] >= 3:
+                try:
+                    debug_html = target_path / f"_debug_exc_page.html"
+                    debug_html.write_text(session.get(url, timeout=15).text, encoding="utf-8")
+                    logger.warning(f"  Saved page HTML to {debug_html} for inspection (3 failed attempts).")
+                except Exception:
+                    pass
+            remaining.append(entry)
+            continue
+
+        downloaded, downloaded_paths = download_all_files(url, files_to_download, session, course_title=course_name, base_path=str(target_path))
+        n_files += downloaded
+        logger.info(f"Feedback: downloaded {downloaded} file(s) for '{course_name}/{sheet}' → {target_path}")
+        if verbose:
+            print(f"    ✓ {downloaded} file(s) downloaded (from {len(files_to_download)} candidate link(s))")
+            for p in downloaded_paths:
+                print(f"      • {Path(p).resolve()}")
+
+        # Only mark as processed if we actually got file(s). Otherwise leave in queue for retry.
+        if downloaded == 0:
+            entry["attempts"] = entry.get("attempts", 0) + 1
+            if entry["attempts"] >= 3:
+                try:
+                    debug_html = target_path / f"_debug_exc_page.html"
+                    debug_html.write_text(session.get(url, timeout=15).text, encoding="utf-8")
+                    logger.warning(f"  Saved page HTML to {debug_html} for inspection (3 failed attempts).")
+                    if verbose:
+                        print(f"    ⚠️  No actual files downloaded from {len(files_to_download)} candidate link(s). Saved HTML: {debug_html}")
+                except Exception:
+                    pass
+            remaining.append(entry)
+            continue
+
+        n_processed += 1
+
+        if M is not None:
+            folder = entry.get("imap_folder", "INBOX")
+            try:
+                if folder != selected_folder:
+                    typ, _ = M.select(f'"{folder}"', readonly=False)
+                    if typ != "OK":
+                        raise RuntimeError(f"select {folder!r} failed: {typ}")
+                    selected_folder = folder
+                M.store(entry["imap_uid"].encode(), "+FLAGS", "\\Seen")
+            except Exception as e:
+                logger.warning(f"Could not mark UID {entry['imap_uid']} in {folder!r} as seen: {e}")
+
+        mid = entry.get("message_id")
+        if mid and mid not in processed_ids:
+            processed_ids.append(mid)
+
+    if M is not None:
+        try:
+            M.close()
+        except Exception:
+            pass
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+    state["queue"] = remaining
+    state["processed_message_ids"] = processed_ids[-500:]  # cap history
+    _save_feedback_state(state)
+    return n_processed, n_files
+
+
+def check_and_process_feedback(session: Optional[requests.Session] = None, verbose: bool = False) -> Tuple[int, int]:
+    """High-level entry: scan inbox for new notifications, then process the queue."""
+    new = fetch_feedback_emails(verbose=verbose)
+    if new:
+        logger.info(f"Queued {len(new)} new feedback notification(s).")
+    if session is None:
+        session = _make_session()
+    if session is None:
+        logger.info("StudOn session not available; feedback URLs remain queued.")
+        return 0, 0
+    return _process_feedback_queue(session, verbose=verbose)
+
+
+def _run_install_imap() -> None:
+    """Interactive setup for FAUmail IMAP credentials (stored in keyring)."""
+    global keyring
+    if keyring is None:
+        print("The 'keyring' package is required to securely store the FAUmail password.")
+        if input("Install it now via pip? [Y/n]: ").strip().lower() == "n":
+            print("Aborted. Run 'pip install keyring' manually, then retry.")
+            return
+        result = subprocess.run([sys.executable, "-m", "pip", "install", "keyring"])
+        if result.returncode != 0:
+            print("❌ pip install failed.")
+            return
+        try:
+            import keyring as _kr
+            keyring = _kr
+        except ImportError as e:
+            print(f"❌ Still cannot import keyring after install: {e}")
+            return
+        print("✅ keyring installed.\n")
+
+    cfg = load_config()
+    default_email = cfg.get("imap_email", "steffen.probst@fau.de")
+    print("╔════════════════════════════════════════════════════════════╗")
+    print("║          FAUmail IMAP Setup (feedback checker)            ║")
+    print("╚════════════════════════════════════════════════════════════╝")
+    print()
+    print(f"Server: {FAUMAIL_IMAP_HOST}:{FAUMAIL_IMAP_PORT} (SSL)")
+    print()
+    answer = input(f"FAU email address [{default_email}]: ").strip() or default_email
+    password = getpass.getpass(f"IDM password for {answer} (input hidden): ").strip()
+    if not password:
+        print("No password entered, aborting.")
+        return
+
+    print("\nVerifying credentials...")
+    try:
+        M = imaplib.IMAP4_SSL(FAUMAIL_IMAP_HOST, FAUMAIL_IMAP_PORT)
+        M.login(answer, password)
+        M.select("INBOX")
+        M.logout()
+    except Exception as e:
+        print(f"❌ Login failed: {e}")
+        print("   Credentials NOT saved.")
+        return
+
+    try:
+        keyring.set_password(KEYRING_SERVICE, answer, password)
+    except Exception as e:
+        print(f"❌ Could not store password in keyring: {e}")
+        return
+
+    cfg["imap_email"] = answer
+    save_config(cfg)
+    print(f"\n✅ Saved. Email in {CONFIG_FILE}, password in keyring service '{KEYRING_SERVICE}'.")
+    print("   Feedback checks will now run as part of --daily-sync.")
+    print("   Manual trigger: python3 studon_scraper.py --check-feedback")
+
+
+def _is_imap_installed() -> bool:
+    """Return True if FAUmail credentials are configured (email + keyring entry)."""
+    cfg = load_config()
+    email_addr = cfg.get("imap_email")
+    if not email_addr or keyring is None:
+        return False
+    try:
+        return keyring.get_password(KEYRING_SERVICE, email_addr) is not None
+    except Exception:
+        return False
+
+
+def _run_uninstall_imap() -> None:
+    """Remove FAUmail credentials and clear the feedback queue state."""
+    cfg = load_config()
+    email_addr = cfg.get("imap_email")
+    removed = False
+    if email_addr and keyring is not None:
+        try:
+            keyring.delete_password(KEYRING_SERVICE, email_addr)
+            print(f"  ✅ Password removed from keyring for {email_addr}.")
+            removed = True
+        except keyring.errors.PasswordDeleteError:
+            print(f"  No keyring entry found for {email_addr}.")
+        except Exception as e:
+            print(f"  Could not remove keyring entry: {e}")
+    if "imap_email" in cfg:
+        cfg.pop("imap_email", None)
+        save_config(cfg)
+        print("  ✅ Removed imap_email from config.json.")
+        removed = True
+    if os.path.exists(FEEDBACK_STATE_FILE):
+        try:
+            os.remove(FEEDBACK_STATE_FILE)
+            print(f"  ✅ Cleared feedback state ({FEEDBACK_STATE_FILE}).")
+        except OSError as e:
+            print(f"  Could not remove state file: {e}")
+    if not removed:
+        print("  Nothing to uninstall — feedback checker was not configured.")
+
+
+def _make_session() -> Optional[requests.Session]:
+    """Load Firefox cookies and return an authenticated session, or None on failure."""
+    try:
+        cj = browser_cookie3.firefox(domain_name=STUDON_DOMAIN)
+        session = requests.Session()
+        session.cookies.update(cj)
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+        return session
+    except Exception as e:
+        print(f"❌ Could not load Firefox cookies: {e}")
+        print("   Make sure you are logged into StudOn in Firefox.")
+        return None
+
+
+def _print_discovery_preview(url: str, session: requests.Session, base_path: str, debug: bool = False) -> None:
+    """
+    Run discovery (no downloads) and print a grouped file preview.
+    Shows what would be fetched and to which local path.
+    """
+    print("\n--- Discovery Preview (no files will be downloaded) ---")
+    course_title = extract_course_title(url, session, debug=debug)
+
+    root_folder = base_path
+    if course_title:
+        dest = os.path.join(root_folder, course_title)
+    else:
+        dest = root_folder
+
+    print(f"📚 Course  : {course_title or '(unknown)'}")
+    print(f"📁 Dest    : {dest}")
+    print("🔎 Scanning course pages...")
+
+    all_files: List[Dict[str, str]] = []
+    discover_items_recursive(url, dest, session, all_files, course_title, debug=debug)
+
+    if not all_files:
+        print("   (no downloadable files found)")
+        return
+
+    # Group files by their subfolder relative to dest
+    by_folder: Dict[str, List[str]] = {}
+    for f in all_files:
+        folder = os.path.relpath(f['path'], dest) if f['path'] != dest else "."
+        by_folder.setdefault(folder, []).append(f['name'])
+
+    total = len(all_files)
+    print(f"\n{'─'*52}")
+    for folder in sorted(by_folder):
+        label = folder if folder != "." else "(root)"
+        print(f"  {label}/")
+        for name in by_folder[folder]:
+            print(f"    • {name}")
+    print(f"{'─'*52}")
+    print(f"  {total} file(s) total → {dest}")
+
+
+def _run_clip_mode(debug: bool = False) -> None:
+    """
+    Clipboard quick-fetch mode (invoked by the 'studon-scraper' shell function).
+    1. Read clipboard — exit silently if no StudOn URL.
+    2. Ask user to confirm fetch.
+    3. Run discovery preview.
+    4. Ask user to confirm download.
+    5. Download.
+    """
+    # 1. Read clipboard
+    try:
+        clip = pyperclip.paste().strip()
+    except Exception:
+        print("❌ Could not read clipboard.")
+        return
+
+    if not is_valid_url(clip) or STUDON_DOMAIN not in clip:
+        if clip:
+            print(f"Clipboard does not contain a StudOn URL:\n  {clip[:80]}")
+        else:
+            print("Clipboard is empty.")
+        return
+
+    print(f"StudOn URL detected:\n  {clip}")
+    answer = input("\nFetch this course? [Y/n]: ").strip().lower()
+    if answer == 'n':
+        print("Aborted.")
+        return
+
+    # 2. Load cookies
+    session = _make_session()
+    if session is None:
+        return
+
+    # 3. Discovery preview
+    _print_discovery_preview(clip, session, DOWNLOAD_FOLDER, debug=debug)
+
+    # 4. Confirm download
+    answer = input("\nProceed with download? [Y/n]: ").strip().lower()
+    if answer == 'n':
+        print("Aborted. No files downloaded.")
+        return
+
+    # 5. Download
+    print()
+    process_single_url(clip, session, DOWNLOAD_FOLDER, debug=debug)
+
+
+def _tui_prompt_url() -> Optional[str]:
+    """Prompt for a StudOn URL, validating inline. Returns URL or None if cancelled."""
+    if questionary:
+        url = questionary.text(
+            "StudOn course URL:",
+            validate=lambda v: True if (v.strip() == "" or (is_valid_url(v.strip()) and STUDON_DOMAIN in v.strip()))
+                               else "Enter a valid StudOn URL (or leave blank to cancel)",
+        ).ask()
+        return url.strip() if url and url.strip() else None
+    url = input("StudOn course URL: ").strip()
+    return url if url else None
+
+
+def _tui_prompt_download_path() -> Optional[str]:
+    """Prompt for a directory path. Returns resolved path or None if blank."""
+    if questionary:
+        path = questionary.path("Download folder (blank = keep current):").ask()
+        return str(Path(path).expanduser().resolve()) if path and path.strip() else None
+    path = input("Download folder (blank = keep current): ").strip()
+    return str(Path(path).expanduser().resolve()) if path else None
+
+
+def fetch_timetable_markdown(output_path: Optional[str] = None) -> Optional[str]:
+    """
+    Fetch the personal campo timetable and write it as a Markdown file.
+    Returns the output path on success, None on failure.
+    Requires Firefox cookies for both fau.de and campo.fau.de.
+    """
+    import re as _re
+
+    print("🔄 Loading campo timetable...")
+    try:
+        s = requests.Session()
+        s.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
+        s.cookies.update(browser_cookie3.firefox(domain_name='campo.fau.de'))
+        s.headers.update({'User-Agent': 'Mozilla/5.0'})
+        r = s.get(CAMPO_TIMETABLE_URL)
+        if r.status_code != 200:
+            print(f"❌ campo returned HTTP {r.status_code}. Make sure you are logged in via Firefox.")
+            return None
+    except Exception as e:
+        print(f"❌ Could not fetch timetable: {e}")
+        return None
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+    title_tag = soup.title
+    raw_title = title_tag.get_text(strip=True) if title_tag else "Stundenplan"
+    page_title = _re.sub(r'\s*[-–]\s*campo\.fau\.de.*$', '', _re.sub(r'\s+', ' ', raw_title)).strip()
+
+    days = [c.get_text(strip=True) for c in soup.find_all('div', class_='colhead')]
+
+    # Parse each schedule panel
+    entries: List[Dict] = []
+    for panel in soup.find_all('div', class_='schedulePanel'):
+        pid = panel.get('id', '')
+        m = _re.search(r'scheduleColumn:(\d+)', pid)
+        col = int(m.group(1)) if m else 0
+        day = days[col] if col < len(days) else f"Tag {col+1}"
+
+        def span(suffix: str) -> str:
+            el = panel.find('span', id=lambda x: x and x.endswith(suffix))
+            return el.get_text(strip=True) if el else ''
+
+        title_el = panel.find('h3', class_='scheduleTitle')
+        title = title_el.get_text(strip=True) if title_el else ''
+        times = span(':times')
+        time_note = span(':academictimespecificationDefaulttext')  # e.g. "s.t."
+        etype = span(':eventtypeShorttext')
+        rhythm = span(':rhythmDefaulttext')
+        start_date = span(':scheduleStartDate')
+        end_date = span(':scheduleEndDate')
+        building = span(':buildingDefaulttext')
+        room_span = panel.find('span', id='')
+        room = room_span.get_text(strip=True) if room_span else ''
+        instructor_spans = panel.find_all('span', id=lambda x: x and 'instructorLink' in (x or ''))
+        instructors = ', '.join(s.get_text(strip=True) for s in instructor_spans)
+        status = span(':workstatusLongtext')
+        note_div = panel.find('div', class_='note')
+        note = note_div.get_text(strip=True) if note_div else ''
+
+        if not title:
+            continue
+
+        time_str = times
+        if time_note:
+            time_str += f" ({time_note})"
+
+        entries.append({
+            'day': day, 'col': col, 'title': title, 'time': time_str,
+            'type': etype, 'rhythm': rhythm, 'start': start_date, 'end': end_date,
+            'room': room, 'building': building, 'instructors': instructors,
+            'status': status, 'note': note,
+        })
+
+    if not entries:
+        print("⚠️  No timetable entries found. Are you logged into campo in Firefox?")
+        return None
+
+    # Sort: by day column, then by start time
+    entries.sort(key=lambda e: (e['col'], e['time']))
+
+    # Build Markdown
+    from datetime import datetime as _dt
+    lines = [
+        f"# {page_title}",
+        f"",
+        f"> Generated {_dt.now().strftime('%Y-%m-%d %H:%M')}",
+        f"",
+    ]
+
+    by_day: Dict[str, List[Dict]] = {}
+    for e in entries:
+        by_day.setdefault(e['day'], []).append(e)
+
+    for day, day_entries in by_day.items():
+        lines.append(f"## {day}")
+        lines.append("")
+        lines.append("| Zeit | Veranstaltung | Typ | Raum / Gebäude | Dozent |")
+        lines.append("|------|--------------|-----|----------------|--------|")
+        for e in day_entries:
+            room_col = ' / '.join(filter(None, [e['room'], e['building']]))
+            status_flag = " ⚠️" if e['note'] else ""
+            title_cell = e['title'] + status_flag
+            lines.append(f"| {e['time']} | {title_cell} | {e['type']} | {room_col} | {e['instructors']} |")
+        lines.append("")
+
+    # Detailed section
+    lines += ["---", "", "## Details", ""]
+    for e in entries:
+        lines.append(f"### {e['title']}")
+        lines.append(f"- **Tag:** {e['day']}")
+        lines.append(f"- **Zeit:** {e['time']}")
+        if e['type']:
+            lines.append(f"- **Typ:** {e['type']}")
+        if e['rhythm']:
+            lines.append(f"- **Rhythmus:** {e['rhythm']}")
+        if e['start'] and e['end']:
+            lines.append(f"- **Zeitraum:** {e['start']} – {e['end']}")
+        if e['room'] or e['building']:
+            room_str = ' / '.join(filter(None, [e['room'], e['building']]))
+            lines.append(f"- **Raum:** {room_str}")
+        if e['instructors']:
+            lines.append(f"- **Dozent:** {e['instructors']}")
+        if e['status']:
+            lines.append(f"- **Status:** {e['status']}")
+        if e['note']:
+            lines.append(f"- **Hinweis:** {e['note']}")
+        lines.append("")
+
+    md = '\n'.join(lines)
+
+    if output_path is None:
+        output_path = os.path.join(DOWNLOAD_FOLDER, 'timetable.md')
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(md)
+    print(f"✅ Timetable written to {output_path}")
+    return output_path
+
+
+def _run_tui_menu(debug: bool = False) -> None:
+    """Interactive arrow-key menu — shown when no URL/flag is provided and stdin is a TTY."""
+    global DOWNLOAD_FOLDER
+
+    if not sys.stdin.isatty():
+        print("No URL provided. Exiting.")
+        return
+
+    installed = _is_installed()
+    install_label = ("✅ Uninstall cron job & shell function"
+                     if installed else
+                     "❗ Install cron job & shell function")
+    install_value = "uninstall" if installed else "install"
+
+    imap_installed = _is_imap_installed()
+    imap_label = ("✅ Uninstall feedback-mail checker (FAUmail)"
+                  if imap_installed else
+                  "❗ Install feedback-mail checker (FAUmail)")
+    imap_value = "uninstall_imap" if imap_installed else "install_imap"
+
+    choices = [
+        questionary.Choice("Register & download a course URL", value="url") if questionary else "Register & download a course URL",
+        questionary.Choice("Dry-run all registered courses (preview new files)", value="dry_run") if questionary else "Dry-run all registered courses (preview new files)",
+        questionary.Choice("Update all tracked courses", value="update_all") if questionary else "Update all tracked courses",
+        questionary.Choice("Check FAUmail for feedback files now", value="check_feedback") if questionary else "Check FAUmail for feedback files now",
+        questionary.Choice("Fetch timetable → timetable.md", value="timetable") if questionary else "Fetch timetable → timetable.md",
+        questionary.Choice("Set default download path", value="set_path") if questionary else "Set default download path",
+        questionary.Choice(install_label, value=install_value) if questionary else install_label,
+        questionary.Choice(imap_label, value=imap_value) if questionary else imap_label,
+        questionary.Choice("Exit", value="exit") if questionary else "Exit",
+    ]
+
+    if questionary:
+        action = questionary.select("What would you like to do?", choices=choices).ask()
+    else:
+        labels = ["Register & download a course URL", "Dry-run all registered courses (preview new files)",
+                  "Update all tracked courses", "Check FAUmail for feedback files now",
+                  "Fetch timetable → timetable.md",
+                  "Set default download path", install_label, imap_label, "Exit"]
+        values = ["url", "dry_run", "update_all", "check_feedback", "timetable", "set_path", install_value, imap_value, "exit"]
+        for i, label in enumerate(labels, 1):
+            print(f"  {i}. {label}")
+        try:
+            idx = int(input("Choice: ").strip()) - 1
+            action = values[idx] if 0 <= idx < len(values) else "exit"
+        except (ValueError, EOFError):
+            action = "exit"
+
+    if action is None or action == "exit":
+        return
+
+    if action == "install":
+        _run_install()
+        return
+
+    if action == "uninstall":
+        _run_uninstall()
+        return
+
+    if action == "install_imap":
+        _run_install_imap()
+        return
+
+    if action == "uninstall_imap":
+        _run_uninstall_imap()
+        return
+
+    if action == "check_feedback":
+        n_processed, n_files = check_and_process_feedback(verbose=True)
+        print(f"Feedback: processed {n_processed} exercise(s), downloaded {n_files} file(s).")
+        return
+
+    if action == "set_path":
+        new_path = _tui_prompt_download_path()
+        if new_path:
+            cfg = load_config()
+            cfg["downloads_path"] = new_path
+            save_config(cfg)
+            DOWNLOAD_FOLDER = new_path
+            print(f"✅ Download path saved: {new_path}")
+        return
+
+    if action == "update_all":
+        update_all_courses(debug=debug)
+        return
+
+    if action == "timetable":
+        fetch_timetable_markdown()
+        return
+
+    if action == "dry_run":
+        session = _make_session()
+        if session is None:
+            return
+        metadata_files = find_all_metadata_files(DOWNLOAD_FOLDER)
+        if not metadata_files:
+            print("No registered courses found.")
+            return
+        for _, source_url, course_folder in metadata_files:
+            _print_discovery_preview(source_url, session, os.path.dirname(course_folder), debug=debug)
+        return
+
+    # action == "url": preview first, then confirm download
+    url = _tui_prompt_url()
+    if not url:
+        print("No URL provided.")
+        return
+
+    session = _make_session()
+    if session is None:
+        return
+
+    _print_discovery_preview(url, session, DOWNLOAD_FOLDER, debug=debug)
+
+    if questionary:
+        confirmed = questionary.confirm("Proceed with download?", default=True).ask()
+    else:
+        confirmed = input("\nProceed with download? [Y/n]: ").strip().lower() != "n"
+
+    if not confirmed:
+        print("Aborted.")
+        return
+
+    downloaded, extracted, files_list = process_single_url(url, session, DOWNLOAD_FOLDER, debug=debug)
+    print(f"\n🎉 Done. Downloaded {downloaded} new file(s), extracted {extracted} archive(s).")
+    if files_list:
+        for filepath in files_list:
+            print(f"   • {os.path.relpath(filepath, DOWNLOAD_FOLDER)}")
+
+
 def main() -> None:
     """Main execution loop."""
     global DOWNLOAD_FOLDER
@@ -1343,7 +2988,7 @@ def main() -> None:
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='StudOn Recursive File Downloader & Auto-Updater')
     parser.add_argument('url', nargs='?', help='StudOn URL to download from')
-    parser.add_argument('download_path', nargs='?', help='Custom download path')
+    parser.add_argument('download_path', nargs='?', help='Custom download path (one-time override)')
     parser.add_argument('--update-all', '-u', action='store_true',
                         help='Update all courses by scanning existing METADATA.md files')
     parser.add_argument('--daily-sync', action='store_true',
@@ -1352,8 +2997,70 @@ def main() -> None:
                        help='Check interval in minutes for --daily-sync (default: 5)')
     parser.add_argument('--debug', '-d', action='store_true',
                        help='Enable debug mode (saves HTML and shows detailed logging)')
+    parser.add_argument('--set-download-path', metavar='PATH',
+                       help='Persist a default download path to config.json and exit')
+    parser.add_argument('--clip', action='store_true',
+                       help='Read clipboard, detect StudOn URL, preview files, and confirm before downloading')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Discover files without downloading (preview mode)')
+    parser.add_argument('--install', action='store_true',
+                       help='Install cron job and shell function (replaces setup_daily_sync.sh)')
+    parser.add_argument('--timetable', action='store_true',
+                       help='Fetch personal campo timetable and write to timetable.md')
+    parser.add_argument('--install-imap', action='store_true',
+                       help='Configure FAUmail IMAP credentials (for feedback-file auto-download)')
+    parser.add_argument('--uninstall-imap', action='store_true',
+                       help='Remove FAUmail credentials and feedback queue state')
+    parser.add_argument('--check-feedback', action='store_true',
+                       help='Scan FAUmail inbox for StudOn feedback notifications and download any reachable PDFs')
+    parser.add_argument('--reset-feedback-state', action='store_true',
+                       help='Delete .studon_feedback_state.json (forces reprocessing of all matching emails)')
 
     args = parser.parse_args()
+
+    # --- Timetable export ---
+    if args.timetable:
+        fetch_timetable_markdown()
+        return
+
+    # --- IMAP setup ---
+    if args.install_imap:
+        _run_install_imap()
+        return
+
+    if args.uninstall_imap:
+        _run_uninstall_imap()
+        return
+
+    if args.reset_feedback_state:
+        if os.path.exists(FEEDBACK_STATE_FILE):
+            os.remove(FEEDBACK_STATE_FILE)
+            print(f"✅ Deleted {FEEDBACK_STATE_FILE}. Next --check-feedback will reprocess all matching emails.")
+        else:
+            print("No feedback state file to delete.")
+        return
+
+    # --- Feedback inbox scan ---
+    if args.check_feedback:
+        n_processed, n_files = check_and_process_feedback(verbose=True)
+        print(f"Feedback: processed {n_processed} exercise(s), downloaded {n_files} file(s).")
+        return
+
+    # --- Install cron + bashrc ---
+    if args.install:
+        _run_install(check_interval=args.interval)
+        return
+
+    # --- Persist download path to config.json and exit ---
+    if args.set_download_path:
+        new_path = str(Path(args.set_download_path).expanduser().resolve())
+        cfg = load_config()
+        cfg["downloads_path"] = new_path
+        save_config(cfg)
+        print(f"✅ Download path saved to {CONFIG_FILE}")
+        print(f"   downloads_path = {new_path}")
+        print("   This path will be used by all future runs, including the cron daily sync.")
+        return
 
     # Enable debug logging if requested
     if args.debug:
@@ -1362,67 +3069,52 @@ def main() -> None:
             handler.setLevel(logging.DEBUG)
         logger.debug("Debug mode enabled")
 
-    # Handle daily sync mode
+    # --- Clipboard quick-fetch mode ---
+    if args.clip:
+        _run_clip_mode(debug=args.debug)
+        return
+
+    # Handle daily sync mode (silent — runs as background cron)
     if args.daily_sync:
         check_interval_seconds = args.interval * 60
         run_daily_sync(check_interval_seconds=check_interval_seconds)
         return
 
-    print("--- StudOn Recursive File Downloader ---")
+    effective_folder = args.download_path if (args.update_all and args.download_path) else DOWNLOAD_FOLDER
+    show_startup_overview(effective_folder)
 
-    # --- Update All Mode ---
     if args.update_all:
-        # Override DOWNLOAD_FOLDER if custom path was provided
         if args.download_path:
             DOWNLOAD_FOLDER = args.download_path
-            logger.info(f"📁 Using custom download folder: {DOWNLOAD_FOLDER}")
-
         update_all_courses(debug=args.debug)
         return
 
-    # --- Single URL Mode ---
-    # --- Setup Session with Cookies ---
+    if args.url:
+        session = _make_session()
+        if session is None:
+            return
+        if args.download_path:
+            DOWNLOAD_FOLDER = args.download_path
+        if args.dry_run:
+            _print_discovery_preview(args.url, session, DOWNLOAD_FOLDER, debug=args.debug)
+            return
+        downloaded, extracted, files_list = process_single_url(args.url, session, DOWNLOAD_FOLDER, debug=args.debug)
+        print(f"\n🎉 Done. Downloaded {downloaded} new file(s), extracted {extracted} archive(s).")
+        if files_list:
+            for filepath in files_list:
+                print(f"   • {os.path.relpath(filepath, DOWNLOAD_FOLDER)}")
+        return
+
+    # No explicit URL/flag: check clipboard, then TUI
     try:
-        print("\nAttempting to load browser cookies...")
-        cj = browser_cookie3.firefox(domain_name=STUDON_DOMAIN)
-        session = requests.Session()
-        session.cookies.update(cj)
-        session.headers.update({'User-Agent': 'Mozilla/5.0'})
-        print("🍪 Firefox cookies loaded successfully.")
-    except Exception as e:
-        print(f"❌ An error occurred while loading Firefox cookies: {e}")
-        print("   Please ensure you are logged into StudOn in Firefox.")
-        return
-    start_url = args.url
-    custom_download_path = args.download_path
-
-    if not start_url:
-        start_url, custom_download_path = get_url_and_download_path_from_sources()
-
-    if not start_url:
-        print("No URL provided. Exiting.")
+        clip = pyperclip.paste().strip()
+    except Exception:
+        clip = ""
+    if clip and is_valid_url(clip) and STUDON_DOMAIN in clip:
+        _run_clip_mode(debug=args.debug)
         return
 
-    # Override DOWNLOAD_FOLDER if custom path was provided
-    if custom_download_path:
-        DOWNLOAD_FOLDER = custom_download_path
-        print(f"📁 Using custom download folder: {DOWNLOAD_FOLDER}")
-
-    # Process the single URL
-    downloaded, extracted, files_list = process_single_url(start_url, session, DOWNLOAD_FOLDER, debug=args.debug)
-
-    print("-" * 50)
-    print(f"🎉 Process completed. Downloaded {downloaded} new file(s), extracted {extracted} archive(s).")
-    print(f"📁 Files are organized in the '{DOWNLOAD_FOLDER}' folder with the same structure as StudOn.")
-
-    # Display downloaded files
-    if files_list:
-        print("\n📥 Downloaded Files:")
-        print("-" * 50)
-        for filepath in files_list:
-            # Show relative path from download folder for readability
-            rel_path = os.path.relpath(filepath, DOWNLOAD_FOLDER)
-            print(f"   • {rel_path}")
+    _run_tui_menu(debug=args.debug)
 
 
 if __name__ == "__main__":

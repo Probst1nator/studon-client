@@ -11,3 +11,9 @@ PyYAML>=6.0.0
 
 # Optional: 7z archive support
 py7zr>=0.20.0
+
+# TUI interactive menu
+questionary>=2.1.0
+
+# IMAP password storage (FAUmail feedback checker)
+keyring>=24.0.0
