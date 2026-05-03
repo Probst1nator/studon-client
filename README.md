@@ -266,3 +266,6 @@ nohup python studon_scraper.py --daily-sync > studon_sync.log 2>&1 &
 ps aux | grep studon_scraper          # check running
 pkill -f "studon_scraper.py --daily-sync"  # stop
 ```
+
+**Feature requests or unresolvable problems**
+Open an issue on the [GitHub repository](https://github.com/AutomatedAlchemy/studon-scraper/issues).

@@ -1964,13 +1964,8 @@ def _run_install(check_interval: int = 5) -> None:
     else:
         print("║           ⚠️  Setup Completed (cron needs attention)      ║")
     print("╚════════════════════════════════════════════════════════════╝")
-    print()
-    print("Next steps:")
-    print("   1. source ~/.bashrc")
-    print("   2. Log into StudOn in Firefox")
-    print("   3. Copy a course URL, then run: studon-scraper")
-    print()
     if not cron_ok:
+        print()
         print("To add the cron job manually:")
         print("   crontab -e")
         print(f"   # Add: {cron_cmd}")
@@ -2904,6 +2899,8 @@ def _run_tui_menu(debug: bool = False) -> None:
 
     if action == "install":
         _run_install()
+        run_daily_sync()
+        _run_tui_menu(debug=debug)
         return
 
     if action == "uninstall":
