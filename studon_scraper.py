@@ -1,4 +1,5 @@
 import os
+import webbrowser
 import re
 import sys
 import json
@@ -1264,7 +1265,7 @@ def pull_git_repos(base_folder: str) -> Tuple[int, int]:
             print(f"  git  {rel}", end='', flush=True)
             try:
                 result = subprocess.run(
-                    ['git', 'pull'],
+                    ['git', 'pull', '--rebase', '--autostash'],
                     cwd=root,
                     capture_output=True,
                     text=True,
@@ -1277,10 +1278,43 @@ def pull_git_repos(base_folder: str) -> Tuple[int, int]:
                     logger.info(f"git pull ok: {root}")
                     pulled += 1
                 else:
-                    err = (result.stderr.strip() or result.stdout.strip())[:80]
-                    print(f"  — failed: {err}")
-                    logger.warning(f"git pull failed in {root}: {err}")
-                    failed += 1
+                    # Clean up rebase state if it failed due to merge conflicts
+                    subprocess.run(['git', 'rebase', '--abort'], cwd=root, capture_output=True)
+                    
+                    # Fallback: Backup the local state and re-clone
+                    url_result = subprocess.run(['git', 'config', '--get', 'remote.origin.url'], cwd=root, capture_output=True, text=True)
+                    remote_url = url_result.stdout.strip()
+                    
+                    if remote_url:
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        backup_path = f"{root}_local_{timestamp}"
+                        
+                        err_snippet = (result.stderr.strip() or result.stdout.strip())[:40]
+                        print(f"  — conflict ({err_snippet}). Backing up to {os.path.basename(backup_path)}...", end='', flush=True)
+                        logger.info(f"git pull conflict in {root}. Backing up to {backup_path} and cloning from {remote_url}")
+                        try:
+                            shutil.move(root, backup_path)
+                            # Remove .git from the backup so it's ignored by future pulls
+                            shutil.rmtree(os.path.join(backup_path, '.git'), ignore_errors=True)
+                            dirs.clear()  # prevent os.walk from recursing into the now-moved subdirectories
+                            
+                            clone_result = subprocess.run(['git', 'clone', remote_url, root], capture_output=True, text=True)
+                            if clone_result.returncode == 0:
+                                print(" ✓ re-cloned")
+                                pulled += 1
+                            else:
+                                print(f" ❌ re-clone failed: {clone_result.stderr.strip()[:40]}")
+                                logger.warning(f"git clone failed for {root}: {clone_result.stderr}")
+                                failed += 1
+                        except Exception as e:
+                            print(f" ❌ fallback failed: {e}")
+                            logger.error(f"Fallback backup/clone failed for {root}: {e}")
+                            failed += 1
+                    else:
+                        err = (result.stderr.strip() or result.stdout.strip())[:80]
+                        print(f"  — failed: {err}")
+                        logger.warning(f"git pull failed in {root} (no remote url): {err}")
+                        failed += 1
             except subprocess.TimeoutExpired:
                 print("  — timed out")
                 logger.warning(f"git pull timed out in {root}")
@@ -1393,23 +1427,32 @@ def was_updated_today(state: UpdateState) -> bool:
 
     return last_update_date == today
 
-def update_all_courses(debug: bool = False) -> Tuple[bool, int, int, bool]:
+def update_all_courses(debug: bool = False, session: Optional[requests.Session] = None) -> Tuple[bool, int, int, bool]:
     """Update all courses by scanning METADATA.md files.
-    Returns (success, total_downloaded, total_extracted)."""
+
+    Args:
+        debug: If True, enables debug output and saves HTML for troubleshooting.
+        session: Pre-authenticated requests session. If None, cookies are loaded
+                 from Firefox automatically.
+
+    Returns:
+        Tuple of (success, total_downloaded, total_extracted, session_expired).
+    """
     try:
-        try:
-            cj = browser_cookie3.firefox(domain_name=STUDON_DOMAIN)
-            session = requests.Session()
-            session.cookies.update(cj)
-            session.headers.update({'User-Agent': 'Mozilla/5.0'})
-        except Exception as e:
-            raise FirefoxCookieError(e)
+        if session is None:
+            try:
+                cj = browser_cookie3.firefox(domain_name=STUDON_DOMAIN)
+                session = requests.Session()
+                session.cookies.update(cj)
+                session.headers.update({'User-Agent': 'Mozilla/5.0'})
+            except Exception as e:
+                raise FirefoxCookieError(e)
 
         metadata_files = find_all_metadata_files(DOWNLOAD_FOLDER)
 
         if not metadata_files:
             print("No registered courses found.")
-            return False, 0, 0
+            return False, 0, 0, False
 
         n = len(metadata_files)
         print(f"Updating {n} course{'s' if n != 1 else ''}...")
@@ -1448,13 +1491,13 @@ def update_all_courses(debug: bool = False) -> Tuple[bool, int, int, bool]:
                 logger.error(f"Error processing {source_url}: {e}")
                 continue
 
-            # Pull git repos inside this course folder immediately after syncing it
-            git_pulled, git_failed = pull_git_repos(course_folder)
-            total_git_pulled += git_pulled
-            total_git_failed += git_failed
-
         if session_expired:
             return False, 0, 0, True
+
+        # Pull all git repos in the entire downloads folder (catches repos not inside any tracked course)
+        git_pulled, git_failed = pull_git_repos(DOWNLOAD_FOLDER)
+        total_git_pulled += git_pulled
+        total_git_failed += git_failed
 
         parts = []
         if total_downloaded:
@@ -2596,6 +2639,260 @@ def _make_session() -> Optional[requests.Session]:
         return None
 
 
+# --- INTERACTIVE BROWSER LOGIN RECOVERY ---
+
+# Mapping of user-facing browser names to browser_cookie3 loader functions
+# and common Linux binary names for launching.
+_BROWSER_REGISTRY: List[Tuple[str, str, str]] = [
+    # (display_name, browser_cookie3_function_name, linux_binary_name)
+    ("Firefox",  "firefox",  "firefox"),
+    ("Chrome",   "chrome",   "google-chrome"),
+    ("Chromium", "chromium", "chromium-browser"),
+    ("Brave",    "brave",    "brave-browser"),
+    ("Edge",     "edge",     "microsoft-edge"),
+    ("Opera",    "opera",    "opera"),
+    ("Vivaldi",  "vivaldi",  "vivaldi"),
+]
+
+
+def _get_first_course_url() -> str:
+    """Return the StudOn source URL of the first registered course.
+
+    Falls back to the Campo timetable URL if no courses are registered.
+
+    Returns:
+        A URL string suitable for triggering an SSO login.
+    """
+    metadata_files = find_all_metadata_files(DOWNLOAD_FOLDER)
+    if metadata_files:
+        # metadata_files is List[Tuple[path, source_url, folder]]
+        return metadata_files[0][1]
+    return CAMPO_TIMETABLE_URL
+
+
+def _try_load_cookies_from_browser(browser_name: str) -> Optional[requests.Session]:
+    """Attempt to load StudOn cookies from a specific browser and validate the session.
+
+    Args:
+        browser_name: The browser_cookie3 function name (e.g. 'firefox', 'chrome').
+
+    Returns:
+        A valid, authenticated requests.Session, or None if cookies are
+        unavailable or the session is expired.
+    """
+    loader_func = getattr(browser_cookie3, browser_name, None)
+    if loader_func is None:
+        logger.debug(f"browser_cookie3 has no loader for '{browser_name}'")
+        return None
+    try:
+        cookie_jar = loader_func(domain_name=STUDON_DOMAIN)
+        session = requests.Session()
+        session.cookies.update(cookie_jar)
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+
+        # Validate: try to access a StudOn page and check we're not redirected to login
+        metadata_files = find_all_metadata_files(DOWNLOAD_FOLDER)
+        if not metadata_files:
+            # No courses to validate against — accept the session optimistically
+            return session
+
+        test_url = metadata_files[0][1]
+        try:
+            response = session.get(test_url, timeout=10, allow_redirects=True)
+            if 'login.php' in response.url or 'ilstartupgui' in response.url:
+                logger.debug(f"Cookies from {browser_name} led to login redirect")
+                return None
+            return session
+        except requests.RequestException as request_error:
+            logger.debug(f"Validation request failed for {browser_name}: {request_error}")
+            return None
+    except Exception as cookie_error:
+        logger.debug(f"Could not load cookies from {browser_name}: {cookie_error}")
+        return None
+
+
+def _open_url_in_browser(url: str, browser_binary: Optional[str] = None) -> bool:
+    """Open a URL in a browser and wait for the user to finish logging in.
+
+    Uses the system default browser when *browser_binary* is None, otherwise
+    launches the specified binary directly.
+
+    Args:
+        url: The URL to open.
+        browser_binary: Optional Linux binary name (e.g. 'google-chrome').
+            When None, ``webbrowser.open()`` is used (delegates to xdg-open).
+
+    Returns:
+        True if the browser was launched successfully, False otherwise.
+    """
+    try:
+        if browser_binary is None:
+            webbrowser.open(url)
+            return True
+        else:
+            proc = subprocess.Popen(
+                [browser_binary, url],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Wait briefly to catch immediate launch failures (e.g. binary not found)
+            try:
+                proc.wait(timeout=2)
+                # If the process exits within 2s with non-zero, the binary likely doesn't exist
+                if proc.returncode and proc.returncode != 0:
+                    return False
+            except subprocess.TimeoutExpired:
+                pass  # Still running — that's expected for a GUI browser
+            return True
+    except FileNotFoundError:
+        return False
+    except Exception as launch_error:
+        logger.debug(f"Failed to open browser '{browser_binary}': {launch_error}")
+        return False
+
+
+def _interactive_login_recovery() -> Optional[requests.Session]:
+    """Orchestrate an interactive browser-based login recovery flow.
+
+    Called when a manual 'update all' detects an expired session. The flow is:
+
+    1. Open the first registered course URL in the **system default browser**.
+    2. Wait for the user to press Enter after logging in.
+    3. Try loading cookies from every known browser.
+    4. If still no valid session, present a browser selection list (with the
+       full URL displayed for manual copy-paste).
+    5. On success with a non-default browser, save ``preferred_browser`` to
+       ``config.json`` for automatic reuse in future runs.
+    6. On repeated failure, re-show the list up to 3 times.
+
+    Returns:
+        A valid, authenticated requests.Session, or None if recovery failed.
+    """
+    login_url = _get_first_course_url()
+    config = load_config()
+    preferred_browser = config.get("preferred_browser")
+
+    # ── Step 1: Open default browser ──────────────────────────────────────────
+    print(f"\n🔑 Opening login page in your default browser...")
+    print(f"   URL: {login_url}")
+    _open_url_in_browser(login_url)
+    input("\n   Press Enter after you have logged in...")
+
+    # ── Step 2: Try preferred browser first, then all known browsers ─────────
+    browser_load_order: List[str] = []
+    if preferred_browser:
+        browser_load_order.append(preferred_browser)
+    for _display, bc3_name, _binary in _BROWSER_REGISTRY:
+        if bc3_name not in browser_load_order:
+            browser_load_order.append(bc3_name)
+
+    print("   Checking for valid session cookies...", end='', flush=True)
+    for bc3_name in browser_load_order:
+        session = _try_load_cookies_from_browser(bc3_name)
+        if session is not None:
+            display = next((d for d, b, _ in _BROWSER_REGISTRY if b == bc3_name), bc3_name)
+            print(f" ✓ (found in {display})")
+            # Save preference if it wasn't already the preferred one
+            if bc3_name != preferred_browser:
+                config["preferred_browser"] = bc3_name
+                save_config(config)
+                print(f"   💾 Saved '{display}' as preferred browser for future logins.")
+            return session
+    print(" ✗ (no valid cookies found)")
+
+    # ── Step 3: Browser selection list ────────────────────────────────────────
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        print(f"\n⚠️  Could not find valid StudOn cookies in any browser.")
+        print(f"   Please select a browser to open for login (attempt {attempt}/{max_attempts}):")
+        print(f"   URL: {login_url}")
+        print()
+
+        # Build choices
+        browser_choices: List[str] = []
+        for display_name, _bc3, _binary in _BROWSER_REGISTRY:
+            browser_choices.append(display_name)
+        browser_choices.append("Skip (use URL above manually)")
+
+        if questionary:
+            selected = questionary.select(
+                "Select browser:",
+                choices=browser_choices,
+            ).ask()
+        else:
+            for idx, label in enumerate(browser_choices, 1):
+                print(f"  {idx}. {label}")
+            try:
+                choice_idx = int(input("Choice: ").strip()) - 1
+                selected = browser_choices[choice_idx] if 0 <= choice_idx < len(browser_choices) else None
+            except (ValueError, EOFError, IndexError):
+                selected = None
+
+        if selected is None or selected == "Skip (use URL above manually)":
+            print(f"\n📋 Please open this URL manually in any browser and log in:")
+            print(f"   {login_url}")
+            input("\n   Press Enter after you have logged in...")
+            # Try all browsers one more time
+            for bc3_name in browser_load_order:
+                session = _try_load_cookies_from_browser(bc3_name)
+                if session is not None:
+                    display = next((d for d, b, _ in _BROWSER_REGISTRY if b == bc3_name), bc3_name)
+                    print(f"   ✓ Found valid session in {display}!")
+                    config["preferred_browser"] = bc3_name
+                    save_config(config)
+                    print(f"   💾 Saved '{display}' as preferred browser.")
+                    return session
+            continue
+
+        # Find the matching registry entry
+        registry_match = next(
+            ((d, bc3, binary) for d, bc3, binary in _BROWSER_REGISTRY if d == selected),
+            None,
+        )
+        if registry_match is None:
+            continue
+
+        display_name, bc3_name, binary_name = registry_match
+        print(f"   Opening {display_name}...")
+        launched = _open_url_in_browser(login_url, browser_binary=binary_name)
+        if not launched:
+            print(f"   ❌ Could not launch {display_name} ('{binary_name}' not found).")
+            print(f"   📋 Copy this URL into any browser: {login_url}")
+            continue
+
+        input(f"\n   Press Enter after you have logged in via {display_name}...")
+
+        # Try the selected browser first, then all others
+        session = _try_load_cookies_from_browser(bc3_name)
+        if session is not None:
+            print(f"   ✓ Login successful via {display_name}!")
+            config["preferred_browser"] = bc3_name
+            save_config(config)
+            print(f"   💾 Saved '{display_name}' as preferred browser for future logins.")
+            return session
+
+        # Try remaining browsers in case user logged in via a different one
+        for other_bc3 in browser_load_order:
+            if other_bc3 == bc3_name:
+                continue
+            session = _try_load_cookies_from_browser(other_bc3)
+            if session is not None:
+                other_display = next((d for d, b, _ in _BROWSER_REGISTRY if b == other_bc3), other_bc3)
+                print(f"   ✓ Found valid session in {other_display}!")
+                config["preferred_browser"] = other_bc3
+                save_config(config)
+                print(f"   💾 Saved '{other_display}' as preferred browser.")
+                return session
+
+        print(f"   ❌ Still no valid cookies found after {display_name} login.")
+
+    # All attempts exhausted
+    print(f"\n❌ Could not establish a valid StudOn session after {max_attempts} attempts.")
+    print(f"   📋 You can try logging in manually at: {login_url}")
+    print(f"   Then re-run the scraper.")
+    return None
+
+
 def _print_discovery_preview(url: str, session: requests.Session, base_path: str, debug: bool = False) -> None:
     """
     Run discovery (no downloads) and print a grouped file preview.
@@ -2931,7 +3228,14 @@ def _run_tui_menu(debug: bool = False) -> None:
         return
 
     if action == "update_all":
-        update_all_courses(debug=debug)
+        success, n_downloaded, n_extracted, session_expired = update_all_courses(debug=debug)
+        if session_expired:
+            recovered_session = _interactive_login_recovery()
+            if recovered_session is not None:
+                print("\n🔄 Retrying update with new session...\n")
+                update_all_courses(debug=debug, session=recovered_session)
+            else:
+                print("\n⏭️  Update skipped — no valid session available.")
         return
 
     if action == "timetable":
@@ -3083,7 +3387,14 @@ def main() -> None:
     if args.update_all:
         if args.download_path:
             DOWNLOAD_FOLDER = args.download_path
-        update_all_courses(debug=args.debug)
+        success, n_downloaded, n_extracted, session_expired = update_all_courses(debug=args.debug)
+        if session_expired and sys.stdin.isatty():
+            recovered_session = _interactive_login_recovery()
+            if recovered_session is not None:
+                print("\n🔄 Retrying update with new session...\n")
+                update_all_courses(debug=args.debug, session=recovered_session)
+            else:
+                print("\n⏭️  Update skipped — no valid session available.")
         return
 
     if args.url:
