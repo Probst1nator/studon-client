@@ -1,7 +1,10 @@
 # studon-scraper
 
 Authenticates to FAU's StudOn LMS via Firefox cookies, crawls course pages, and downloads/organises all subscribed course materials.
-Runs as a daily background agent via cron.
+
+Runs two background agents via `@reboot` cron:
+- **Daily sync** — waits for Firefox login, refreshes *all* tracked courses once per day.
+- **Lecture sync** — long-running daemon that fetches *only* the course relevant to each lecture at start − 5 min, start, and start + 5 min, driven by your personal campo timetable. Force-opens Firefox via a tray icon if cookies are missing. Avoids rate-limiting by never touching more than the one course you're about to walk into.
 
 ---
 
@@ -45,9 +48,13 @@ git clone <repository-url> .
 python3 studon_scraper.py --install
 ```
 
-`--install` registers an `@reboot` cron entry, adds a `studon-scraper` shell
-function to `~/.bashrc` (clipboard quick-fetch), and optionally persists a
-download path. Re-run any time you move the directory.
+`--install` registers both `@reboot` cron entries (`--daily-sync` and
+`--lecture-sync`), adds a `studon-scraper` shell function to `~/.bashrc`
+(clipboard quick-fetch), optionally persists a download path, and runs the
+interactive `--map-lectures` wizard so every campo timetable entry is paired
+with a tracked course (or explicitly marked "no StudOn course") before the
+lecture-sync daemon starts. Re-run any time you move the directory or
+register a new course.
 
 Optional — set up the FAUmail feedback auto-downloader (see [Feedback files](#feedback-files)):
 
@@ -79,6 +86,56 @@ Once the cron job is installed:
 2. The scraper detects Firefox, syncs all tracked courses, then exits.
 3. Repeat next day — state is persisted in `.studon_updater_state.json`.
 
+### Per-lecture sync
+
+`--install` also registers the `--lecture-sync` daemon. It reads your campo
+timetable (refreshed daily) and fires three single-course fetches per
+lecture: 5 min before start, at start, and 5 min after. If Firefox cookies
+have expired, a tray icon appears once per fire with an **Open StudOn
+login** option — click it to launch Firefox at StudOn; the daemon picks
+back up automatically. If you don't log in within ~2 min the fire is
+skipped silently and the next fire tries again.
+
+Each campo timetable entry is bucketed in priority order:
+
+| Bucket | What it means |
+|---|---|
+| **Mapped (explicit)** | The verbatim campo title is listed in some course's `METADATA.md` `timetable_titles`. |
+| **Mapped (normalized)** | Folder names with cosmetic differences (e.g. `SoSe 2026 - <name>`) auto-match the campo title; the verbatim title is then pinned into that course's METADATA so the next run is `explicit`. |
+| **No-course** | Listed in `lecture_mapping.json::no_course_titles` — silently skipped. |
+| **Unmapped** | None of the above — emits a daily `notify-send` warning. Run `--map-lectures` to fix. |
+
+Run `--map-lectures` whenever you enroll in a new course, change semester,
+or see an "unmapped" warning:
+
+```bash
+python studon_scraper.py --map-lectures
+```
+
+For each unmapped entry it asks: **Link to which tracked course?**,
+**Mark as no StudOn course?**, or **Skip for now?** — and writes either the
+course's METADATA.md or `lecture_mapping.json` accordingly.
+
+If the StudOn course isn't tracked yet at all, use `--discover-from-timetable`
+instead: it walks every Unmapped campo entry, programmatically "clicks" the
+campo *Detailansicht* button (JSF form POST), follows the campo→studon proxy
+link to its final ILIAS URL, and offers to register that course as a new
+tracked course — saving you from pasting URLs by hand.
+
+```bash
+python studon_scraper.py --discover-from-timetable
+```
+
+The verbatim timetable title is pinned into the new course's METADATA so the
+next `--map-lectures` / `--lecture-sync` run sees it as `Mapped (explicit)`.
+
+For a quick sanity check without running the daemon:
+
+```bash
+python studon_scraper.py --lecture-sync-once
+# Prints resolved buckets and the next 5 fires, then exits.
+```
+
 ### Manual operations
 
 ```bash
@@ -93,6 +150,9 @@ python studon_scraper.py --clip
 
 # Export campo timetable to timetable.md
 python studon_scraper.py --timetable
+
+# Scan campo studyPlanner detail views (opened in Firefox) → pruefungen.md
+python studon_scraper.py --campo-pruefungen
 
 # Scan FAUmail for new feedback notifications and download PDFs
 python studon_scraper.py --check-feedback
@@ -111,11 +171,16 @@ Run `python studon_scraper.py --help` for the complete and current list. Key fla
 | Flag | Purpose |
 |------|---------|
 | `--update-all` | Refresh every tracked course |
-| `--daily-sync` | Cron mode: wait for Firefox login, sync once, exit |
+| `--daily-sync` | Cron mode: wait for Firefox login, sync all courses once, exit |
+| `--lecture-sync` | Long-running daemon: per-lecture single-course fetches driven by campo timetable |
+| `--lecture-sync-once` | Print resolved campo↔course buckets and the next 5 fires, then exit (testing) |
+| `--map-lectures` | Interactive wizard: link unmapped campo entries to courses, or mark them as no-course |
+| `--discover-from-timetable` | For each Unmapped campo entry, follow the JSF "Detailansicht" button → final StudOn URL and offer to register it as a tracked course |
 | `--clip` | Read clipboard, preview, confirm, download |
 | `--dry-run` | Discover files without downloading |
 | `--timetable` | Export personal campo timetable |
-| `--install` / `--uninstall` | Install / remove cron entry + bashrc function |
+| `--campo-pruefungen` | Parse campo studyPlanner Detailansichten (must be pre-opened in Firefox) → `pruefungen.md` |
+| `--install` / `--uninstall` | Install / remove cron entries + bashrc function |
 | `--install-imap` / `--uninstall-imap` | Configure / remove FAUmail feedback checker |
 | `--check-feedback` | Scan inbox now and download any reachable feedback PDFs |
 | `--reset-feedback-state` | Clear `.studon_feedback_state.json` to reprocess all matching mails |
@@ -152,16 +217,25 @@ Environment variable `CONFIRMATION_THRESHOLD` (default `50`) — prompts before 
 
 ```
 studon_downloads/
-├── .studon_updater_state.json   # sync state (cloud-sync safe)
-├── RECENT_UPDATES.md            # last-run download log
+├── .studon_updater_state.json     # daily-sync state (cloud-sync safe)
+├── .studon_sync.lock              # PID-file shared by --daily-sync and --lecture-sync
+├── .timetable_entries.json        # structured campo cache consumed by --lecture-sync
+├── timetable.md                   # human-readable campo timetable
+├── pruefungen.md                  # Prüfungs-Anmeldefristen aus campo studyPlanner Detailansichten
+├── RECENT_UPDATES.md              # last-run download log
 ├── <Course Name>/
-│   ├── METADATA.md              # source URL + file history (YAML frontmatter)
+│   ├── METADATA.md                # source URL + file history + timetable_titles (YAML frontmatter)
 │   └── <lecture folders>/
-└── Feedback/                    # populated by --check-feedback
+└── Feedback/                      # populated by --check-feedback
     └── <Course Name>/
-        └── <Übungseinheit>/     # e.g. "Blatt 02"
+        └── <Übungseinheit>/       # e.g. "Blatt 02"
             └── <feedback files>
 ```
+
+`lecture_mapping.json` lives next to the script (alongside `config.json`),
+not in the download folder. It stores only the *negative* side of the
+campo↔course mapping (`no_course_titles`, `ignored_titles`) — the positive
+side is each course's `timetable_titles` inside its own `METADATA.md`.
 
 The scraper **never deletes or overwrites** existing files. To re-download a file, remove or rename the local copy first.
 
@@ -201,7 +275,11 @@ python3 studon_scraper.py --install
 
 1. Log into StudOn in Firefox and enrol in new courses.
 2. Download each new course once: `python studon_scraper.py "<url>"`
-3. Daily sync tracks them automatically from then on.
+3. Refresh campo timetable: `python studon_scraper.py --timetable`
+   - For exam-registration deadlines: open each module's *Detailansicht* in Firefox once, then `python studon_scraper.py --campo-pruefungen` → `pruefungen.md`.
+4. Run `python studon_scraper.py --map-lectures` to link new timetable
+   entries to the new course folders (or mark them as no-course).
+5. Daily sync + lecture sync track them automatically from then on.
 
 Old course files from prior semesters are never touched.
 
@@ -213,8 +291,9 @@ If `--install` doesn't fit your platform:
 
 ```bash
 crontab -e
-# Add:
+# Add both:
 @reboot cd /path/to/studon-scraper && /usr/bin/python3 studon_scraper.py --daily-sync >> studon_sync.log 2>&1
+@reboot cd /path/to/studon-scraper && /usr/bin/python3 studon_scraper.py --lecture-sync >> studon_sync.log 2>&1
 ```
 
 Or as a systemd user service — create `~/.config/systemd/user/studon-sync.service`:

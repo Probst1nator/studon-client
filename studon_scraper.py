@@ -17,12 +17,13 @@ from typing import Dict, List, Optional, Tuple
 import zipfile
 import tarfile
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from tabulate import tabulate
 from pathlib import Path
 import logging
 import yaml
 import platform as platform_module
+from html import escape as _html_escape
 
 try:
     import py7zr
@@ -158,6 +159,9 @@ class CourseMetadata:
     source_url: str
     last_fetched: datetime
     file_history: List[FileRecord]
+    # Verbatim timetable titles (from campo) that map to this course. Used by
+    # --lecture-sync to schedule per-lecture single-course fetches.
+    timetable_titles: List[str] = field(default_factory=list)
 
     @property
     def last_fetched_formatted(self) -> str:
@@ -194,12 +198,15 @@ class CourseMetadata:
     def to_yaml_markdown(self, course_folder: Path) -> str:
         """Generate markdown with YAML frontmatter for programmatic access."""
         # Prepare YAML frontmatter data
-        yaml_data = {
+        yaml_data: dict = {
             'course_title': self.course_title,
             'source_url': self.source_url,
             'last_fetched': self.last_fetched.isoformat(),
-            'file_history': [record.to_dict(course_folder) for record in self.file_history]
         }
+        # Persist timetable_titles only when set, to keep existing files clean.
+        if self.timetable_titles:
+            yaml_data['timetable_titles'] = list(self.timetable_titles)
+        yaml_data['file_history'] = [record.to_dict(course_folder) for record in self.file_history]
 
         # Generate YAML frontmatter
         yaml_str = yaml.dump(yaml_data, default_flow_style=False, allow_unicode=True, sort_keys=False)
@@ -250,11 +257,14 @@ class CourseMetadata:
                         except (ValueError, TypeError):
                             last_fetched = datetime.now()
 
+                        raw_titles = yaml_data.get('timetable_titles', []) or []
+                        timetable_titles = [str(t) for t in raw_titles if isinstance(t, (str, int, float))]
                         return cls(
                             course_title=yaml_data.get('course_title', 'Unknown Course'),
                             source_url=yaml_data.get('source_url', ''),
                             last_fetched=last_fetched,
-                            file_history=file_history
+                            file_history=file_history,
+                            timetable_titles=timetable_titles,
                         )
                     except yaml.YAMLError as e:
                         logger.warning(f"Could not parse YAML frontmatter: {e}, falling back to markdown parsing")
@@ -344,7 +354,243 @@ _config = load_config()
 DOWNLOAD_FOLDER = str(Path(_config.get("downloads_path", "studon_downloads")).expanduser())
 STUDON_DOMAIN = 'studon.fau.de'
 CAMPO_TIMETABLE_URL = 'https://www.campo.fau.de/qisserver/pages/plan/individualTimetable.xhtml?_flowId=individualTimetableSchedule-flow'
+CAMPO_STUDY_PLANNER_URL = 'https://www.campo.fau.de/qisserver/pages/startFlow.xhtml?_flowId=studyPlanner-flow'
 RECENT_UPDATES_FILE = os.path.join(DOWNLOAD_FOLDER, "RECENT_UPDATES.md")
+LECTURE_MAPPING_PATH = os.path.join(_SCRIPT_DIR, "lecture_mapping.json")
+SYNC_LOCK_PATH = os.path.join(DOWNLOAD_FOLDER, ".studon_sync.lock")
+
+
+# --- TITLE NORMALIZATION (used for matching only, never for storage/display) ---
+
+_SEMESTER_PREFIX_RE = re.compile(r'^(?:sose|wise)\s*\d{4}\s*[-–]\s*', re.IGNORECASE)
+_YEAR_PREFIX_RE = re.compile(r'^\d{4}\s+')
+_TRAILING_MARKER_RE = re.compile(r'\s*[⚠️✅❗❌]+\s*$')
+
+
+def _normalize_title(s: str) -> str:
+    """Normalize a course / lecture title for fuzzy-but-deterministic matching.
+
+    - lowercase
+    - strip leading semester ("SoSe 2026 -") or year ("2026 ") prefixes
+    - collapse whitespace runs to a single space
+    - replace ` / ` (campo style) with a single space (folder-name style)
+    - strip trailing emoji markers ("⚠️" etc.)
+    """
+    if not s:
+        return ""
+    out = s.strip()
+    out = _TRAILING_MARKER_RE.sub('', out)
+    out = out.lower()
+    out = _SEMESTER_PREFIX_RE.sub('', out)
+    out = _YEAR_PREFIX_RE.sub('', out)
+    out = out.replace(' / ', ' ')
+    out = re.sub(r'\s+', ' ', out).strip()
+    return out
+
+
+# --- LECTURE MAPPING (campo timetable ↔ tracked StudOn courses) ---
+
+def _load_lecture_mapping_json() -> dict:
+    """Load lecture_mapping.json. Returns {} when missing."""
+    if not os.path.exists(LECTURE_MAPPING_PATH):
+        return {"no_course_titles": [], "ignored_titles": []}
+    try:
+        with open(LECTURE_MAPPING_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"lecture_mapping.json unreadable, treating as empty: {e}")
+        return {"no_course_titles": [], "ignored_titles": []}
+    data.setdefault("no_course_titles", [])
+    data.setdefault("ignored_titles", [])
+    return data
+
+
+def _save_lecture_mapping_json(data: dict) -> None:
+    """Persist lecture_mapping.json next to config.json."""
+    with open(LECTURE_MAPPING_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write("\n")
+
+
+# --- SYNC MUTEX (shared by --daily-sync and --lecture-sync) ---
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if a process with this PID is running."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _acquire_sync_lock(holder: str, wait_seconds: float = 0.0) -> bool:
+    """Try to claim the sync lockfile. Returns True on success.
+
+    holder: short string identifying who holds it (logged on contention).
+    wait_seconds: poll for at most this long; 0 = single try.
+    """
+    deadline = time.time() + wait_seconds
+    os.makedirs(os.path.dirname(SYNC_LOCK_PATH) or '.', exist_ok=True)
+    while True:
+        # Stale-lock detection
+        if os.path.exists(SYNC_LOCK_PATH):
+            try:
+                with open(SYNC_LOCK_PATH, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+                pid = int(payload.get('pid', 0))
+                other = payload.get('holder', '?')
+            except (OSError, json.JSONDecodeError, ValueError):
+                pid, other = 0, '?'
+            if pid and _pid_alive(pid):
+                if time.time() >= deadline:
+                    logger.info(f"Sync lock held by {other} (pid {pid}); not acquiring.")
+                    return False
+                time.sleep(min(2.0, max(0.5, deadline - time.time())))
+                continue
+            # Stale — replace.
+            logger.info(f"Removing stale sync lock (pid {pid}, holder {other}).")
+            try:
+                os.remove(SYNC_LOCK_PATH)
+            except OSError:
+                pass
+        try:
+            fd = os.open(SYNC_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
+            continue
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump({'pid': os.getpid(), 'holder': holder,
+                       'acquired_at': datetime.now().isoformat()}, f)
+        return True
+
+
+def _release_sync_lock() -> None:
+    """Remove the sync lockfile if we own it. Safe to call when not held."""
+    try:
+        with open(SYNC_LOCK_PATH, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        if int(payload.get('pid', 0)) != os.getpid():
+            return
+    except (OSError, json.JSONDecodeError, ValueError):
+        return
+    try:
+        os.remove(SYNC_LOCK_PATH)
+    except OSError as e:
+        logger.debug(f"Could not remove sync lock: {e}")
+
+
+@dataclass
+class TrackedCourse:
+    """One tracked StudOn course as seen from disk."""
+    metadata_path: str
+    course_folder: str
+    course_title: str
+    source_url: str
+    timetable_titles: List[str]
+
+
+def _discover_tracked_courses(base_folder: str) -> List[TrackedCourse]:
+    """Scan METADATA.md files and load the data needed for bucket resolution."""
+    tracked: List[TrackedCourse] = []
+    for root, _dirs, files in os.walk(base_folder):
+        if "METADATA.md" not in files:
+            continue
+        # Skip Feedback subfolders — they're per-submission, not courses.
+        if os.sep + "Feedback" + os.sep in root + os.sep:
+            continue
+        metadata_path = os.path.join(root, "METADATA.md")
+        cm = CourseMetadata.from_yaml_markdown(metadata_path)
+        if cm is None or not cm.source_url or cm.course_title == 'Unknown Course':
+            continue
+        tracked.append(TrackedCourse(
+            metadata_path=metadata_path,
+            course_folder=root,
+            course_title=cm.course_title,
+            source_url=cm.source_url,
+            timetable_titles=list(cm.timetable_titles),
+        ))
+    return tracked
+
+
+def _add_timetable_title_to_course(metadata_path: str, verbatim_title: str) -> None:
+    """Append a verbatim timetable title to a course's METADATA.md (idempotent)."""
+    cm = CourseMetadata.from_yaml_markdown(metadata_path)
+    if cm is None:
+        logger.warning(f"Cannot update {metadata_path}: file unreadable")
+        return
+    if verbatim_title in cm.timetable_titles:
+        return
+    cm.timetable_titles.append(verbatim_title)
+    try:
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            f.write(cm.to_yaml_markdown(Path(metadata_path).parent))
+        logger.info(f"Linked timetable title '{verbatim_title}' → {os.path.basename(os.path.dirname(metadata_path))}")
+    except OSError as e:
+        logger.error(f"Could not write {metadata_path}: {e}")
+
+
+@dataclass
+class ResolvedLecture:
+    """A timetable entry resolved against the tracked-course set."""
+    entry: Dict
+    status: str                     # 'mapped' | 'no_course' | 'ignored' | 'unmapped'
+    course: Optional[TrackedCourse] # set when status == 'mapped'
+    match_kind: str = ''            # 'explicit' | 'normalized' | ''
+
+
+def _resolve_timetable_buckets(
+    entries: List[Dict],
+    tracked: List[TrackedCourse],
+    mapping: dict,
+    auto_pin_normalized: bool = True,
+) -> List[ResolvedLecture]:
+    """Bucket each timetable entry against tracked courses + lecture_mapping.json.
+
+    When auto_pin_normalized=True, a normalized match writes the verbatim
+    title back into the matched course's METADATA.md to lock the link.
+    """
+    no_course = set(mapping.get('no_course_titles', []))
+    ignored = set(mapping.get('ignored_titles', []))
+
+    # Build lookups in priority order: explicit timetable_titles, then normalized course_title.
+    explicit_lookup: Dict[str, TrackedCourse] = {}
+    normalized_lookup: Dict[str, TrackedCourse] = {}
+    for c in tracked:
+        for vt in c.timetable_titles:
+            explicit_lookup.setdefault(vt, c)
+        normalized_lookup.setdefault(_normalize_title(c.course_title), c)
+
+    results: List[ResolvedLecture] = []
+    pinned_paths: set = set()
+    for entry in entries:
+        title = entry.get('title', '')
+        if title in ignored:
+            results.append(ResolvedLecture(entry, 'ignored', None))
+            continue
+        if title in explicit_lookup:
+            results.append(ResolvedLecture(entry, 'mapped', explicit_lookup[title], 'explicit'))
+            continue
+        norm = _normalize_title(title)
+        if norm and norm in normalized_lookup:
+            course = normalized_lookup[norm]
+            if auto_pin_normalized and course.metadata_path not in pinned_paths:
+                _add_timetable_title_to_course(course.metadata_path, title)
+                course.timetable_titles.append(title)
+                explicit_lookup[title] = course
+                pinned_paths.add(course.metadata_path)
+            results.append(ResolvedLecture(entry, 'mapped', course, 'normalized'))
+            continue
+        if title in no_course:
+            results.append(ResolvedLecture(entry, 'no_course', None))
+            continue
+        results.append(ResolvedLecture(entry, 'unmapped', None))
+    return results
 
 # --- PLATFORM DETECTION ---
 
@@ -402,27 +648,60 @@ def is_valid_url(url_string: str) -> bool:
     except (ValueError, AttributeError):
         return False
 
+def _url_host_matches(url: str, domain: str) -> bool:
+    """True if *url*'s host is exactly *domain* or a sub-domain of it.
+
+    A real hostname check on the parsed URL — never a substring test. A
+    substring test ('studon.fau.de' in url) is bypassed by hosts such as
+    'studon.fau.de.attacker.com' or by 'attacker.com/?studon.fau.de'.
+    """
+    if not isinstance(url, str):
+        return False
+    try:
+        host = (urlparse(url).hostname or '').lower()
+    except (ValueError, AttributeError):
+        return False
+    domain = domain.lower().strip('.')
+    return bool(host) and (host == domain or host.endswith('.' + domain))
+
 def find_all_metadata_files(base_folder: str) -> List[Tuple[str, str, str]]:
     """
     Finds all METADATA.md files in the download folder.
     Returns a list of tuples: (metadata_file_path, source_url, course_folder_path)
+
+    Skips a METADATA.md that sits directly at base_folder (the download root) — a
+    tracked course always lives inside its own subfolder. Also skips entries whose
+    source URL fails is_valid_url() (defensive guard against historical garbage
+    like `source_url: h`).
     """
     metadata_files = []
+    base_folder_abs = os.path.abspath(base_folder)
 
     for root, dirs, files in os.walk(base_folder):
-        if "METADATA.md" in files:
-            metadata_path = os.path.join(root, "METADATA.md")
-            try:
-                with open(metadata_path, 'r') as f:
-                    content = f.read()
-                    # Extract source URL from metadata
-                    match = re.search(r'^Source:\s*(.+)$', content, re.MULTILINE)
-                    if match:
-                        source_url = match.group(1).strip()
-                        course_folder = root
-                        metadata_files.append((metadata_path, source_url, course_folder))
-            except Exception as e:
-                logger.warning(f"Could not read {metadata_path}: {e}")
+        if "METADATA.md" not in files:
+            continue
+        metadata_path = os.path.join(root, "METADATA.md")
+        if os.path.abspath(root) == base_folder_abs:
+            logger.warning(
+                f"Ignoring stray METADATA.md at download-folder root: {metadata_path}. "
+                "A tracked course must live in its own subfolder."
+            )
+            continue
+        try:
+            with open(metadata_path, 'r') as f:
+                content = f.read()
+                match = re.search(r'^Source:\s*(.+)$', content, re.MULTILINE)
+                if not match:
+                    continue
+                source_url = match.group(1).strip()
+                if not is_valid_url(source_url):
+                    logger.warning(
+                        f"Skipping {metadata_path}: invalid source_url {source_url!r}."
+                    )
+                    continue
+                metadata_files.append((metadata_path, source_url, root))
+        except Exception as e:
+            logger.warning(f"Could not read {metadata_path}: {e}")
 
     return metadata_files
 
@@ -459,14 +738,25 @@ def get_url_and_download_path_from_sources() -> tuple[Optional[str], Optional[st
         print("❌ The entered text is not a valid URL. Please try again.")
 
 def clean_filename(name: str) -> str:
-    """Removes characters that are illegal in file paths."""
-    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    """Removes characters that are illegal or unsafe in file paths.
+
+    Path separators and shell-illegal characters are stripped. A result of
+    '.' or '..' is rejected outright: a remote-controlled link text must
+    never become a path-traversal component when joined into a download path.
+    """
+    cleaned = re.sub(r'[\\/*?:"<>|]', "", name).strip()
+    if cleaned in ('.', '..'):
+        return ''
+    return cleaned
 
 def extract_course_title(page_url: str, session: requests.Session, debug: bool = False) -> Optional[str]:
     """
     Extracts the course title from a StudOn page.
     Tries multiple common StudOn HTML patterns to find the title.
     """
+    if not _url_host_matches(page_url, STUDON_DOMAIN):
+        logger.warning(f"Refusing to fetch off-domain URL for course title: {page_url}")
+        return None
     try:
         response = session.get(page_url)
         response.raise_for_status()
@@ -548,6 +838,47 @@ def clear_download_folder(folder_path: str) -> None:
     os.makedirs(folder_path, exist_ok=True)
     print(f"📁 Created fresh download folder: {folder_path}")
 
+def _is_safe_archive_member(member_name: str, extract_dir: str) -> bool:
+    """True if extracting *member_name* lands inside *extract_dir*.
+
+    Rejects absolute paths and '..' traversal. Used to vet archive members
+    before extraction so a crafted archive cannot write outside its folder.
+    """
+    if not member_name:
+        return True  # empty / pure-directory entries are harmless
+    if os.path.isabs(member_name) or member_name.startswith(('/', '\\')):
+        return False
+    base = os.path.realpath(extract_dir)
+    dest = os.path.realpath(os.path.join(base, member_name))
+    return dest == base or dest.startswith(base + os.sep)
+
+
+def _safe_tar_extract(tar_ref: tarfile.TarFile, extract_dir: str) -> None:
+    """Extract a tar archive without escaping *extract_dir*.
+
+    tarfile.extractall() honours '..' members, absolute paths, symlinks and
+    hardlinks by default (CVE-2007-4559), so members are vetted here: links
+    and device/fifo special files are dropped, traversal members are dropped,
+    and the stdlib 'data' filter is applied as a second layer when available.
+    """
+    safe_members = []
+    for m in tar_ref.getmembers():
+        if m.issym() or m.islnk():
+            logger.warning(f"Archive: dropping link member {m.name!r} from tar.")
+            continue
+        if m.ischr() or m.isblk() or m.isfifo():
+            logger.warning(f"Archive: dropping special-file member {m.name!r} from tar.")
+            continue
+        if not _is_safe_archive_member(m.name, extract_dir):
+            logger.warning(f"Archive: dropping path-traversal member {m.name!r} from tar.")
+            continue
+        safe_members.append(m)
+    if hasattr(tarfile, 'data_filter'):
+        tar_ref.extractall(extract_dir, members=safe_members, filter='data')
+    else:
+        tar_ref.extractall(extract_dir, members=safe_members)
+
+
 def extract_archive(archive_path: str) -> bool:
     """
     Extracts a single archive file (.zip, .tar, .tar.gz, .tar.bz2, .7z).
@@ -583,13 +914,20 @@ def extract_archive(archive_path: str) -> bool:
         if archive_path.endswith('.zip'):
             print(f"      📦 Extracting ZIP: {filename}")
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                unsafe = [n for n in zip_ref.namelist()
+                          if not _is_safe_archive_member(n, extract_dir)]
+                if unsafe:
+                    logger.warning(f"Refusing ZIP {filename}: {len(unsafe)} member(s) "
+                                   f"escape the extraction dir, e.g. {unsafe[0]!r}")
+                    print(f"      ❌ Refused unsafe ZIP {filename} (path traversal).")
+                    return False
                 zip_ref.extractall(extract_dir)
             return True
 
         elif archive_path.endswith(('.tar', '.tar.gz', '.tar.bz2', '.tgz', '.tbz2')):
             print(f"      📦 Extracting TAR: {filename}")
             with tarfile.open(archive_path, 'r:*') as tar_ref:
-                tar_ref.extractall(extract_dir)
+                _safe_tar_extract(tar_ref, extract_dir)
             return True
 
         elif archive_path.endswith('.7z'):
@@ -599,6 +937,13 @@ def extract_archive(archive_path: str) -> bool:
                 return False
             print(f"      📦 Extracting 7z: {filename}")
             with py7zr.SevenZipFile(archive_path, 'r') as archive:
+                unsafe = [n for n in (archive.getnames() or [])
+                          if not _is_safe_archive_member(n, extract_dir)]
+                if unsafe:
+                    logger.warning(f"Refusing 7z {filename}: {len(unsafe)} member(s) "
+                                   f"escape the extraction dir, e.g. {unsafe[0]!r}")
+                    print(f"      ❌ Refused unsafe 7z {filename} (path traversal).")
+                    return False
                 archive.extractall(extract_dir)
             return True
 
@@ -748,13 +1093,19 @@ def create_course_link_file(course_folder: Path, course_title: str, source_url: 
         link_filename = "Link to StudOn.html"
         link_path = course_folder / link_filename
 
+        # Escape both interpolated values. source_url and course_title can
+        # carry attacker-influenced content (a crafted course page, a campo
+        # redirect target); never inject them raw into HTML.
+        safe_url = _html_escape(source_url, quote=True)
+        safe_title = _html_escape(course_title, quote=True)
+
         # Create HTML redirect file with meta-refresh (instant redirect)
         html_content = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="0; url={source_url}">
-    <title>Redirecting to StudOn - {course_title}</title>
+    <meta http-equiv="refresh" content="0; url={safe_url}">
+    <title>Redirecting to StudOn - {safe_title}</title>
     <style>
         body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; }}
         a {{ color: #0066cc; text-decoration: none; }}
@@ -762,8 +1113,8 @@ def create_course_link_file(course_folder: Path, course_title: str, source_url: 
 </head>
 <body>
     <h2>Redirecting to StudOn...</h2>
-    <p>Course: {course_title}</p>
-    <p>If you are not redirected automatically, <a href="{source_url}">click here</a>.</p>
+    <p>Course: {safe_title}</p>
+    <p>If you are not redirected automatically, <a href="{safe_url}">click here</a>.</p>
 </body>
 </html>
 """
@@ -787,13 +1138,26 @@ def update_course_metadata(metadata_path: str, course_title: Optional[str], sour
     """
     course_folder = Path(metadata_path).parent
 
+    # Refuse to write a METADATA.md directly at the download-folder root. A tracked
+    # course always lives in its own subfolder; writing at the root produces a
+    # stray METADATA that find_all_metadata_files() then re-processes forever
+    # (see historical "Invalid URL 'h'" loop).
+    if course_folder.resolve() == Path(DOWNLOAD_FOLDER).resolve():
+        logger.warning(
+            f"Refusing to write METADATA at download-folder root ({metadata_path}). "
+            f"Course title would have been: {course_title!r}, source: {source_url!r}."
+        )
+        return
+
     # Load existing metadata using the new from_yaml_markdown method
     # This handles both YAML frontmatter and old markdown formats
     existing_metadata = CourseMetadata.from_yaml_markdown(metadata_path)
 
     existing_history: List[FileRecord] = []
+    existing_titles: List[str] = []
     if existing_metadata:
         existing_history = existing_metadata.file_history
+        existing_titles = existing_metadata.timetable_titles
         # Use existing course title and source URL if not provided
         if not course_title:
             course_title = existing_metadata.course_title
@@ -811,7 +1175,8 @@ def update_course_metadata(metadata_path: str, course_title: Optional[str], sour
         course_title=course_title or 'Unknown Course',
         source_url=source_url,
         last_fetched=datetime.now(),
-        file_history=all_history
+        file_history=all_history,
+        timetable_titles=existing_titles,
     )
 
     try:
@@ -835,6 +1200,10 @@ def discover_items_recursive(page_url: str, current_path: str, session: requests
     if page_url in _visited:
         return
     _visited.add(page_url)
+
+    if not _url_host_matches(page_url, STUDON_DOMAIN):
+        logger.warning(f"Skipping off-domain page during crawl: {page_url}")
+        return
 
     try:
         response = session.get(page_url)
@@ -865,10 +1234,14 @@ def discover_items_recursive(page_url: str, current_path: str, session: requests
         print(f"   [DEBUG]   Saved HTML → {debug_file}")
 
     def _add_file(url, name):
-        if name:
-            file_list.append({'url': url, 'path': current_path, 'name': name, 'course_title': course_title or 'Unknown Course'})
-            if debug:
-                print(f"   ✓ Found file: {name}")
+        if not name:
+            return
+        if not _url_host_matches(url, STUDON_DOMAIN):
+            logger.warning(f"Skipping off-domain file link: {url}")
+            return
+        file_list.append({'url': url, 'path': current_path, 'name': name, 'course_title': course_title or 'Unknown Course'})
+        if debug:
+            print(f"   ✓ Found file: {name}")
 
     def _enter_folder(url, name):
         if name:
@@ -930,8 +1303,12 @@ def discover_items_recursive(page_url: str, current_path: str, session: requests
             is_file = ('file' in icon_classes or
                        bool(re.search(r'target=file_', href)) or
                        'cmd=sendfile' in href)
+            # Note: `target=crs_` is *intentionally* excluded — those links
+            # point to other StudOn courses and must not be recursed into,
+            # otherwise sub-course files land nested under the parent's tree
+            # (e.g. "Maschinelles Lernen .../Introduction to Machine Learning/").
             is_folder = ('fold' in icon_classes or 'cat' in icon_classes or
-                         bool(re.search(r'target=(fold|cat|crs)_', href)) or
+                         bool(re.search(r'target=(fold|cat)_', href)) or
                          ('cmd=view' in href and 'ref_id' in href))
             if is_file:
                 _add_file(item_url, item_name)
@@ -965,7 +1342,8 @@ def discover_items_recursive(page_url: str, current_path: str, session: requests
         if 'cmd=sendfile' in href or bool(re.search(r'target=file_', href)):
             _add_file(item_url, item_name)
         elif (('cmd=view' in href and 'ref_id' in href) or
-              bool(re.search(r'target=(fold|cat|crs)_', href))):
+              bool(re.search(r'target=(fold|cat)_', href))):
+            # `target=crs_` deliberately excluded: it links to another course.
             _enter_folder(item_url, item_name)
 
 def download_all_files(source: str, files_to_download: List[Dict[str, str]], session: requests.Session, course_title: Optional[str] = None, base_path: str = None) -> Tuple[int, List[str]]:
@@ -1246,83 +1624,101 @@ def process_single_url(start_url: str, session: requests.Session, base_download_
 
 # --- GIT REPO MAINTENANCE ---
 
+# Hardened git invocation. A .git/ directory can reach the download folder via
+# a downloaded/extracted archive or via Syncthing; running git inside an
+# attacker-controlled repo is RCE. These -c flags neutralise the config-driven
+# command-execution vectors (ext:: transport, fsmonitor, repo hooks).
+_GIT_SAFE_FLAGS = [
+    '-c', 'protocol.ext.allow=never',
+    '-c', 'protocol.file.allow=never',
+    '-c', 'core.fsmonitor=',
+    '-c', 'core.hooksPath=/dev/null',
+]
+
+
+def _is_safe_git_remote(url: str) -> bool:
+    """True only for plain https:// remotes.
+
+    Blocks the ext:: transport (arbitrary command execution), file:// and
+    local paths, scp-style git@host:path, and anything else that could run
+    code or reach the local filesystem when git fetches from the repo.
+    """
+    if not isinstance(url, str):
+        return False
+    return url.strip().lower().startswith('https://')
+
+
 def pull_git_repos(base_folder: str) -> Tuple[int, int]:
     """
-    Walks base_folder recursively, finds every git repo, and runs git pull.
-    Returns (pulled_count, failed_count).
+    Walk base_folder, find git repos, and fast-forward any that have a plain
+    https remote. Returns (pulled_count, failed_count).
+
+    Security: a repo found here is untrusted input — it can arrive via a
+    downloaded/extracted archive or via Syncthing, and running git inside an
+    attacker-controlled repo is remote code execution. So a repo is touched
+    only when its origin remote is a plain https URL; git runs with hardened
+    flags (_GIT_SAFE_FLAGS); updates are restricted to fast-forwards (no
+    rebase, no merge driver); and there is no move-aside + re-clone fallback.
     """
     if not shutil.which('git'):
         logger.debug("git not found in PATH — skipping repo pulls")
         return 0, 0
 
+    git_env = os.environ.copy()
+    git_env['GIT_TERMINAL_PROMPT'] = '0'  # never block on a credential prompt
+
     pulled = 0
     failed = 0
 
     for root, dirs, _ in os.walk(base_folder):
-        if '.git' in dirs:
-            dirs.remove('.git')  # don't recurse inside .git
-            rel = os.path.relpath(root, base_folder)
-            print(f"  git  {rel}", end='', flush=True)
-            try:
-                result = subprocess.run(
-                    ['git', 'pull', '--rebase', '--autostash'],
-                    cwd=root,
-                    capture_output=True,
-                    text=True,
-                    timeout=60,
-                )
-                if result.returncode == 0:
-                    lines = result.stdout.strip().splitlines()
-                    summary = lines[-1] if lines else 'ok'
-                    print(f"  — {summary}")
-                    logger.info(f"git pull ok: {root}")
-                    pulled += 1
-                else:
-                    # Clean up rebase state if it failed due to merge conflicts
-                    subprocess.run(['git', 'rebase', '--abort'], cwd=root, capture_output=True)
-                    
-                    # Fallback: Backup the local state and re-clone
-                    url_result = subprocess.run(['git', 'config', '--get', 'remote.origin.url'], cwd=root, capture_output=True, text=True)
-                    remote_url = url_result.stdout.strip()
-                    
-                    if remote_url:
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        backup_path = f"{root}_local_{timestamp}"
-                        
-                        err_snippet = (result.stderr.strip() or result.stdout.strip())[:40]
-                        print(f"  — conflict ({err_snippet}). Backing up to {os.path.basename(backup_path)}...", end='', flush=True)
-                        logger.info(f"git pull conflict in {root}. Backing up to {backup_path} and cloning from {remote_url}")
-                        try:
-                            shutil.move(root, backup_path)
-                            # Remove .git from the backup so it's ignored by future pulls
-                            shutil.rmtree(os.path.join(backup_path, '.git'), ignore_errors=True)
-                            dirs.clear()  # prevent os.walk from recursing into the now-moved subdirectories
-                            
-                            clone_result = subprocess.run(['git', 'clone', remote_url, root], capture_output=True, text=True)
-                            if clone_result.returncode == 0:
-                                print(" ✓ re-cloned")
-                                pulled += 1
-                            else:
-                                print(f" ❌ re-clone failed: {clone_result.stderr.strip()[:40]}")
-                                logger.warning(f"git clone failed for {root}: {clone_result.stderr}")
-                                failed += 1
-                        except Exception as e:
-                            print(f" ❌ fallback failed: {e}")
-                            logger.error(f"Fallback backup/clone failed for {root}: {e}")
-                            failed += 1
-                    else:
-                        err = (result.stderr.strip() or result.stdout.strip())[:80]
-                        print(f"  — failed: {err}")
-                        logger.warning(f"git pull failed in {root} (no remote url): {err}")
-                        failed += 1
-            except subprocess.TimeoutExpired:
-                print("  — timed out")
-                logger.warning(f"git pull timed out in {root}")
+        if '.git' not in dirs:
+            continue
+        dirs.remove('.git')  # don't recurse inside .git
+        rel = os.path.relpath(root, base_folder)
+        print(f"  git  {rel}", end='', flush=True)
+
+        # Read the remote URL with a plain config read (no transport, no
+        # hooks, no index refresh) and refuse anything that is not https.
+        try:
+            url_result = subprocess.run(
+                ['git'] + _GIT_SAFE_FLAGS + ['config', '--get', 'remote.origin.url'],
+                cwd=root, capture_output=True, text=True, timeout=15, env=git_env,
+            )
+        except Exception as e:
+            print(f"  — skipped ({e})")
+            failed += 1
+            continue
+
+        remote_url = url_result.stdout.strip()
+        if not _is_safe_git_remote(remote_url):
+            print("  — skipped (no plain-https remote)")
+            logger.info(f"Skipping git repo {root}: remote {remote_url!r} is not a plain https URL.")
+            continue
+
+        try:
+            result = subprocess.run(
+                ['git'] + _GIT_SAFE_FLAGS + ['pull', '--ff-only'],
+                cwd=root, capture_output=True, text=True, timeout=60, env=git_env,
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().splitlines()
+                summary = lines[-1] if lines else 'ok'
+                print(f"  — {summary}")
+                logger.info(f"git pull ok: {root}")
+                pulled += 1
+            else:
+                err = (result.stderr.strip() or result.stdout.strip())[:80]
+                print(f"  — failed: {err}")
+                logger.warning(f"git pull failed in {root}: {err}")
                 failed += 1
-            except Exception as e:
-                print(f"  — error: {e}")
-                logger.warning(f"git pull error in {root}: {e}")
-                failed += 1
+        except subprocess.TimeoutExpired:
+            print("  — timed out")
+            logger.warning(f"git pull timed out in {root}")
+            failed += 1
+        except Exception as e:
+            print(f"  — error: {e}")
+            logger.warning(f"git pull error in {root}: {e}")
+            failed += 1
 
     return pulled, failed
 
@@ -1557,6 +1953,96 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int) -> None:
         logger.debug(f"Desktop notification failed: {e}")
 
 
+def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = None) -> bool:
+    """Show a tray icon while polling for a valid StudOn login.
+
+    Returns True when login is detected, False if the tray library is not
+    available / no display, the user quits via the menu, or the optional
+    wall-clock timeout elapses. The caller should fall back to silent
+    polling on False.
+
+    Polling cadence: every 60s by default; on icon click or "Open login"
+    menu, opens the browser and switches to every 5s for 2 minutes.
+
+    max_wait_seconds: when set, the tray closes after this many seconds
+    even if the user has not interacted. Used by --lecture-sync to
+    avoid blocking a fire window indefinitely.
+    """
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    try:
+        import threading
+        import pystray
+        from PIL import Image, ImageDraw
+    except ImportError as e:
+        logger.info(f"Tray icon unavailable ({e}); falling back to silent polling.")
+        return False
+
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((4, 4, 60, 60), fill=(30, 110, 200, 255), outline=(255, 255, 255, 255), width=3)
+    d.text((20, 18), "S", fill=(255, 255, 255, 255))
+
+    state = {
+        "fast_until": 0.0,    # epoch until which to poll every 5s
+        "logged_in": False,
+        "user_quit": False,
+    }
+    stop_event = threading.Event()
+    deadline = time.time() + max_wait_seconds if max_wait_seconds else None
+
+    def open_login(icon=None, item=None):
+        logger.info("Tray icon: opening browser for StudOn login")
+        _open_url_in_browser(login_url)
+        state["fast_until"] = time.time() + 120  # 2 minutes of 5s polling
+
+    def quit_waiter(icon, item):
+        state["user_quit"] = True
+        stop_event.set()
+        icon.stop()
+
+    def poller(icon):
+        icon.visible = True
+        while not stop_event.is_set():
+            try:
+                if can_access_studon():
+                    state["logged_in"] = True
+                    icon.stop()
+                    return
+            except Exception as e:
+                logger.debug(f"Tray waiter login check failed: {e}")
+            if deadline is not None and time.time() >= deadline:
+                logger.info("Tray icon: max_wait_seconds reached, closing.")
+                stop_event.set()
+                try:
+                    icon.stop()
+                except Exception:
+                    pass
+                return
+            interval = 5 if time.time() < state["fast_until"] else 60
+            if deadline is not None:
+                interval = min(interval, max(1, int(deadline - time.time())))
+            stop_event.wait(interval)
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open StudOn login", open_login, default=True),
+        pystray.MenuItem("Check now", lambda icon, item: state.update(fast_until=time.time() + 120)),
+        pystray.MenuItem("Quit (skip sync)", quit_waiter),
+    )
+    icon = pystray.Icon("studon-scraper", img, "StudOn: waiting for login", menu)
+
+    thread = threading.Thread(target=poller, args=(icon,), daemon=True)
+    thread.start()
+    try:
+        icon.run()
+    except Exception as e:
+        logger.warning(f"Tray icon failed to run: {e}; falling back to silent polling.")
+        stop_event.set()
+        return False
+    stop_event.set()
+    return state["logged_in"]
+
+
 def run_daily_sync(check_interval_seconds: int = 300) -> None:
     """
     Run until a daily sync is performed, then exit.
@@ -1577,45 +2063,48 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
 
     logger.debug(f"Daily sync started, checking every {check_interval_seconds // 60}m")
 
-    firefox_opened = False
     waiting_logged = False
     while True:
         try:
             if not can_access_studon():
                 if not waiting_logged:
-                    logger.info(f"Daily sync: waiting for StudOn login (checking every {check_interval_seconds // 60}m)")
+                    logger.info("Daily sync: waiting for StudOn login (tray icon active)")
                     waiting_logged = True
-                if not firefox_opened:
-                    logger.info("Daily sync: opening Firefox for StudOn login")
-                    try:
-                        proc = subprocess.Popen(["firefox", f"https://{STUDON_DOMAIN}"])
-                        firefox_opened = True
-                        proc.wait()  # block until Firefox is closed
-                        logger.info("Daily sync: Firefox closed, retrying login check")
-                        firefox_opened = False
-                    except FileNotFoundError:
-                        logger.warning("Daily sync: firefox not found in PATH, falling back to polling")
-                        time.sleep(check_interval_seconds)
-                else:
+                login_url = f"https://{STUDON_DOMAIN}"
+                try:
+                    login_url = _get_first_course_url()
+                except Exception:
+                    pass
+                tray_ok = _wait_for_login_via_tray(login_url)
+                if not tray_ok:
+                    # Tray unavailable, user quit, or icon errored — poll silently.
                     time.sleep(check_interval_seconds)
+                waiting_logged = False
                 continue
 
-            success, n_downloaded, n_extracted, session_expired = update_all_courses()
-            if success:
-                try:
-                    fb_processed, fb_files = check_and_process_feedback()
-                    if fb_files:
-                        logger.info(f"Feedback sync: downloaded {fb_files} file(s) across {fb_processed} exercise(s).")
-                        n_downloaded += fb_files
-                except Exception as e:
-                    logger.warning(f"Feedback check failed (non-fatal): {e}")
-                logger.info("Daily sync complete.")
-                _send_desktop_notification(n_downloaded, n_extracted)
-                return
-            elif session_expired:
+            if not _acquire_sync_lock('daily-sync', wait_seconds=600):
+                logger.info("Daily sync: lock busy, deferring 5 min.")
+                time.sleep(300)
+                continue
+            try:
+                success, n_downloaded, n_extracted, session_expired = update_all_courses()
+                if success:
+                    try:
+                        fb_processed, fb_files = check_and_process_feedback()
+                        if fb_files:
+                            logger.info(f"Feedback sync: downloaded {fb_files} file(s) across {fb_processed} exercise(s).")
+                            n_downloaded += fb_files
+                    except Exception as e:
+                        logger.warning(f"Feedback check failed (non-fatal): {e}")
+                    logger.info("Daily sync complete.")
+                    _send_desktop_notification(n_downloaded, n_extracted)
+                    return
+            finally:
+                _release_sync_lock()
+
+            if session_expired:
                 logger.warning("Daily sync: session expired during update, re-entering login wait loop in 2 minutes...")
                 waiting_logged = False
-                firefox_opened = False
                 time.sleep(120)
             else:
                 logger.warning("Daily sync: update_all_courses failed, will retry...")
@@ -1627,6 +2116,568 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
         except Exception as e:
             logger.error(f"Error during daily sync: {e}")
             time.sleep(check_interval_seconds)
+
+_WEEKDAY_PREFIX_TO_INDEX: Dict[str, int] = {
+    'mo': 0, 'di': 1, 'mi': 2, 'do': 3, 'fr': 4, 'sa': 5, 'so': 6,
+}
+
+
+def _parse_entry_day_to_weekday(day_str: str) -> Optional[int]:
+    """Map a campo day label like 'Mo., 11.05.2026' or 'Mi., 13.05.2026Himmelfahrt' to 0..6."""
+    if not day_str:
+        return None
+    s = day_str.strip().lower()
+    return _WEEKDAY_PREFIX_TO_INDEX.get(s[:2])
+
+
+_TIME_RE = re.compile(r'^\s*(\d{1,2}):(\d{2})\s*(?:bis|-|–)\s*(\d{1,2}):(\d{2})')
+
+
+def _parse_entry_times(time_str: str) -> Optional[Tuple[int, int, int, int]]:
+    """Extract (start_h, start_m, end_h, end_m) from an entry's 'time' field."""
+    if not time_str:
+        return None
+    m = _TIME_RE.match(time_str)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+
+
+def _next_occurrence(weekday_idx: int, hour: int, minute: int, now: datetime) -> datetime:
+    """Return the next datetime matching (weekday, hour, minute) at or after now."""
+    days_ahead = (weekday_idx - now.weekday()) % 7
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=days_ahead)
+    if candidate < now:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _compute_fire_schedule(resolved: List[ResolvedLecture], now: datetime,
+                           window_minutes: Tuple[int, int, int] = (-5, 0, 5)) -> List[Tuple[datetime, ResolvedLecture]]:
+    """Build (fire_time, lecture) tuples for the next week, only for 'mapped' entries.
+
+    Three fires per lecture: start-5m, start, start+5m. Sorted ascending.
+    """
+    fires: List[Tuple[datetime, ResolvedLecture]] = []
+    for r in resolved:
+        if r.status != 'mapped':
+            continue
+        wd = _parse_entry_day_to_weekday(r.entry.get('day', ''))
+        times = _parse_entry_times(r.entry.get('time', ''))
+        if wd is None or times is None:
+            continue
+        start_h, start_m, _eh, _em = times
+        # Build all three fires for the next occurrence of this weekday.
+        base_now = now - timedelta(minutes=10)  # tolerance for boot catch-up
+        next_start = _next_occurrence(wd, start_h, start_m, base_now)
+        for offset in window_minutes:
+            fires.append((next_start + timedelta(minutes=offset), r))
+    fires.sort(key=lambda t: t[0])
+    return fires
+
+
+_MD_DAY_HEADING_RE = re.compile(r'^##\s+(Mo|Di|Mi|Do|Fr|Sa|So)\.,.*$', re.IGNORECASE)
+_MD_ROW_RE = re.compile(r'^\|\s*(\d{1,2}:\d{2}\s+bis\s+\d{1,2}:\d{2}(?:\s*\(s\.t\.\))?)\s*\|\s*(.+?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|$')
+
+
+def _parse_timetable_markdown(path: str) -> Optional[Tuple[str, List[Dict]]]:
+    """Parse an existing timetable.md back into entries.
+
+    Used as a fallback when both the JSON cache and a live campo fetch are
+    unavailable (e.g. stale Firefox cookies but a recent timetable on disk).
+    Only the fields the daemon needs are populated (day, title, time, type,
+    room, instructors).
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            md = f.read()
+    except OSError as e:
+        logger.warning(f"Could not read timetable markdown: {e}")
+        return None
+
+    page_title = 'Stundenplan'
+    first_line = md.splitlines()[0] if md.splitlines() else ''
+    if first_line.startswith('# '):
+        page_title = first_line[2:].strip()
+
+    entries: List[Dict] = []
+    current_day = ''
+    in_details = False
+    for line in md.splitlines():
+        if line.strip() == '## Details':
+            in_details = True
+            continue
+        if in_details:
+            continue
+        h = _MD_DAY_HEADING_RE.match(line)
+        if h:
+            # Reconstruct the campo-style day label from the heading
+            current_day = line[2:].strip().rstrip()
+            continue
+        m = _MD_ROW_RE.match(line)
+        if not m or 'Zeit' in m.group(1) or '---' in m.group(1):
+            continue
+        time_str, title, etype, room_col, instructors = m.groups()
+        title = _TRAILING_MARKER_RE.sub('', title).strip()
+        if not title or not current_day:
+            continue
+        entries.append({
+            'day': current_day, 'col': 0, 'title': title, 'time': time_str.strip(),
+            'type': etype.strip(), 'rhythm': '', 'start': '', 'end': '',
+            'room': room_col.strip(), 'building': '', 'instructors': instructors.strip(),
+            'status': '', 'note': '',
+        })
+    if not entries:
+        return None
+    return page_title, entries
+
+
+def _ensure_timetable_entries(max_age_hours: float = 24.0) -> Optional[Tuple[str, List[Dict]]]:
+    """Return cached (page_title, entries) if fresh; else fetch live; else parse timetable.md."""
+    cache = _read_timetable_cache()
+    if cache is not None:
+        fetched_at, page_title, entries = cache
+        if (datetime.now() - fetched_at).total_seconds() < max_age_hours * 3600:
+            return page_title, entries
+    result = _fetch_timetable_entries()
+    if result is not None:
+        _write_timetable_cache(result[0], result[1])
+        return result
+    # Fallback: stale or missing cookies, but a timetable.md may still be on disk.
+    md_path = os.path.join(DOWNLOAD_FOLDER, 'timetable.md')
+    parsed = _parse_timetable_markdown(md_path)
+    if parsed is not None:
+        logger.info("Lecture sync: using on-disk timetable.md (campo fetch failed).")
+    return parsed
+
+
+def _warn_unmapped_once(resolved: List[ResolvedLecture], warned: set) -> None:
+    """Emit one notify-send + log warning per unmapped title per daemon-lifetime."""
+    fresh = [r for r in resolved if r.status == 'unmapped' and r.entry.get('title') not in warned]
+    if not fresh:
+        return
+    titles = sorted({r.entry.get('title', '') for r in fresh})
+    for t in titles:
+        warned.add(t)
+        logger.warning(f"Lecture sync: timetable entry '{t}' is unmapped — run --map-lectures.")
+    if shutil.which("notify-send"):
+        body = "Unmapped: " + ", ".join(titles[:3]) + (" ..." if len(titles) > 3 else "")
+        env = os.environ.copy()
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
+        try:
+            subprocess.run(
+                ["notify-send", "--app-name=StudOn Scraper", "--icon=dialog-warning",
+                 "StudOn lecture-sync: unmapped lectures", body],
+                env=env, timeout=5,
+            )
+        except Exception:
+            pass
+
+
+def _lecture_fetch_one(course: TrackedCourse) -> Tuple[int, int]:
+    """Run a single-course fetch via the existing pipeline. Returns (downloaded, extracted)."""
+    try:
+        cj = browser_cookie3.firefox(domain_name=STUDON_DOMAIN)
+    except Exception as e:
+        raise FirefoxCookieError(e)
+    session = requests.Session()
+    session.cookies.update(cj)
+    session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    downloaded, extracted, _ = process_single_url(
+        course.source_url, session, course.course_folder,
+        create_course_subfolder=False, debug=False,
+    )
+    return downloaded, extracted
+
+
+def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
+    """Long-running daemon for per-lecture single-course sync.
+
+    Reads the campo timetable (or sidecar cache), resolves lecture →
+    course buckets, and schedules fetches at start-5m / start / start+5m
+    for each mapped lecture. Boot catch-up: on startup, immediately runs
+    any fire whose window covers `now`. Single-shot tray for login on each
+    fire — no repeated nagging.
+
+    Args:
+        once: When True, prints the resolved buckets and the next 5 fire
+              times, then exits without fetching. Used for --lecture-sync --once.
+        tray_wait_seconds: Hard cap on the tray-icon wait per fire.
+    """
+    check_platform_compatibility()
+    logger.info(f"Lecture sync starting (once={once}, tray_wait={tray_wait_seconds}s)")
+
+    warned_unmapped: set = set()
+    last_timetable_load = 0.0
+    resolved: List[ResolvedLecture] = []
+    fires: List[Tuple[datetime, ResolvedLecture]] = []
+
+    def reload_schedule() -> None:
+        nonlocal resolved, fires, last_timetable_load
+        result = _ensure_timetable_entries()
+        if result is None:
+            logger.warning("Lecture sync: could not load timetable, will retry later.")
+            resolved, fires = [], []
+            return
+        _page_title, entries = result
+        tracked = _discover_tracked_courses(DOWNLOAD_FOLDER)
+        mapping = _load_lecture_mapping_json()
+        resolved = _resolve_timetable_buckets(entries, tracked, mapping, auto_pin_normalized=True)
+        _warn_unmapped_once(resolved, warned_unmapped)
+        now = datetime.now()
+        fires = _compute_fire_schedule(resolved, now)
+        last_timetable_load = time.time()
+        mapped_count = sum(1 for r in resolved if r.status == 'mapped')
+        unmapped_count = sum(1 for r in resolved if r.status == 'unmapped')
+        logger.info(f"Lecture sync: resolved {len(resolved)} entries — {mapped_count} mapped, "
+                    f"{unmapped_count} unmapped; {len(fires)} fires scheduled.")
+
+    reload_schedule()
+
+    if once:
+        print(f"\nResolved {len(resolved)} timetable entries:")
+        for r in resolved:
+            tag = r.status if r.status != 'mapped' else f"mapped({r.match_kind})"
+            course = r.course.course_title if r.course else ''
+            print(f"  [{tag:20s}] {r.entry.get('title', '')[:60]:60s}  -> {course}")
+        now = datetime.now()
+        upcoming = [f for f in fires if f[0] >= now][:5]
+        print(f"\nNext {len(upcoming)} fires:")
+        for fire_time, r in upcoming:
+            course_name = r.course.course_title if r.course else ''
+            print(f"  {fire_time.strftime('%a %Y-%m-%d %H:%M')}  → {course_name}")
+        return
+
+    while True:
+        try:
+            now = datetime.now()
+            # Reload schedule daily, or if file changed.
+            if time.time() - last_timetable_load > 6 * 3600:
+                reload_schedule()
+                now = datetime.now()
+
+            # Find the next fire (boot catch-up: a fire in the last 10 minutes still counts).
+            due: Optional[Tuple[datetime, ResolvedLecture]] = None
+            for fire_time, r in fires:
+                if fire_time >= now - timedelta(minutes=10):
+                    due = (fire_time, r)
+                    break
+
+            if due is None:
+                # No fires left this week — refresh in 1h.
+                logger.info("Lecture sync: no upcoming fires; sleeping 1h before reload.")
+                time.sleep(3600)
+                reload_schedule()
+                continue
+
+            fire_time, lecture = due
+            wait = (fire_time - now).total_seconds()
+            if wait > 0:
+                course_name = lecture.course.course_title if lecture.course else '?'
+                logger.info(f"Lecture sync: next fire {fire_time.isoformat()} for '{course_name}' "
+                            f"(sleeping {int(wait)}s)")
+                time.sleep(min(wait, 1800))  # cap sleep at 30 min so we recheck schedule
+                if time.time() - last_timetable_load > 6 * 3600:
+                    reload_schedule()
+                continue
+
+            # Fire time. Drop it from the queue so we don't refire.
+            fires = [f for f in fires if f is not due]
+            course = lecture.course
+            if course is None:
+                continue
+
+            if not can_access_studon():
+                logger.info(f"Lecture sync: not logged in at fire {fire_time.isoformat()}; "
+                            f"opening tray (max {tray_wait_seconds}s).")
+                login_url = course.source_url or f"https://{STUDON_DOMAIN}"
+                tray_ok = _wait_for_login_via_tray(login_url, max_wait_seconds=tray_wait_seconds)
+                if not tray_ok or not can_access_studon():
+                    logger.info("Lecture sync: still not logged in after tray window; skipping this fire.")
+                    continue
+
+            if not _acquire_sync_lock(f'lecture-sync:{os.path.basename(course.course_folder)}', wait_seconds=0):
+                logger.info("Lecture sync: another sync is running; skipping this fire.")
+                continue
+            try:
+                logger.info(f"Lecture sync: fetching '{course.course_title}'")
+                try:
+                    downloaded, extracted = _lecture_fetch_one(course)
+                    if downloaded:
+                        _send_desktop_notification(downloaded, extracted)
+                        logger.info(f"Lecture sync: {downloaded} new, {extracted} extracted.")
+                    else:
+                        logger.info("Lecture sync: nothing new.")
+                except FirefoxCookieError as e:
+                    logger.warning(f"Lecture sync: cookies unavailable — {e}")
+                except StudOnError as e:
+                    logger.warning(f"Lecture sync: {e}")
+                except Exception as e:
+                    logger.error(f"Lecture sync: unexpected error fetching '{course.course_title}': {e}")
+            finally:
+                _release_sync_lock()
+
+        except KeyboardInterrupt:
+            logger.info("Lecture sync: interrupted, exiting.")
+            _release_sync_lock()
+            return
+        except Exception as e:
+            logger.error(f"Lecture sync loop error: {e}")
+            time.sleep(60)
+
+
+def run_map_lectures_interactive() -> None:
+    """Interactive helper for inspecting and editing the lecture mapping.
+
+    Loads the timetable cache (or fetches if missing/stale), runs the bucket
+    resolver, prints a summary, and for each Unmapped entry asks the user
+    to either link it to a tracked course or mark it as no-course.
+
+    Refuses to run when stdin is not a TTY — questionary auto-selects the
+    first option on a non-interactive stream, which would silently produce
+    wrong mappings.
+    """
+    if not sys.stdin.isatty():
+        print("❌ --map-lectures requires an interactive terminal. Run it from a shell.")
+        return
+    print("📅 Loading timetable...")
+    result = _ensure_timetable_entries(max_age_hours=24.0)
+    if result is None:
+        print("❌ Could not load timetable. Make sure you're logged into campo in Firefox.")
+        return
+    _page_title, entries = result
+    tracked = _discover_tracked_courses(DOWNLOAD_FOLDER)
+    if not tracked:
+        print("❌ No tracked courses found in the download folder. Register a course first.")
+        return
+    mapping = _load_lecture_mapping_json()
+    # Resolve once with auto-pin so cosmetic mismatches stick.
+    resolved = _resolve_timetable_buckets(entries, tracked, mapping, auto_pin_normalized=True)
+
+    buckets = {'mapped': 0, 'no_course': 0, 'ignored': 0, 'unmapped': 0}
+    for r in resolved:
+        buckets[r.status] = buckets.get(r.status, 0) + 1
+
+    print()
+    print("Mapping summary:")
+    print(f"  ✅ Mapped:    {buckets['mapped']}")
+    print(f"  🚫 No course: {buckets['no_course']}")
+    print(f"  ⏭️  Ignored:  {buckets['ignored']}")
+    print(f"  ❓ Unmapped:  {buckets['unmapped']}")
+    print()
+
+    if buckets['mapped']:
+        print("Mapped lectures:")
+        for r in resolved:
+            if r.status != 'mapped' or r.course is None:
+                continue
+            kind = r.match_kind
+            tag = "📌" if kind == 'explicit' else "🔗"
+            print(f"  {tag} {r.entry.get('title', ''):60s} → {r.course.course_title}")
+        print()
+
+    unmapped = [r for r in resolved if r.status == 'unmapped']
+    if not unmapped:
+        print("✅ All timetable entries are accounted for.")
+        return
+
+    print(f"{len(unmapped)} unmapped lecture(s) need attention.")
+    print()
+
+    # Build picker options for each unmapped entry.
+    course_choices = [(c.course_title, c) for c in tracked]
+    course_choices.sort(key=lambda x: x[0])
+
+    for r in unmapped:
+        title = r.entry.get('title', '')
+        day = r.entry.get('day', '')
+        ttime = r.entry.get('time', '')
+        instructors = r.entry.get('instructors', '')
+        print(f"\n— Unmapped — '{title}'")
+        if day or ttime:
+            print(f"    {day}  {ttime}  {instructors}")
+        if questionary:
+            choices = [questionary.Choice(f"Link to: {name}", value=('link', course)) for name, course in course_choices]
+            choices.append(questionary.Choice("Mark as 'no StudOn course' (skip silently)", value=('no_course', None)))
+            choices.append(questionary.Choice("Skip for now (remains Unmapped, will warn)", value=('skip', None)))
+            action = questionary.select(f"What should '{title}' map to?", choices=choices).ask()
+        else:
+            print("  1. Link to a tracked course")
+            print("  2. Mark as 'no StudOn course'")
+            print("  3. Skip for now")
+            try:
+                resp = (input("  Choice [1/2/3]: ") or '3').strip()
+            except EOFError:
+                resp = '3'
+            if resp == '1':
+                for i, (name, _c) in enumerate(course_choices, 1):
+                    print(f"    {i}. {name}")
+                try:
+                    idx = int(input("    Course #: ").strip()) - 1
+                    action = ('link', course_choices[idx][1]) if 0 <= idx < len(course_choices) else ('skip', None)
+                except (ValueError, EOFError, IndexError):
+                    action = ('skip', None)
+            elif resp == '2':
+                action = ('no_course', None)
+            else:
+                action = ('skip', None)
+
+        if action is None:
+            action = ('skip', None)
+
+        kind, payload = action
+        if kind == 'link' and payload is not None:
+            _add_timetable_title_to_course(payload.metadata_path, title)
+            print(f"  ✅ Linked to '{payload.course_title}'.")
+        elif kind == 'no_course':
+            if title not in mapping['no_course_titles']:
+                mapping['no_course_titles'].append(title)
+                _save_lecture_mapping_json(mapping)
+            print(f"  🚫 Marked '{title}' as no-course.")
+        else:
+            print(f"  ⏭️  Left '{title}' unmapped.")
+
+    print()
+    print("Done. Re-run --map-lectures any time to revisit, or edit:")
+    print(f"  - lecture_mapping.json: {LECTURE_MAPPING_PATH}")
+    print(f"  - METADATA.md per course (timetable_titles list)")
+
+
+def run_discover_from_timetable(debug: bool = False) -> None:
+    """Walk Unmapped campo timetable entries, resolve each to its StudOn URL via the
+    'Detailansicht' button, and register the resulting courses as tracked courses.
+    """
+    if not sys.stdin.isatty():
+        print("❌ --discover-from-timetable requires an interactive terminal.")
+        return
+
+    print("📅 Fetching campo timetable...")
+    try:
+        campo_session = requests.Session()
+        campo_session.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
+        campo_session.cookies.update(browser_cookie3.firefox(domain_name='campo.fau.de'))
+        campo_session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    except Exception as e:
+        print(f"❌ Could not load Firefox cookies for campo: {e}")
+        return
+
+    result = _fetch_timetable_entries()
+    if result is None:
+        return
+    _page_title, entries = result
+
+    tracked = _discover_tracked_courses(DOWNLOAD_FOLDER)
+    mapping = _load_lecture_mapping_json()
+    resolved = _resolve_timetable_buckets(entries, tracked, mapping, auto_pin_normalized=True)
+
+    unmapped = [r for r in resolved if r.status == 'unmapped']
+    if not unmapped:
+        print("✅ Every timetable entry is already mapped — nothing to discover.")
+        return
+
+    print(f"🔍 {len(unmapped)} unmapped entry/entries to investigate.")
+    print()
+
+    # Separate session for the StudOn downloader (different cookie domain).
+    try:
+        studon_session = requests.Session()
+        studon_session.cookies.update(browser_cookie3.firefox(domain_name=STUDON_DOMAIN))
+        studon_session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    except Exception as e:
+        print(f"❌ Could not load Firefox cookies for {STUDON_DOMAIN}: {e}")
+        return
+
+    registered = 0
+    skipped = 0
+    failed = 0
+    seen_titles: set = set()
+
+    for r in unmapped:
+        entry = r.entry
+        title = entry.get('title', '')
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+        button_name = entry.get('detail_button_name', '')
+        if not button_name:
+            print(f"⚠️  '{title}': no detail button found in timetable, skipping.")
+            failed += 1
+            continue
+
+        # Re-fetch the timetable each iteration so the JSF ViewState is fresh.
+        try:
+            page = campo_session.get(CAMPO_TIMETABLE_URL, timeout=30)
+        except Exception as e:
+            print(f"❌ Could not re-fetch timetable: {e}")
+            failed += 1
+            continue
+        if page.status_code != 200:
+            print(f"❌ Timetable re-fetch HTTP {page.status_code}, aborting.")
+            return
+
+        print(f"➡️  '{title}': POSTing detail button...")
+        detail_html = _post_jsf_detail_button(campo_session, page.text, page.url, button_name)
+        if detail_html is None:
+            print(f"   ❌ JSF POST failed for '{title}'.")
+            failed += 1
+            continue
+
+        link = _extract_studon_link(detail_html)
+        if not link:
+            print(f"   ⚠️  No StudOn link found on the detail page for '{title}'.")
+            failed += 1
+            continue
+
+        print(f"   🔗 Found StudOn link: {link}")
+        final_url = _resolve_studon_course_url(studon_session, link)
+        if not final_url:
+            print(f"   ❌ Could not resolve final ILIAS URL for '{title}'.")
+            failed += 1
+            continue
+        print(f"   ✅ Resolved to: {final_url}")
+
+        if questionary:
+            confirm = questionary.confirm(
+                f"Register '{title}' as a new tracked course?", default=True
+            ).ask()
+        else:
+            try:
+                confirm = (input(f"   Register '{title}' as a new tracked course? [Y/n]: ") or 'y').strip().lower() != 'n'
+            except EOFError:
+                confirm = False
+
+        if not confirm:
+            print(f"   ⏭️  Skipped '{title}'.")
+            skipped += 1
+            continue
+
+        try:
+            n_dl, n_ex, _ = process_single_url(
+                final_url, studon_session,
+                base_download_path=DOWNLOAD_FOLDER,
+                create_course_subfolder=True,
+                debug=debug,
+            )
+        except Exception as e:
+            print(f"   ❌ Download failed for '{title}': {e}")
+            failed += 1
+            continue
+
+        # Pin the verbatim timetable title onto the freshly-created course.
+        course_title = extract_course_title(final_url, studon_session, debug=debug)
+        if course_title:
+            meta_path = os.path.join(DOWNLOAD_FOLDER, course_title, "METADATA.md")
+            if os.path.exists(meta_path):
+                _add_timetable_title_to_course(meta_path, title)
+
+        print(f"   📦 Registered '{title}' ({n_dl} downloaded, {n_ex} extracted).")
+        registered += 1
+
+    print()
+    print(f"Done. Registered: {registered}  Skipped: {skipped}  Failed: {failed}")
+
 
 def _course_folder_stats(folder_path: str) -> Tuple[int, int]:
     """Return (file_count, total_bytes) for a course folder, skipping meta files."""
@@ -1799,14 +2850,14 @@ def show_startup_overview(download_folder: str) -> None:
 
 
 def _is_installed() -> bool:
-    """Return True if the cron job for this script is already registered."""
+    """Return True if a cron job for this script is already registered."""
     script_path = os.path.abspath(__file__)
     try:
         proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
         if proc.returncode != 0:
             return False
         return any(
-            script_path in line and '--daily-sync' in line
+            script_path in line and ('--daily-sync' in line or '--lecture-sync' in line)
             for line in proc.stdout.splitlines()
         )
     except FileNotFoundError:
@@ -1814,20 +2865,20 @@ def _is_installed() -> bool:
 
 
 def _run_uninstall() -> None:
-    """Remove the cron job and bashrc function installed by --install."""
+    """Remove the cron jobs and bashrc function installed by --install."""
     script_path = os.path.abspath(__file__)
     # --- Cron ---
     try:
         proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
         existing = proc.stdout if proc.returncode == 0 else ''
         clean = [l for l in existing.splitlines()
-                 if not (script_path in l and '--daily-sync' in l)]
+                 if not (script_path in l and ('--daily-sync' in l or '--lecture-sync' in l))]
         if len(clean) < len(existing.splitlines()):
             subprocess.run(['crontab', '-'], input='\n'.join(clean) + '\n',
                            capture_output=True, text=True)
-            print("  ✅ Cron job removed.")
+            print("  ✅ Cron jobs removed.")
         else:
-            print("  No matching cron entry found.")
+            print("  No matching cron entries found.")
     except FileNotFoundError:
         print("  crontab not available — skipping.")
 
@@ -1928,12 +2979,16 @@ def _run_install(check_interval: int = 5) -> None:
             print(f"  Saved: {expanded}")
     print()
 
-    # --- Cron job ---
-    cron_cmd = f"@reboot cd {script_dir} && {python} {script_path} --daily-sync"
+    # --- Cron jobs ---
+    daily_cmd = f"@reboot cd {script_dir} && {python} {script_path} --daily-sync"
     if check_interval != 5:
-        cron_cmd += f" --interval {check_interval}"
+        daily_cmd += f" --interval {check_interval}"
+    lecture_cmd = f"@reboot cd {script_dir} && {python} {script_path} --lecture-sync"
+    desired_cmds = [daily_cmd, lecture_cmd]
 
-    print(f"Cron entry:  {cron_cmd}")
+    print("Cron entries:")
+    for c in desired_cmds:
+        print(f"  {c}")
     print()
 
     cron_ok = False
@@ -1944,33 +2999,35 @@ def _run_install(check_interval: int = 5) -> None:
         print("  ERROR: crontab not found — install it manually.")
         existing_tab = None
 
+    def _is_studon_line(l: str) -> bool:
+        return 'studon' in l and ('--daily-sync' in l or '--lecture-sync' in l)
+
     if existing_tab is not None:
-        studon_lines = [l for l in existing_tab.splitlines()
-                        if 'studon' in l and '--daily-sync' in l]
-        if studon_lines and len(studon_lines) == 1 and studon_lines[0] == cron_cmd:
-            print("  Cron job already up to date.")
+        existing_lines = existing_tab.splitlines()
+        studon_lines = [l for l in existing_lines if _is_studon_line(l)]
+        already_ok = sorted(studon_lines) == sorted(desired_cmds)
+        if already_ok:
+            print("  Cron entries already up to date.")
             cron_ok = True
         else:
             if studon_lines:
-                print(f"  Replacing existing entry:")
+                print(f"  Replacing existing entries:")
                 for l in studon_lines:
                     print(f"    {l}")
                 if input("  Replace? [Y/n]: ").strip().lower() == 'n':
-                    print("  Keeping existing cron entry.")
-                    cron_ok = True  # treat as ok — user chose to keep it
-                    studon_lines = []  # skip write
+                    print("  Keeping existing cron entries.")
+                    cron_ok = True
                 else:
-                    studon_lines = studon_lines  # will be removed below
+                    studon_lines = []  # signal rewrite
             if not cron_ok:
-                clean = [l for l in existing_tab.splitlines()
-                         if not ('studon' in l and '--daily-sync' in l)]
-                clean.append(cron_cmd)
+                clean = [l for l in existing_lines if not _is_studon_line(l)]
+                clean.extend(desired_cmds)
                 new_tab = '\n'.join(clean) + '\n'
                 result = subprocess.run(['crontab', '-'], input=new_tab,
                                         capture_output=True, text=True)
                 cron_ok = result.returncode == 0
                 if cron_ok:
-                    print("  Cron job installed.")
+                    print("  Cron entries installed.")
                 else:
                     print(f"  Failed: {result.stderr.strip()}")
     print()
@@ -2009,10 +3066,22 @@ def _run_install(check_interval: int = 5) -> None:
     print("╚════════════════════════════════════════════════════════════╝")
     if not cron_ok:
         print()
-        print("To add the cron job manually:")
+        print("To add the cron jobs manually:")
         print("   crontab -e")
-        print(f"   # Add: {cron_cmd}")
+        for c in desired_cmds:
+            print(f"   # Add: {c}")
         print()
+
+    # --- Lecture mapping (interactive) ---
+    print()
+    print("Running --map-lectures to verify your timetable ↔ course mapping...")
+    print("(You can re-run this any time with: python studon_scraper.py --map-lectures)")
+    print()
+    try:
+        run_map_lectures_interactive()
+    except Exception as e:
+        logger.warning(f"Could not run lecture mapping: {e}")
+        print(f"⚠️  Lecture mapping skipped: {e}")
 
 
 # --- FEEDBACK MAIL CHECKER (FAUmail IMAP → StudOn exc page → PDF download) ---
@@ -2025,6 +3094,26 @@ FEEDBACK_SUBJECT_PATTERN = re.compile(r"Es wurde eine neue Feedback-Datei", re.I
 EXC_URL_PATTERN = re.compile(r"https://www\.studon\.fau\.de/studon/goto?\.php\?[^\s]+|https://www\.studon\.fau\.de/studon/go/exc/\d+/\d+")
 UEBUNGSEINHEIT_PATTERN = re.compile(r"Übungseinheit:\s*(.+)", re.IGNORECASE)
 UEBUNG_PATTERN = re.compile(r"^Übung:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
+def _is_genuine_feedback_email(subject: str, from_header: str) -> bool:
+    """True if a message looks like a real StudOn feedback notification.
+
+    Requires both the subject pattern and a sender address within fau.de.
+    IMAP messages are unauthenticated input: without the sender check,
+    anyone who emails the user could trigger an authenticated StudOn fetch
+    just by sending a message with the expected subject line. FAU's own
+    mail server rejects spoofed @fau.de senders, so an in-domain sender is
+    a meaningful authenticity signal here.
+    """
+    if not FEEDBACK_SUBJECT_PATTERN.search(subject or ''):
+        return False
+    _name, addr = email.utils.parseaddr(from_header or '')
+    addr = addr.lower().strip()
+    if '@' not in addr:
+        return False
+    host = addr.rsplit('@', 1)[1]
+    return host == 'fau.de' or host.endswith('.fau.de')
 
 
 def _load_feedback_state() -> dict:
@@ -2215,13 +3304,18 @@ def fetch_feedback_emails(days_back: int = 30, verbose: bool = False) -> List[di
 
             for uid in uids:
                 try:
-                    typ, msg_data = M.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID)])")
+                    typ, msg_data = M.fetch(uid, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID FROM)])")
                     if typ != "OK" or not msg_data or not msg_data[0]:
                         continue
                     header_bytes = msg_data[0][1] if isinstance(msg_data[0], tuple) else msg_data[0]
                     header_msg = email_mod.message_from_bytes(header_bytes)
                     subject = _decode_header(header_msg.get("Subject", ""))
                     if not FEEDBACK_SUBJECT_PATTERN.search(subject):
+                        continue
+                    from_hdr = _decode_header(header_msg.get("From", ""))
+                    if not _is_genuine_feedback_email(subject, from_hdr):
+                        logger.warning(f"Feedback email '{subject[:60]}' rejected: "
+                                       f"sender {from_hdr!r} is not within fau.de — possible spoof.")
                         continue
                     total_subject_matches += 1
                     early_message_id = (header_msg.get("Message-ID") or "").strip()
@@ -2320,7 +3414,7 @@ def discover_feedback_files(exc_url: str, session: requests.Session) -> List[Dic
             if not href or href.startswith("#") or href.startswith("javascript:"):
                 continue
             full = urljoin(resp.url, href)
-            if STUDON_DOMAIN not in full:
+            if not _url_host_matches(full, STUDON_DOMAIN):
                 continue
             if _FEEDBACK_DOWNLOAD_HREF.search(href) and full not in seen_dl_urls:
                 seen_dl_urls.add(full)
@@ -2333,7 +3427,7 @@ def discover_feedback_files(exc_url: str, session: requests.Session) -> List[Dic
                 if not href:
                     continue
                 full = urljoin(resp.url, href)
-                if STUDON_DOMAIN not in full or full in seen_pages:
+                if not _url_host_matches(full, STUDON_DOMAIN) or full in seen_pages:
                     continue
                 # Recurse into exercise/assignment sub-views
                 if re.search(r"(cmdClass=ilexercise|ass_id=|cmd=showAssignment|cmd=submissionFeedback|cmd=showOverview|exc_listfeedback|listFeedback)", href, re.IGNORECASE):
@@ -3005,11 +4099,11 @@ def _tui_prompt_download_path() -> Optional[str]:
     return str(Path(path).expanduser().resolve()) if path else None
 
 
-def fetch_timetable_markdown(output_path: Optional[str] = None) -> Optional[str]:
-    """
-    Fetch the personal campo timetable and write it as a Markdown file.
-    Returns the output path on success, None on failure.
-    Requires Firefox cookies for both fau.de and campo.fau.de.
+def _fetch_timetable_entries() -> Optional[Tuple[str, List[Dict]]]:
+    """Fetch and parse the personal campo timetable.
+
+    Returns (page_title, entries) on success, None on failure. Requires
+    Firefox cookies for both fau.de and campo.fau.de.
     """
     import re as _re
 
@@ -3034,13 +4128,29 @@ def fetch_timetable_markdown(output_path: Optional[str] = None) -> Optional[str]
 
     days = [c.get_text(strip=True) for c in soup.find_all('div', class_='colhead')]
 
-    # Parse each schedule panel
+    # Build a (col, termin) → JSF button name lookup. The course-detail buttons
+    # live outside the schedulePanel divs (smallscreen/mobile section) but share
+    # the same scheduleColumn/termin indexing.
+    detail_buttons: Dict[Tuple[int, int], str] = {}
+    for b in soup.find_all(['button', 'input']):
+        bid = b.get('id') or ''
+        if not bid.endswith(':course_detail_link_smallscreen'):
+            continue
+        mcol = _re.search(r'scheduleColumn:(\d+)', bid)
+        mtrm = _re.search(r'termin:(\d+)', bid)
+        if not (mcol and mtrm):
+            continue
+        detail_buttons[(int(mcol.group(1)), int(mtrm.group(1)))] = b.get('name') or bid
+
     entries: List[Dict] = []
     for panel in soup.find_all('div', class_='schedulePanel'):
         pid = panel.get('id', '')
         m = _re.search(r'scheduleColumn:(\d+)', pid)
         col = int(m.group(1)) if m else 0
+        m_term = _re.search(r'termin:(\d+)', pid)
+        termin = int(m_term.group(1)) if m_term else 0
         day = days[col] if col < len(days) else f"Tag {col+1}"
+        detail_button_name = detail_buttons.get((col, termin), '')
 
         def span(suffix: str) -> str:
             el = panel.find('span', id=lambda x: x and x.endswith(suffix))
@@ -3071,20 +4181,93 @@ def fetch_timetable_markdown(output_path: Optional[str] = None) -> Optional[str]
             time_str += f" ({time_note})"
 
         entries.append({
-            'day': day, 'col': col, 'title': title, 'time': time_str,
+            'day': day, 'col': col, 'termin': termin, 'title': title, 'time': time_str,
             'type': etype, 'rhythm': rhythm, 'start': start_date, 'end': end_date,
             'room': room, 'building': building, 'instructors': instructors,
             'status': status, 'note': note,
+            'detail_button_name': detail_button_name,
         })
 
     if not entries:
         print("⚠️  No timetable entries found. Are you logged into campo in Firefox?")
         return None
 
-    # Sort: by day column, then by start time
     entries.sort(key=lambda e: (e['col'], e['time']))
+    return page_title, entries
 
-    # Build Markdown
+
+def _post_jsf_detail_button(
+    session: requests.Session, page_html: str, page_url: str, button_name: str
+) -> Optional[str]:
+    """Programmatically 'click' a JSF submit button by POSTing the enclosing form.
+
+    Returns the response HTML on success, or None on failure.
+    """
+    from urllib.parse import urljoin
+    soup = BeautifulSoup(page_html, 'html.parser')
+    form = soup.find('form', id='plan') or soup.find('form')
+    if form is None:
+        return None
+    action = form.get('action') or page_url
+    post_url = urljoin(page_url, action)
+    data: List[Tuple[str, str]] = []
+    for inp in form.find_all('input'):
+        name = inp.get('name')
+        if not name:
+            continue
+        itype = (inp.get('type') or 'text').lower()
+        if itype in ('submit', 'button', 'image'):
+            continue
+        data.append((name, inp.get('value', '') or ''))
+    # Trigger the specific command button by name.
+    data.append((button_name, ''))
+    try:
+        r = session.post(post_url, data=data, allow_redirects=True)
+    except Exception as e:
+        logger.warning(f"JSF detail-button POST failed: {e}")
+        return None
+    if r.status_code != 200:
+        logger.warning(f"JSF detail-button POST returned HTTP {r.status_code}.")
+        return None
+    return r.text
+
+
+def _extract_studon_link(detail_html: str) -> Optional[str]:
+    """Pick out the 'Link zur Lehrveranstaltung auf StudOn' anchor from a campo detail page."""
+    soup = BeautifulSoup(detail_html, 'html.parser')
+    for label in soup.find_all('label'):
+        if 'StudOn' in label.get_text() and 'Lehrveranstaltung' in label.get_text():
+            for_id = label.get('for')
+            if for_id:
+                answer = soup.find(id=for_id)
+                if answer:
+                    a = answer.find('a', href=True)
+                    if a and 'studon.fau.de' in a['href']:
+                        return a['href']
+    # Fallback: any campo→studon proxy link on the page.
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if 'studon.fau.de/campo/course/' in href or 'studon.fau.de/studon/' in href:
+            return href
+    return None
+
+
+def _resolve_studon_course_url(session: requests.Session, link_url: str) -> Optional[str]:
+    """Follow a campo→studon proxy link to its final ILIAS URL."""
+    try:
+        r = session.get(link_url, allow_redirects=True, timeout=30)
+    except Exception as e:
+        logger.warning(f"Could not resolve StudOn link {link_url}: {e}")
+        return None
+    final = r.url
+    if not _url_host_matches(final, STUDON_DOMAIN):
+        logger.warning(f"Resolved URL is not on studon.fau.de: {final}")
+        return None
+    return final
+
+
+def _render_timetable_markdown(page_title: str, entries: List[Dict]) -> str:
+    """Render parsed timetable entries to the existing Markdown layout."""
     from datetime import datetime as _dt
     lines = [
         f"# {page_title}",
@@ -3109,7 +4292,6 @@ def fetch_timetable_markdown(output_path: Optional[str] = None) -> Optional[str]
             lines.append(f"| {e['time']} | {title_cell} | {e['type']} | {room_col} | {e['instructors']} |")
         lines.append("")
 
-    # Detailed section
     lines += ["---", "", "## Details", ""]
     for e in entries:
         lines.append(f"### {e['title']}")
@@ -3132,14 +4314,201 @@ def fetch_timetable_markdown(output_path: Optional[str] = None) -> Optional[str]
             lines.append(f"- **Hinweis:** {e['note']}")
         lines.append("")
 
-    md = '\n'.join(lines)
+    return '\n'.join(lines)
 
+
+def _timetable_cache_path() -> str:
+    """Sidecar JSON path for structured timetable entries (consumed by --lecture-sync)."""
+    return os.path.join(DOWNLOAD_FOLDER, '.timetable_entries.json')
+
+
+def _write_timetable_cache(page_title: str, entries: List[Dict]) -> None:
+    """Persist parsed entries next to timetable.md for daemon consumption."""
+    path = _timetable_cache_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump({
+                'fetched_at': datetime.now().isoformat(),
+                'page_title': page_title,
+                'entries': entries,
+            }, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        logger.warning(f"Could not write timetable cache: {e}")
+
+
+def _read_timetable_cache() -> Optional[Tuple[datetime, str, List[Dict]]]:
+    """Return (fetched_at, page_title, entries) from sidecar cache, or None."""
+    path = _timetable_cache_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        fetched_at = datetime.fromisoformat(data['fetched_at'])
+        return fetched_at, data.get('page_title', 'Stundenplan'), data.get('entries', [])
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.warning(f"Could not read timetable cache: {e}")
+        return None
+
+
+def fetch_timetable_markdown(output_path: Optional[str] = None) -> Optional[str]:
+    """Fetch campo timetable, write Markdown + structured JSON cache.
+
+    Returns the output Markdown path on success, None on failure. Requires
+    Firefox cookies for both fau.de and campo.fau.de.
+    """
+    result = _fetch_timetable_entries()
+    if result is None:
+        return None
+    page_title, entries = result
+
+    md = _render_timetable_markdown(page_title, entries)
     if output_path is None:
         output_path = os.path.join(DOWNLOAD_FOLDER, 'timetable.md')
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(md)
     print(f"✅ Timetable written to {output_path}")
+    _write_timetable_cache(page_title, entries)
+    return output_path
+
+
+# --- CAMPO PRÜFUNGEN (study-planner detail-view scraper) ---
+
+_CAMPO_PERIOD_RE = re.compile(
+    r'(Prüfungs[a-zäöüß]+zeitraum|Anmeldezeitraum|Abmeldezeitraum|Belegungszeitraum)\s+(\S+)\s+von\s+'
+    r'([\d.]+)\s+([\d:]+)\s+bis\s+([\d.]+)\s+([\d:]+)(?:\s*-\s*(.+))?',
+    re.IGNORECASE,
+)
+
+
+def _parse_campo_pruefung_detail(html: str) -> Optional[Dict]:
+    """Parse a Campo studyPlanner Detailansicht page. Returns dict with module
+    name and Zeiträume, or None if not a usable Prüfung/module detail.
+    """
+    soup = BeautifulSoup(html, 'html.parser')
+    title_tag = soup.title
+    if not title_tag or 'Detailansicht' not in title_tag.get_text():
+        return None
+
+    module_name: Optional[str] = None
+    for h in soup.find_all('h3'):
+        t = h.get_text(' ', strip=True)
+        if t.startswith('Permalink: Elementdaten '):
+            module_name = t[len('Permalink: Elementdaten '):].strip()
+            break
+    if not module_name:
+        return None
+
+    periods: List[Dict[str, str]] = []
+    for ul in soup.find_all('ul', class_='listStyleIconSimple'):
+        for li in ul.find_all('li'):
+            m = _CAMPO_PERIOD_RE.search(li.get_text(' ', strip=True))
+            if m:
+                periods.append({
+                    'type': m.group(1),
+                    'semester': m.group(2),
+                    'start': f"{m.group(3)} {m.group(4)}",
+                    'end': f"{m.group(5)} {m.group(6)}",
+                    'status': (m.group(7) or '').strip(),
+                })
+
+    if not periods:
+        return None
+    return {'module_name': module_name, 'periods': periods}
+
+
+def _iter_campo_detail_pages(session: requests.Session,
+                              max_flow: int = 12,
+                              max_step: int = 30) -> List[Tuple[str, Dict]]:
+    """Iterate Campo studyPlanner flowExecutionKeys (e<f>s<s>) reachable in the
+    current Firefox session and return (flow_key, parsed_detail) for each
+    Detailansicht with Zeiträume. Dedupes by module name.
+
+    The student must have opened the relevant Modul/Prüfungs-Detailansichten in
+    Firefox beforehand — flow execution keys are server-side per-session state.
+    """
+    base = CAMPO_STUDY_PLANNER_URL + '&_flowExecutionKey='
+    seen_modules: set = set()
+    results: List[Tuple[str, Dict]] = []
+    for f in range(1, max_flow + 1):
+        consecutive_misses = 0
+        for s in range(1, max_step + 1):
+            key = f'e{f}s{s}'
+            try:
+                r = session.get(base + key, allow_redirects=False, timeout=15)
+            except requests.RequestException:
+                continue
+            if r.status_code != 200:
+                consecutive_misses += 1
+                if consecutive_misses >= 6:
+                    break
+                continue
+            consecutive_misses = 0
+            parsed = _parse_campo_pruefung_detail(r.text)
+            if parsed and parsed['module_name'] not in seen_modules:
+                seen_modules.add(parsed['module_name'])
+                results.append((key, parsed))
+    return results
+
+
+def _render_campo_pruefungen_markdown(results: List[Tuple[str, Dict]]) -> str:
+    from datetime import datetime as _dt
+    lines = [
+        "# Prüfungen & Anmeldefristen",
+        "",
+        f"> Auto-generated {_dt.now().strftime('%Y-%m-%d %H:%M')} by `studon-scraper --campo-pruefungen`.",
+        "> Quelle: campo.fau.de StudyPlanner Detailansichten. Damit ein Modul hier erscheint,",
+        "> muss seine Detailansicht vorher in Firefox geöffnet worden sein "
+        "(`_flowExecutionKey` ist server-seitig pro Sitzung).",
+        "",
+        "| Modul | Typ | Semester | Von | Bis | Status |",
+        "|-------|-----|----------|-----|-----|--------|",
+    ]
+    for _key, parsed in sorted(results, key=lambda kv: kv[1]['module_name']):
+        mod = parsed['module_name']
+        for p in parsed['periods']:
+            lines.append(
+                f"| {mod} | {p['type']} | {p['semester']} | "
+                f"{p['start']} | {p['end']} | {p['status']} |"
+            )
+    lines.append("")
+    return '\n'.join(lines)
+
+
+def fetch_campo_pruefungen_markdown(output_path: Optional[str] = None) -> Optional[str]:
+    """Scan Campo studyPlanner Detailansichten reachable via current Firefox
+    session and write Prüfungs-Anmeldefristen to `pruefungen.md`.
+    """
+    print("🔄 Scanning Campo studyPlanner detail views...")
+    try:
+        session = requests.Session()
+        session.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
+        session.cookies.update(browser_cookie3.firefox(domain_name='campo.fau.de'))
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+    except Exception as e:
+        print(f"❌ Could not load Firefox cookies: {e}")
+        return None
+
+    probe = session.get(CAMPO_STUDY_PLANNER_URL, allow_redirects=True, timeout=15)
+    if probe.status_code != 200 or 'Studienplaner' not in probe.text:
+        print("❌ Campo studyPlanner not reachable. Log into campo.fau.de in Firefox and retry.")
+        return None
+
+    results = _iter_campo_detail_pages(session)
+    if not results:
+        print("⚠️  No Detailansicht pages found in current Campo session.")
+        print("    Open module/Prüfung Detailansichten in Firefox first, then re-run.")
+        return None
+
+    md = _render_campo_pruefungen_markdown(results)
+    if output_path is None:
+        output_path = os.path.join(DOWNLOAD_FOLDER, 'pruefungen.md')
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(md)
+    print(f"✅ Prüfungen written to {output_path} ({len(results)} module(s))")
     return output_path
 
 
@@ -3169,6 +4538,8 @@ def _run_tui_menu(debug: bool = False) -> None:
         questionary.Choice("Update all tracked courses", value="update_all") if questionary else "Update all tracked courses",
         questionary.Choice("Check FAUmail for feedback files now", value="check_feedback") if questionary else "Check FAUmail for feedback files now",
         questionary.Choice("Fetch timetable → timetable.md", value="timetable") if questionary else "Fetch timetable → timetable.md",
+        questionary.Choice("Map lecture schedule → tracked courses", value="map_lectures") if questionary else "Map lecture schedule → tracked courses",
+        questionary.Choice("Discover & register new courses from timetable", value="discover_timetable") if questionary else "Discover & register new courses from timetable",
         questionary.Choice("Set default download path", value="set_path") if questionary else "Set default download path",
         questionary.Choice(install_label, value=install_value) if questionary else install_label,
         questionary.Choice(imap_label, value=imap_value) if questionary else imap_label,
@@ -3180,9 +4551,12 @@ def _run_tui_menu(debug: bool = False) -> None:
     else:
         labels = ["Register & download a course URL", "Dry-run all registered courses (preview new files)",
                   "Update all tracked courses", "Check FAUmail for feedback files now",
-                  "Fetch timetable → timetable.md",
+                  "Fetch timetable → timetable.md", "Map lecture schedule → tracked courses",
+                  "Discover & register new courses from timetable",
                   "Set default download path", install_label, imap_label, "Exit"]
-        values = ["url", "dry_run", "update_all", "check_feedback", "timetable", "set_path", install_value, imap_value, "exit"]
+        values = ["url", "dry_run", "update_all", "check_feedback", "timetable", "map_lectures",
+                  "discover_timetable",
+                  "set_path", install_value, imap_value, "exit"]
         for i, label in enumerate(labels, 1):
             print(f"  {i}. {label}")
         try:
@@ -3242,6 +4616,14 @@ def _run_tui_menu(debug: bool = False) -> None:
         fetch_timetable_markdown()
         return
 
+    if action == "map_lectures":
+        run_map_lectures_interactive()
+        return
+
+    if action == "discover_timetable":
+        run_discover_from_timetable(debug=debug)
+        return
+
     if action == "dry_run":
         session = _make_session()
         if session is None:
@@ -3294,6 +4676,14 @@ def main() -> None:
                         help='Update all courses by scanning existing METADATA.md files')
     parser.add_argument('--daily-sync', action='store_true',
                        help='Wait for Firefox and perform daily sync, then exit (for @reboot cron)')
+    parser.add_argument('--lecture-sync', action='store_true',
+                       help='Run the per-lecture sync daemon (fetches the current course at start-5m/start/start+5m). Intended for @reboot cron.')
+    parser.add_argument('--lecture-sync-once', action='store_true',
+                       help='Print resolved timetable buckets and next 5 fires, then exit (testing).')
+    parser.add_argument('--map-lectures', action='store_true',
+                       help='Interactively map campo timetable entries to tracked StudOn courses.')
+    parser.add_argument('--discover-from-timetable', action='store_true',
+                       help='For each Unmapped campo timetable entry, follow the Detailansicht button to its StudOn course and register it as a tracked course.')
     parser.add_argument('--interval', '-i', type=int, default=5,
                        help='Check interval in minutes for --daily-sync (default: 5)')
     parser.add_argument('--debug', '-d', action='store_true',
@@ -3308,6 +4698,8 @@ def main() -> None:
                        help='Install cron job and shell function (replaces setup_daily_sync.sh)')
     parser.add_argument('--timetable', action='store_true',
                        help='Fetch personal campo timetable and write to timetable.md')
+    parser.add_argument('--campo-pruefungen', action='store_true',
+                       help='Scan campo studyPlanner Detailansichten (opened in Firefox) and write pruefungen.md')
     parser.add_argument('--install-imap', action='store_true',
                        help='Configure FAUmail IMAP credentials (for feedback-file auto-download)')
     parser.add_argument('--uninstall-imap', action='store_true',
@@ -3322,6 +4714,11 @@ def main() -> None:
     # --- Timetable export ---
     if args.timetable:
         fetch_timetable_markdown()
+        return
+
+    # --- Campo Prüfungstermine / Anmeldefristen ---
+    if args.campo_pruefungen:
+        fetch_campo_pruefungen_markdown()
         return
 
     # --- IMAP setup ---
@@ -3379,6 +4776,20 @@ def main() -> None:
     if args.daily_sync:
         check_interval_seconds = args.interval * 60
         run_daily_sync(check_interval_seconds=check_interval_seconds)
+        return
+
+    # Lecture sync (per-lecture daemon)
+    if args.lecture_sync:
+        run_lecture_sync(once=False)
+        return
+    if args.lecture_sync_once:
+        run_lecture_sync(once=True)
+        return
+    if args.map_lectures:
+        run_map_lectures_interactive()
+        return
+    if args.discover_from_timetable:
+        run_discover_from_timetable(debug=args.debug)
         return
 
     effective_folder = args.download_path if (args.update_all and args.download_path) else DOWNLOAD_FOLDER
