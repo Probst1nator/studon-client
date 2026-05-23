@@ -379,3 +379,26 @@ def test_is_studon_url_rejects_substring_lookalikes():
     assert not s._is_studon_url('https://studon.fau.de.attacker.com/x')
     assert not s._is_studon_url('https://attacker.com/?studon.fau.de')
     assert not s._is_studon_url('not-a-url')
+
+
+# --- 7z symlink containment (verified handled by py7zr >=1.0) ----------------
+
+def test_extract_archive_refuses_7z_with_symlink_member(tmp_path):
+    """A 7z carrying an out-of-tree symlink member must not extract. py7zr >=1.0
+    rejects this itself (Bad7zFile 'Symlink point out of target directory') and
+    extract_archive surfaces it as a refusal. Regression guard: catches a py7zr
+    downgrade below the symlink-aware version, or a 7z-branch change that would
+    let such an archive through."""
+    import pytest
+    py7zr = pytest.importorskip('py7zr')
+    course = tmp_path / 'course'
+    course.mkdir()
+    src = tmp_path / 'src'
+    src.mkdir()
+    os.symlink('/etc/hostname', str(src / 'evil_link'))
+    (src / 'normal.txt').write_text('hi')
+    archive = course / 'mal.7z'
+    with py7zr.SevenZipFile(str(archive), 'w') as a:
+        a.writeall(str(src), 'data')
+    assert s.extract_archive(str(archive)) is False
+    assert not os.path.lexists(str(course / 'mal' / 'data' / 'evil_link'))
