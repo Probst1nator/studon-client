@@ -1648,6 +1648,55 @@ def _is_safe_git_remote(url: str) -> bool:
     return url.strip().lower().startswith('https://')
 
 
+# Config / .gitattributes tokens that turn a `git pull` into code execution.
+# _GIT_SAFE_FLAGS neutralises ext::/file transports, fsmonitor and hooks, but a
+# .gitattributes-assigned clean/smudge filter driver still runs a command on
+# checkout and cannot be pre-empted by a `-c` flag (its name is attacker-chosen).
+_GIT_UNSAFE_CONFIG_TOKENS = (
+    '[filter ', '[diff ', 'fsmonitor', 'hookspath', 'sshcommand',
+    'pager', 'command', '[include', 'helper',
+)
+
+
+def _git_repo_is_safe_to_pull(repo_root: str) -> bool:
+    """True only if the repo carries no config or attributes that make a
+    `git pull` execute a command.
+
+    A repo found in the download tree is untrusted — it can arrive via an
+    extracted archive or Syncthing. _GIT_SAFE_FLAGS covers the config keys it
+    can override with `-c`; this gate refuses what it cannot, notably a
+    .gitattributes-assigned filter/diff driver (the driver name is attacker-
+    chosen, so no fixed `-c` flag neutralises it). A refused repo is skipped;
+    the user can still pull it by hand if they trust it.
+    """
+    git_dir = os.path.join(repo_root, '.git')
+    if not os.path.isdir(git_dir):
+        return False
+    try:
+        cfg = os.path.join(git_dir, 'config')
+        if os.path.exists(cfg):
+            with open(cfg, 'r', errors='replace') as fh:
+                text = fh.read().lower()
+            if any(tok in text for tok in _GIT_UNSAFE_CONFIG_TOKENS):
+                return False
+        attr_files = [os.path.join(git_dir, 'info', 'attributes')]
+        for root, dirs, files in os.walk(repo_root):
+            if '.git' in dirs:
+                dirs.remove('.git')
+            if '.gitattributes' in files:
+                attr_files.append(os.path.join(root, '.gitattributes'))
+        for attr in attr_files:
+            if not os.path.exists(attr):
+                continue
+            with open(attr, 'r', errors='replace') as fh:
+                atext = fh.read().lower()
+            if 'filter=' in atext or 'diff=' in atext:
+                return False
+    except OSError:
+        return False
+    return True
+
+
 def pull_git_repos(base_folder: str) -> Tuple[int, int]:
     """
     Walk base_folder, find git repos, and fast-forward any that have a plain
@@ -1676,6 +1725,14 @@ def pull_git_repos(base_folder: str) -> Tuple[int, int]:
         dirs.remove('.git')  # don't recurse inside .git
         rel = os.path.relpath(root, base_folder)
         print(f"  git  {rel}", end='', flush=True)
+
+        # Refuse repos whose config/attributes can run a command on `git pull`
+        # (filter drivers, hooks, *Command keys) before invoking git at all.
+        if not _git_repo_is_safe_to_pull(root):
+            print("  — skipped (declares hooks/filters/command config)")
+            logger.warning(f"Skipping git repo {root}: .git config/attributes "
+                           f"declare a code-execution vector; pull manually if trusted.")
+            continue
 
         # Read the remote URL with a plain config read (no transport, no
         # hooks, no index refresh) and refuse anything that is not https.

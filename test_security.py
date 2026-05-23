@@ -332,3 +332,39 @@ def test_feedback_email_genuine_requires_fau_sender():
 def test_feedback_email_genuine_requires_subject():
     """A fau.de sender with the wrong subject is not a feedback notification."""
     assert not s._is_genuine_feedback_email('Hallo', 'studon@fau.de')
+
+
+# === 2026-05 follow-up review (F-01) =========================================
+
+# --- F-01: pull_git_repos must refuse repos whose config/attributes run code ---
+# _GIT_SAFE_FLAGS neutralises ext::/file/fsmonitor/hooks but NOT a
+# .gitattributes-assigned smudge/clean filter driver — that still runs a
+# command on checkout and cannot be pre-empted by a `-c` flag (attacker-named).
+
+def test_git_repo_unsafe_when_gitattributes_assigns_filter(tmp_path):
+    """A .gitattributes filter driver is RCE on `git pull` (runs on checkout)."""
+    repo = tmp_path / 'repo'
+    (repo / '.git').mkdir(parents=True)
+    (repo / '.git' / 'config').write_text('[core]\n\tbare = false\n')
+    (repo / '.gitattributes').write_text('* filter=pwn\n')
+    assert s._git_repo_is_safe_to_pull(str(repo)) is False
+
+
+def test_git_repo_unsafe_when_config_declares_filter_driver(tmp_path):
+    """A [filter "x"] section in .git/config (smudge runs a command) is unsafe."""
+    repo = tmp_path / 'repo'
+    (repo / '.git').mkdir(parents=True)
+    (repo / '.git' / 'config').write_text(
+        '[core]\n[filter "pwn"]\n\tsmudge = touch /tmp/pwned\n')
+    assert s._git_repo_is_safe_to_pull(str(repo)) is False
+
+
+def test_git_repo_safe_when_config_is_minimal(tmp_path):
+    """A plain repo (core + https remote + branch) carries no code-exec vector."""
+    repo = tmp_path / 'repo'
+    (repo / '.git').mkdir(parents=True)
+    (repo / '.git' / 'config').write_text(
+        '[core]\n\trepositoryformatversion = 0\n'
+        '[remote "origin"]\n\turl = https://github.com/u/r.git\n'
+        '[branch "main"]\n\tremote = origin\n')
+    assert s._git_repo_is_safe_to_pull(str(repo)) is True
