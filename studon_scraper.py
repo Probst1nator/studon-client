@@ -664,6 +664,14 @@ def _url_host_matches(url: str, domain: str) -> bool:
     domain = domain.lower().strip('.')
     return bool(host) and (host == domain or host.endswith('.' + domain))
 
+def _is_studon_url(url: str) -> bool:
+    """True if *url* is a well-formed URL whose host is StudOn (or a sub-domain).
+
+    The canonical entry-point gate: a real host check, never `STUDON_DOMAIN in
+    url` — a substring test accepts lookalikes like 'studon.fau.de.attacker.com'.
+    """
+    return is_valid_url(url) and _url_host_matches(url, STUDON_DOMAIN)
+
 def find_all_metadata_files(base_folder: str) -> List[Tuple[str, str, str]]:
     """
     Finds all METADATA.md files in the download folder.
@@ -4102,7 +4110,7 @@ def _run_clip_mode(debug: bool = False) -> None:
         print("❌ Could not read clipboard.")
         return
 
-    if not is_valid_url(clip) or STUDON_DOMAIN not in clip:
+    if not _is_studon_url(clip):
         if clip:
             print(f"Clipboard does not contain a StudOn URL:\n  {clip[:80]}")
         else:
@@ -4139,7 +4147,7 @@ def _tui_prompt_url() -> Optional[str]:
     if questionary:
         url = questionary.text(
             "StudOn course URL:",
-            validate=lambda v: True if (v.strip() == "" or (is_valid_url(v.strip()) and STUDON_DOMAIN in v.strip()))
+            validate=lambda v: True if (v.strip() == "" or _is_studon_url(v.strip()))
                                else "Enter a valid StudOn URL (or leave blank to cancel)",
         ).ask()
         return url.strip() if url and url.strip() else None
@@ -4886,7 +4894,7 @@ def main() -> None:
         clip = pyperclip.paste().strip()
     except Exception:
         clip = ""
-    if clip and is_valid_url(clip) and STUDON_DOMAIN in clip:
+    if clip and _is_studon_url(clip):
         _run_clip_mode(debug=args.debug)
         return
 

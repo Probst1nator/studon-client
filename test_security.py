@@ -368,3 +368,14 @@ def test_git_repo_safe_when_config_is_minimal(tmp_path):
         '[remote "origin"]\n\turl = https://github.com/u/r.git\n'
         '[branch "main"]\n\tremote = origin\n')
     assert s._git_repo_is_safe_to_pull(str(repo)) is True
+
+
+# --- F-03: the clipboard/TUI URL gate must be host-based, not a substring test ---
+
+def test_is_studon_url_rejects_substring_lookalikes():
+    """`STUDON_DOMAIN in url` accepts studon.fau.de.attacker.com — the gate
+    must parse the host instead."""
+    assert s._is_studon_url('https://www.studon.fau.de/studon/x')
+    assert not s._is_studon_url('https://studon.fau.de.attacker.com/x')
+    assert not s._is_studon_url('https://attacker.com/?studon.fau.de')
+    assert not s._is_studon_url('not-a-url')
