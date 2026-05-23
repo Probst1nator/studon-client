@@ -1412,7 +1412,7 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
                             print()
                             first_file_printed = True
                         print(f"      ↓ {expected_name} (remote update)", end='', flush=True)
-                        update_resp = session.get(file_url, stream=True)
+                        update_resp = session.get(file_url, stream=True, timeout=(10, 60))
                         update_resp.raise_for_status()
                         with open(new_path, 'wb') as f:
                             for chunk in update_resp.iter_content(chunk_size=8192):
@@ -1438,7 +1438,7 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
                 print()
                 first_file_printed = True
             print(f"      ↓ {expected_name}", end='', flush=True)
-            file_response = session.get(file_url, stream=True)
+            file_response = session.get(file_url, stream=True, timeout=(10, 60))
             file_response.raise_for_status()
 
             # Try to get filename from Content-Disposition header first
