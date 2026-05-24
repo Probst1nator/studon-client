@@ -1,4 +1,4 @@
-"""Security regression tests for studon_scraper.
+"""Security regression tests for studon_client.
 
 Covers the path-traversal, archive-extraction, domain-validation and
 git-handling hardening from the 2026-05 security audit. Run with: pytest -q
@@ -11,7 +11,7 @@ import tarfile
 import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import studon_scraper as s  # noqa: E402
+import studon_client as s  # noqa: E402
 
 
 # --- F6: clean_filename must not emit path-traversal components ------------

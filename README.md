@@ -1,4 +1,4 @@
-# studon-scraper
+# studon-client
 
 Authenticates to FAU's StudOn LMS via Firefox cookies, crawls course pages, and downloads/organises all subscribed course materials.
 
@@ -45,11 +45,11 @@ cd ~/Studium
 git clone <repository-url> .
 
 # 2. Install cron job + shell function
-python3 studon_scraper.py --install
+python3 studon_client.py --install
 ```
 
 `--install` registers both `@reboot` cron entries (`--daily-sync` and
-`--lecture-sync`), adds a `studon-scraper` shell function to `~/.bashrc`
+`--lecture-sync`), adds a `studon-client` shell function to `~/.bashrc`
 (clipboard quick-fetch), optionally persists a download path, and runs the
 interactive `--map-lectures` wizard so every campo timetable entry is paired
 with a tracked course (or explicitly marked "no StudOn course") before the
@@ -59,7 +59,7 @@ register a new course.
 Optional — set up the FAUmail feedback auto-downloader (see [Feedback files](#feedback-files)):
 
 ```bash
-python3 studon_scraper.py --install-imap
+python3 studon_client.py --install-imap
 ```
 
 ---
@@ -72,10 +72,10 @@ Make sure Firefox is open and logged into StudOn, then:
 
 ```bash
 # Interactive — detects StudOn URL from clipboard, or prompts
-python studon_scraper.py
+python studon_client.py
 
 # Explicit URL
-python studon_scraper.py "https://www.studon.fau.de/..."
+python studon_client.py "https://www.studon.fau.de/..."
 ```
 
 ### Daily auto-sync
@@ -109,7 +109,7 @@ Run `--map-lectures` whenever you enroll in a new course, change semester,
 or see an "unmapped" warning:
 
 ```bash
-python studon_scraper.py --map-lectures
+python studon_client.py --map-lectures
 ```
 
 For each unmapped entry it asks: **Link to which tracked course?**,
@@ -123,7 +123,7 @@ link to its final ILIAS URL, and offers to register that course as a new
 tracked course — saving you from pasting URLs by hand.
 
 ```bash
-python studon_scraper.py --discover-from-timetable
+python studon_client.py --discover-from-timetable
 ```
 
 The verbatim timetable title is pinned into the new course's METADATA so the
@@ -132,7 +132,7 @@ next `--map-lectures` / `--lecture-sync` run sees it as `Mapped (explicit)`.
 For a quick sanity check without running the daemon:
 
 ```bash
-python studon_scraper.py --lecture-sync-once
+python studon_client.py --lecture-sync-once
 # Prints resolved buckets and the next 5 fires, then exits.
 ```
 
@@ -140,25 +140,25 @@ python studon_scraper.py --lecture-sync-once
 
 ```bash
 # Refresh all tracked courses
-python studon_scraper.py --update-all
+python studon_client.py --update-all
 
 # Preview new files without downloading
-python studon_scraper.py <URL> --dry-run
+python studon_client.py <URL> --dry-run
 
-# Clipboard quick-fetch (also available as the 'studon-scraper' shell function)
-python studon_scraper.py --clip
+# Clipboard quick-fetch (also available as the 'studon-client' shell function)
+python studon_client.py --clip
 
 # Export campo timetable to timetable.md
-python studon_scraper.py --timetable
+python studon_client.py --timetable
 
 # Scan campo studyPlanner detail views (opened in Firefox) → pruefungen.md
-python studon_scraper.py --campo-pruefungen
+python studon_client.py --campo-pruefungen
 
 # Scan FAUmail for new feedback notifications and download PDFs
-python studon_scraper.py --check-feedback
+python studon_client.py --check-feedback
 
 # Persist a default download path
-python studon_scraper.py --set-download-path ~/Studium
+python studon_client.py --set-download-path ~/Studium
 
 # Check sync log
 cat studon_sync.log
@@ -166,7 +166,7 @@ cat studon_sync.log
 
 ### Full command reference
 
-Run `python studon_scraper.py --help` for the complete and current list. Key flags:
+Run `python studon_client.py --help` for the complete and current list. Key flags:
 
 | Flag | Purpose |
 |------|---------|
@@ -189,7 +189,7 @@ Run `python studon_scraper.py --help` for the complete and current list. Key fla
 
 ### Interactive TUI
 
-Run `python studon_scraper.py` with no arguments to get an arrow-key menu for all common operations (register course, update all, check feedback, install/uninstall, etc.).
+Run `python studon_client.py` with no arguments to get an arrow-key menu for all common operations (register course, update all, check feedback, install/uninstall, etc.).
 
 ---
 
@@ -247,7 +247,7 @@ When an instructor uploads a feedback PDF on StudOn, the LMS sends an email of
 the form `[StudOn] Es wurde eine neue Feedback-Datei zur Übung „…" hinzugefügt.`
 The scraper can pick those up automatically:
 
-1. `python3 studon_scraper.py --install-imap` — prompts for your FAU email and
+1. `python3 studon_client.py --install-imap` — prompts for your FAU email and
    IDM password (stored in the system keyring, never on disk).
 2. From then on, `--daily-sync` and `--check-feedback` scan all FAUmail folders
    for matching messages, queue their StudOn exc URLs in
@@ -264,7 +264,7 @@ Remove with `--uninstall-imap` (clears the keyring entry, the email from
 Store this folder in any cloud sync service (Syncthing, OneDrive, Dropbox, etc.). Then on each device:
 
 ```bash
-python3 studon_scraper.py --install
+python3 studon_client.py --install
 ```
 
 `studon_downloads/.studon_updater_state.json` syncs across devices — if one device has already synced today, others will skip.
@@ -274,10 +274,10 @@ python3 studon_scraper.py --install
 ## New semester
 
 1. Log into StudOn in Firefox and enrol in new courses.
-2. Download each new course once: `python studon_scraper.py "<url>"`
-3. Refresh campo timetable: `python studon_scraper.py --timetable`
-   - For exam-registration deadlines: open each module's *Detailansicht* in Firefox once, then `python studon_scraper.py --campo-pruefungen` → `pruefungen.md`.
-4. Run `python studon_scraper.py --map-lectures` to link new timetable
+2. Download each new course once: `python studon_client.py "<url>"`
+3. Refresh campo timetable: `python studon_client.py --timetable`
+   - For exam-registration deadlines: open each module's *Detailansicht* in Firefox once, then `python studon_client.py --campo-pruefungen` → `pruefungen.md`.
+4. Run `python studon_client.py --map-lectures` to link new timetable
    entries to the new course folders (or mark them as no-course).
 5. Daily sync + lecture sync track them automatically from then on.
 
@@ -292,8 +292,8 @@ If `--install` doesn't fit your platform:
 ```bash
 crontab -e
 # Add both:
-@reboot cd /path/to/studon-scraper && /usr/bin/python3 studon_scraper.py --daily-sync >> studon_sync.log 2>&1
-@reboot cd /path/to/studon-scraper && /usr/bin/python3 studon_scraper.py --lecture-sync >> studon_sync.log 2>&1
+@reboot cd /path/to/studon-client && /usr/bin/python3 studon_client.py --daily-sync >> studon_sync.log 2>&1
+@reboot cd /path/to/studon-client && /usr/bin/python3 studon_client.py --lecture-sync >> studon_sync.log 2>&1
 ```
 
 Or as a systemd user service — create `~/.config/systemd/user/studon-sync.service`:
@@ -305,10 +305,10 @@ After=network.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/path/to/studon-scraper
-ExecStart=/usr/bin/python3 /path/to/studon-scraper/studon_scraper.py --daily-sync
-StandardOutput=append:/path/to/studon-scraper/studon_sync.log
-StandardError=append:/path/to/studon-scraper/studon_sync.log
+WorkingDirectory=/path/to/studon-client
+ExecStart=/usr/bin/python3 /path/to/studon-client/studon_client.py --daily-sync
+StandardOutput=append:/path/to/studon-client/studon_sync.log
+StandardError=append:/path/to/studon-client/studon_sync.log
 
 [Install]
 WantedBy=default.target
@@ -336,15 +336,15 @@ which python3        # confirm Python path matches cron entry
 ```
 
 **Non-Ubuntu platform issues**
-- Test manual mode first: `python studon_scraper.py <URL>`
+- Test manual mode first: `python studon_client.py <URL>`
 - For macOS/Windows: use manual mode and configure scheduling separately.
 
 **Run sync manually in background**
 ```bash
-nohup python studon_scraper.py --daily-sync > studon_sync.log 2>&1 &
-ps aux | grep studon_scraper          # check running
-pkill -f "studon_scraper.py --daily-sync"  # stop
+nohup python studon_client.py --daily-sync > studon_sync.log 2>&1 &
+ps aux | grep studon_client          # check running
+pkill -f "studon_client.py --daily-sync"  # stop
 ```
 
 **Feature requests or unresolvable problems**
-Open an issue on the [GitHub repository](https://github.com/AutomatedAlchemy/studon-scraper/issues).
+Open an issue on the [GitHub repository](https://github.com/AutomatedAlchemy/studon-client/issues).

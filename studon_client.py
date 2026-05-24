@@ -1,8 +1,36 @@
 import os
-import webbrowser
-import re
 import sys
 import json
+
+# --- CRITICAL: respond to --advertise BEFORE any heavy imports ---
+# The tools-installer machinery (used by ~/Synced/repos/AutomatedAlchemy/
+# installer.py, which re-uses ~/Synced/repos/tools/installer.py as a library)
+# probes each candidate script with `--advertise` and a 5s timeout. The
+# heavy imports below (requests, BeautifulSoup, browser_cookie3, …) would
+# blow the budget, so short-circuit here.
+if "--advertise" in sys.argv:
+    print(json.dumps([{
+        "name": "StudOn Client",
+        "desktop_file": "studon_client.desktop",
+        "icon": "applications-internet",
+        "desc": "FAU StudOn / campo scraper — course downloads, timetable, Notenübersicht-PDFs",
+        "terminal": True,
+        "args": [],
+        "tags": ["CLI"],
+        "alias": "studon-client",
+        # alias_args auto-injects --clip when the shell alias is invoked
+        # (so `studon-client URL` → `python studon_client.py --clip URL`,
+        # the preview+confirm quick-fetch flow). The plain `args` stays []
+        # so --install / .desktop launches don't pick up --clip.
+        "alias_args": ["--clip"],
+        # Skill support: --install-skill / --uninstall-skill write
+        # ~/.claude/skills/studon/SKILL.md from inline SKILL_MD_CONTENT.
+        "skill_name": "studon",
+    }]))
+    sys.exit(0)
+
+import webbrowser
+import re
 import email.utils
 import shutil
 import subprocess
@@ -39,6 +67,15 @@ try:
     import keyring
 except ImportError:
     keyring = None
+
+try:
+    from cli_tool_kit import ToolInstaller, ToolMetadata, CronInstaller
+    _HAS_INSTALLER = True
+except ImportError:
+    ToolInstaller = None  # type: ignore[assignment,misc]
+    ToolMetadata = None   # type: ignore[assignment,misc]
+    CronInstaller = None  # type: ignore[assignment,misc]
+    _HAS_INSTALLER = False
 
 import imaplib
 import email as email_mod
@@ -355,6 +392,7 @@ DOWNLOAD_FOLDER = str(Path(_config.get("downloads_path", "studon_downloads")).ex
 STUDON_DOMAIN = 'studon.fau.de'
 CAMPO_TIMETABLE_URL = 'https://www.campo.fau.de/qisserver/pages/plan/individualTimetable.xhtml?_flowId=individualTimetableSchedule-flow'
 CAMPO_STUDY_PLANNER_URL = 'https://www.campo.fau.de/qisserver/pages/startFlow.xhtml?_flowId=studyPlanner-flow'
+CAMPO_EXAMS_OVERVIEW_URL = 'https://www.campo.fau.de/qisserver/pages/sul/examAssessment/personExamsReadonly.xhtml?_flowId=examsOverviewForPerson-flow'
 RECENT_UPDATES_FILE = os.path.join(DOWNLOAD_FOLDER, "RECENT_UPDATES.md")
 LECTURE_MAPPING_PATH = os.path.join(_SCRIPT_DIR, "lecture_mapping.json")
 SYNC_LOCK_PATH = os.path.join(DOWNLOAD_FOLDER, ".studon_sync.lock")
@@ -631,7 +669,7 @@ def check_platform_compatibility() -> None:
         logger.warning("  • File paths and permissions")
         logger.warning("")
         logger.warning("If you experience problems, please:")
-        logger.warning("  • Try running manually: python3 studon_scraper.py --update-all")
+        logger.warning("  • Try running manually: python3 studon_client.py --update-all")
         logger.warning("  • Check GitHub issues for platform-specific solutions")
         logger.warning("  • Consider contributing platform support!")
         logger.warning("=" * 70)
@@ -2094,7 +2132,7 @@ def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = N
         pystray.MenuItem("Check now", lambda icon, item: state.update(fast_until=time.time() + 120)),
         pystray.MenuItem("Quit (skip sync)", quit_waiter),
     )
-    icon = pystray.Icon("studon-scraper", img, "StudOn: waiting for login", menu)
+    icon = pystray.Icon("studon-client", img, "StudOn: waiting for login", menu)
 
     thread = threading.Thread(target=poller, args=(icon,), daemon=True)
     thread.start()
@@ -2871,7 +2909,7 @@ def show_startup_overview(download_folder: str) -> None:
 
     if not courses:
         print(wide_row('No registered courses found.', YE))
-        print(wide_row(f'Add a course:  python studon_scraper.py <URL>', DIM))
+        print(wide_row(f'Add a course:  python studon_client.py <URL>', DIM))
         print(WIDE_BOT)
         print()
         return
@@ -2949,10 +2987,10 @@ def _run_uninstall() -> None:
 
     # --- Bashrc ---
     bashrc = Path.home() / '.bashrc'
-    marker = '# studon-scraper quick-fetch'
+    marker = '# studon-client quick-fetch'
     if bashrc.exists():
         lines = bashrc.read_text().splitlines(keepends=True)
-        filtered = [l for l in lines if marker not in l and 'studon-scraper()' not in l]
+        filtered = [l for l in lines if marker not in l and 'studon-client()' not in l]
         if len(filtered) < len(lines):
             bashrc.write_text(''.join(filtered))
             print("  ✅ Shell function removed from ~/.bashrc.")
@@ -2960,10 +2998,160 @@ def _run_uninstall() -> None:
             print("  No shell function found in ~/.bashrc.")
 
 
+# --- Claude Code skill registration ---------------------------------------
+# Single source of truth for ~/.claude/skills/studon/SKILL.md. Update this
+# when CLI flags change so `python3 studon_client.py --install-skill` re-
+# registers a fresh manifest. Kept inline so the script stays self-contained.
+SKILL_DIR  = Path.home() / '.claude' / 'skills' / 'studon'
+SKILL_FILE = SKILL_DIR / 'SKILL.md'
+SKILL_MD_CONTENT = '''---
+name: studon
+description: Drive the StudOn / Campo scraper at ~/Synced/repos/AutomatedAlchemy/studon-client/. Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, dump prüfungs-Anmeldefristen, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
+---
+
+# studon
+
+Wrapper for the StudOn / Campo scraper at
+`~/Synced/repos/AutomatedAlchemy/studon-client/studon_client.py`.
+Authenticates to FAU StudOn + campo via Firefox cookies (`browser-cookie3`),
+crawls course pages, and downloads materials into the configured downloads
+folder (`~/Synced/OneDrive/Studium/KIM4/` on this fleet).
+
+The scraper is already installed and self-running:
+- `@reboot studon_client.py --daily-sync` — once-per-day full sync of all tracked courses
+- `@reboot studon_client.py --lecture-sync` — per-lecture fetcher driven by the campo timetable
+
+This skill is for **ad-hoc invocations** from a Claude session — anything the
+cron daemons don't already do automatically.
+
+## When to use
+
+- "Download this StudOn course" → has a URL → `<URL>` mode below.
+- "Update all my courses now" → `--update-all`.
+- "Was kommt diese Woche an Vorlesungen?" → `--timetable` → reads `timetable.md`.
+- "Welche Prüfungsanmeldungen laufen?" → `--campo-pruefungen` (requires Detailansichten pre-opened in Firefox).
+- "Lade meine Notenübersicht / BAföG-Bescheinigung / Transcript" → `--campo-bescheinigungen` (downloads all 12 PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/`).
+- "Register a new course from a campo timetable entry I don't have yet" → `--discover-from-timetable`.
+
+**Do NOT use this skill for:**
+- The QuizHub daily-quiz pipeline — that's `~/Synced/repos/AutomatedAlchemy/quizhub-client/` and runs from cron.
+- The `lecture-prep` skill — that builds a *pre-lecture concept quiz*, not a course download.
+- Anything outside FAU StudOn / campo.
+
+## How to invoke
+
+Bash tool alias `studon-client` is installed but **not callable from
+Claude's non-interactive Bash** (alias expansion is disabled). Use the direct
+script path:
+
+```bash
+PY=/home/prob/Synced/repos/prob_ubuntu_environment/Py3EnvShare/bin/python3
+SCRAPER=/home/prob/Synced/repos/AutomatedAlchemy/studon-client/studon_client.py
+
+$PY $SCRAPER --help
+```
+
+(Plain `python3` also works on this host — the fleet venv at `Py3EnvShare`
+already has `browser-cookie3`, `beautifulsoup4`, `requests`, `questionary`.)
+
+## Cheat-sheet (subset of `--help`)
+
+| Intent | Command |
+|---|---|
+| Download one course by URL | `$PY $SCRAPER <studon_course_url>` |
+| Preview without downloading | `$PY $SCRAPER <url> --dry-run` |
+| Refresh every tracked course | `$PY $SCRAPER --update-all` |
+| Export campo timetable → `timetable.md` | `$PY $SCRAPER --timetable` |
+| Map unmapped timetable entries → courses | `$PY $SCRAPER --map-lectures` |
+| Auto-register new courses from timetable | `$PY $SCRAPER --discover-from-timetable` |
+| Dump Prüfungs-Anmeldefristen → `pruefungen.md` | `$PY $SCRAPER --campo-pruefungen` |
+| Download all Notenübersicht/Bescheinigungen PDFs | `$PY $SCRAPER --campo-bescheinigungen` |
+| Show next 5 lecture-sync fires (debug) | `$PY $SCRAPER --lecture-sync-once` |
+| Set default download path | `$PY $SCRAPER --set-download-path ~/path` |
+| (Re)install this Claude skill | `$PY $SCRAPER --install-skill` |
+
+Full architecture & dataclasses: `~/Synced/repos/AutomatedAlchemy/studon-client/CLAUDE.md`.
+
+## Preconditions
+
+- **Firefox must be logged into both StudOn and campo.** The scraper reads
+  Firefox cookies via `browser-cookie3`. If the cookie is stale, the scraper
+  prints `❌ Could not load Firefox cookies` or `make sure you're logged in`.
+  Tell the user to refresh both tabs in Firefox, then re-run.
+- For `--campo-pruefungen`: the user must have **manually opened each
+  Modul/Prüfungs-Detailansicht in Firefox** beforehand (the `_flowExecutionKey`
+  is server-side per-session state — the scraper can only iterate keys that
+  already exist in the current campo flow stack).
+- For `--campo-bescheinigungen`: only requires being logged into campo — the
+  page enumerates its own 12 PDF buttons and the scraper re-GETs the form per
+  button to refresh the `_flowExecutionKey`.
+
+## Output layout
+
+```
+~/Synced/OneDrive/Studium/KIM4/         # configured downloads_path
+├── timetable.md                        # --timetable
+├── .timetable_entries.json             # cache consumed by --lecture-sync
+├── pruefungen.md                       # --campo-pruefungen
+├── RECENT_UPDATES.md                   # last sync's download log
+├── Bescheinigungen/                    # --campo-bescheinigungen
+│   ├── Notenübersicht.pdf
+│   ├── Leistungsbescheinigung nach §48 BAföG.pdf
+│   └── ... (12 total)
+└── <Course Name>/
+    ├── METADATA.md                     # course state + timetable_titles
+    └── <lecture folders>/
+```
+
+## Notes
+
+- Cron-installed daemons share a PID-lock at `<downloads>/.studon_sync.lock`
+  — ad-hoc invocations queue politely behind a running daemon (`--update-all`
+  waits up to 10 min; everything else exits if the lock is held).
+- Logs land in CWD (`studon_sync.log`), not the script dir. Syncthing has been
+  known to mint `studon_sync.sync-conflict-*.log` copies across hosts — those
+  are noise, not errors.
+- Per-file confirmation kicks in above 50 files (`CONFIRMATION_THRESHOLD` env
+  var). For a non-interactive Claude session, prefer `--dry-run` first to
+  preview, then re-run without it.
+'''
+
+
+def _is_skill_installed() -> bool:
+    return SKILL_FILE.exists()
+
+
+def _run_install_skill() -> None:
+    """Write (or refresh) ~/.claude/skills/studon/SKILL.md from the inline source."""
+    SKILL_DIR.mkdir(parents=True, exist_ok=True)
+    pre_existed = SKILL_FILE.exists()
+    if pre_existed and SKILL_FILE.read_text(encoding='utf-8') == SKILL_MD_CONTENT:
+        print(f"  • Skill already up-to-date: {SKILL_FILE}")
+        return
+    SKILL_FILE.write_text(SKILL_MD_CONTENT, encoding='utf-8')
+    verb = "Refreshed" if pre_existed else "Installed"
+    print(f"  ✅ {verb} Claude skill at {SKILL_FILE}")
+    print(f"     Claude Code picks this up live — no restart needed.")
+
+
+def _run_uninstall_skill() -> None:
+    """Remove ~/.claude/skills/studon/SKILL.md (and the empty dir)."""
+    if SKILL_FILE.exists():
+        SKILL_FILE.unlink()
+        print(f"  ✅ Removed {SKILL_FILE}")
+    else:
+        print(f"  • No skill file at {SKILL_FILE}")
+    try:
+        SKILL_DIR.rmdir()  # only succeeds if empty
+        print(f"  ✅ Removed empty {SKILL_DIR}")
+    except OSError:
+        pass  # non-empty (user added other files) — leave it
+
+
 def _run_install(check_interval: int = 5) -> None:
     """
     Unified installer: replaces setup_daily_sync.sh.
-    Installs the @reboot cron job and the 'studon-scraper' bashrc function.
+    Installs the @reboot cron job and the 'studon-client' bashrc function.
     """
     import importlib.util
 
@@ -3098,10 +3286,10 @@ def _run_install(check_interval: int = 5) -> None:
     print()
 
     # --- Bashrc function ---
-    print("Installing 'studon-scraper' shell function...")
+    print("Installing 'studon-client' shell function...")
     bashrc   = Path.home() / '.bashrc'
-    marker   = '# studon-scraper quick-fetch'
-    func_line = f'studon-scraper() {{ {python} {script_path} --clip "$@"; }}'
+    marker   = '# studon-client quick-fetch'
+    func_line = f'studon-client() {{ {python} {script_path} --clip "$@"; }}'
 
     if bashrc.exists():
         content = bashrc.read_text()
@@ -3110,7 +3298,7 @@ def _run_install(check_interval: int = 5) -> None:
 
     if marker in content:
         lines     = content.splitlines()
-        new_lines = [func_line if l.startswith('studon-scraper()') else l for l in lines]
+        new_lines = [func_line if l.startswith('studon-client()') else l for l in lines]
         new_content = '\n'.join(new_lines) + '\n'
         if new_content == content:
             print("  Already up to date in ~/.bashrc")
@@ -3140,13 +3328,21 @@ def _run_install(check_interval: int = 5) -> None:
     # --- Lecture mapping (interactive) ---
     print()
     print("Running --map-lectures to verify your timetable ↔ course mapping...")
-    print("(You can re-run this any time with: python studon_scraper.py --map-lectures)")
+    print("(You can re-run this any time with: python studon_client.py --map-lectures)")
     print()
     try:
         run_map_lectures_interactive()
     except Exception as e:
         logger.warning(f"Could not run lecture mapping: {e}")
         print(f"⚠️  Lecture mapping skipped: {e}")
+
+    # --- Claude Code skill (best-effort; safe if ~/.claude doesn't exist) ---
+    print()
+    print("→ Registering Claude Code skill...")
+    try:
+        _run_install_skill()
+    except Exception as e:
+        print(f"⚠️  Skill registration skipped: {e}")
 
 
 # --- FEEDBACK MAIL CHECKER (FAUmail IMAP → StudOn exc page → PDF download) ---
@@ -3740,7 +3936,7 @@ def _run_install_imap() -> None:
     save_config(cfg)
     print(f"\n✅ Saved. Email in {CONFIG_FILE}, password in keyring service '{KEYRING_SERVICE}'.")
     print("   Feedback checks will now run as part of --daily-sync.")
-    print("   Manual trigger: python3 studon_scraper.py --check-feedback")
+    print("   Manual trigger: python3 studon_client.py --check-feedback")
 
 
 def _is_imap_installed() -> bool:
@@ -4096,7 +4292,7 @@ def _print_discovery_preview(url: str, session: requests.Session, base_path: str
 
 def _run_clip_mode(debug: bool = False) -> None:
     """
-    Clipboard quick-fetch mode (invoked by the 'studon-scraper' shell function).
+    Clipboard quick-fetch mode (invoked by the 'studon-client' shell function).
     1. Read clipboard — exit silently if no StudOn URL.
     2. Ask user to confirm fetch.
     3. Run discovery preview.
@@ -4523,7 +4719,7 @@ def _render_campo_pruefungen_markdown(results: List[Tuple[str, Dict]]) -> str:
     lines = [
         "# Prüfungen & Anmeldefristen",
         "",
-        f"> Auto-generated {_dt.now().strftime('%Y-%m-%d %H:%M')} by `studon-scraper --campo-pruefungen`.",
+        f"> Auto-generated {_dt.now().strftime('%Y-%m-%d %H:%M')} by `studon-client --campo-pruefungen`.",
         "> Quelle: campo.fau.de StudyPlanner Detailansichten. Damit ein Modul hier erscheint,",
         "> muss seine Detailansicht vorher in Firefox geöffnet worden sein "
         "(`_flowExecutionKey` ist server-seitig pro Sitzung).",
@@ -4575,6 +4771,131 @@ def fetch_campo_pruefungen_markdown(output_path: Optional[str] = None) -> Option
         f.write(md)
     print(f"✅ Prüfungen written to {output_path} ({len(results)} module(s))")
     return output_path
+
+
+def _campo_session() -> Optional[requests.Session]:
+    """Build a requests.Session populated with current Firefox cookies for campo."""
+    try:
+        s = requests.Session()
+        s.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
+        s.cookies.update(browser_cookie3.firefox(domain_name='campo.fau.de'))
+        s.headers.update({'User-Agent': 'Mozilla/5.0'})
+        return s
+    except Exception as e:
+        print(f"❌ Could not load Firefox cookies: {e}")
+        return None
+
+
+def _filename_from_content_disposition(cd: str, fallback: str) -> str:
+    """Extract filename from a Content-Disposition header (prefers RFC 5987 filename*=)."""
+    from urllib.parse import unquote
+    if not cd:
+        return fallback
+    m = re.search(r"filename\*\s*=\s*([^;]+)", cd, re.IGNORECASE)
+    if m:
+        val = m.group(1).strip()
+        # form: charset''percent-encoded
+        if "''" in val:
+            _, _, encoded = val.partition("''")
+            return unquote(encoded)
+        return unquote(val.strip('"'))
+    m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.IGNORECASE)
+    if m:
+        return unquote(m.group(1).strip())
+    return fallback
+
+
+def fetch_campo_exam_documents(output_dir: Optional[str] = None) -> Optional[List[str]]:
+    """Download every PDF offered on campo's `personExamsReadonly` page
+    (`examsOverviewForPerson-flow`) — Notenübersicht, Bescheinigungen,
+    BAföG-§48, Angemeldete Prüfungen, etc.
+
+    Each PDF button is a MyFaces non-AJAX form submit. The flow-execution
+    key advances on every interaction, so we re-GET the form before each
+    POST to get a fresh ViewState + key.
+
+    Returns list of saved file paths, or None on failure.
+    """
+    print("🔄 Fetching campo Notenübersicht / Bescheinigungen page...")
+    s = _campo_session()
+    if s is None:
+        return None
+
+    # Initial GET to enumerate buttons.
+    try:
+        r = s.get(CAMPO_EXAMS_OVERVIEW_URL, timeout=30, allow_redirects=True)
+    except requests.RequestException as e:
+        print(f"❌ Campo request failed: {e}")
+        return None
+    if r.status_code != 200 or 'Notenübersicht' not in r.text:
+        print("❌ Campo personExamsReadonly not reachable. Log into campo.fau.de in Firefox and retry.")
+        return None
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+    buttons = soup.find_all('button', {'name': re.compile(r':printReport_\d+$')})
+    if not buttons:
+        print("⚠️  No printReport_* buttons found on the page.")
+        return None
+
+    reports = [(b.get('name'), b.get('value', '').strip()) for b in buttons]
+    print(f"📄 Found {len(reports)} report(s):")
+    for i, (_, label) in enumerate(reports):
+        print(f"   [{i:2d}] {label}")
+
+    if output_dir is None:
+        output_dir = os.path.join(DOWNLOAD_FOLDER, 'Bescheinigungen')
+    os.makedirs(output_dir, exist_ok=True)
+
+    from urllib.parse import urljoin
+    saved: List[str] = []
+    for idx, (btn_name, label) in enumerate(reports):
+        # Re-GET to get a fresh ViewState + flowExecutionKey for each submit.
+        try:
+            page = s.get(CAMPO_EXAMS_OVERVIEW_URL, timeout=30, allow_redirects=True)
+        except requests.RequestException as e:
+            print(f"   ✗ [{idx}] {label}: GET failed ({e})")
+            continue
+        psoup = BeautifulSoup(page.text, 'html.parser')
+        btn = psoup.find('button', {'name': btn_name})
+        if not btn:
+            print(f"   ✗ [{idx}] {label}: button vanished from page")
+            continue
+        form = btn.find_parent('form')
+        action = urljoin(page.url, form.get('action') or page.url)
+        payload: Dict[str, str] = {}
+        for inp in form.find_all(['input', 'select', 'textarea']):
+            n = inp.get('name')
+            if not n:
+                continue
+            payload[n] = inp.get('value', '')
+        # MyFaces OAM convention: hidden field name=name marks which button fired.
+        payload[btn_name] = btn_name
+
+        try:
+            post = s.post(action, data=payload, timeout=120,
+                          allow_redirects=True, headers={'Referer': page.url})
+        except requests.RequestException as e:
+            print(f"   ✗ [{idx}] {label}: POST failed ({e})")
+            continue
+
+        ct = (post.headers.get('Content-Type') or '').lower()
+        is_pdf = 'pdf' in ct or post.content[:4] == b'%PDF'
+        if not is_pdf:
+            print(f"   ✗ [{idx}] {label}: response was {ct or '?'} ({len(post.content)} bytes), not PDF")
+            continue
+        fname = _filename_from_content_disposition(
+            post.headers.get('Content-Disposition', ''),
+            fallback=f"report_{idx}.pdf")
+        # Sanitize: strip path separators.
+        fname = os.path.basename(fname).replace('/', '_').replace('\\', '_')
+        out_path = os.path.join(output_dir, fname)
+        with open(out_path, 'wb') as fh:
+            fh.write(post.content)
+        saved.append(out_path)
+        print(f"   ✓ [{idx}] {label}  →  {fname} ({len(post.content):,} B)")
+
+    print(f"✅ Saved {len(saved)}/{len(reports)} PDF(s) to {output_dir}")
+    return saved
 
 
 def _run_tui_menu(debug: bool = False) -> None:
@@ -4761,10 +5082,16 @@ def main() -> None:
                        help='Discover files without downloading (preview mode)')
     parser.add_argument('--install', action='store_true',
                        help='Install cron job and shell function (replaces setup_daily_sync.sh)')
+    parser.add_argument('--install-skill', action='store_true',
+                       help='(Re)write ~/.claude/skills/studon/SKILL.md from the inline source so Claude Code surfaces this scraper as a skill')
+    parser.add_argument('--uninstall-skill', action='store_true',
+                       help='Remove ~/.claude/skills/studon/SKILL.md')
     parser.add_argument('--timetable', action='store_true',
                        help='Fetch personal campo timetable and write to timetable.md')
     parser.add_argument('--campo-pruefungen', action='store_true',
                        help='Scan campo studyPlanner Detailansichten (opened in Firefox) and write pruefungen.md')
+    parser.add_argument('--campo-bescheinigungen', action='store_true',
+                       help='Download all PDFs from campo Notenübersicht / personExamsReadonly page (Notenübersicht, BAföG-§48, ord. Studium, angemeldete Prüfungen, ...) into <downloads>/Bescheinigungen/')
     parser.add_argument('--install-imap', action='store_true',
                        help='Configure FAUmail IMAP credentials (for feedback-file auto-download)')
     parser.add_argument('--uninstall-imap', action='store_true',
@@ -4784,6 +5111,20 @@ def main() -> None:
     # --- Campo Prüfungstermine / Anmeldefristen ---
     if args.campo_pruefungen:
         fetch_campo_pruefungen_markdown()
+        return
+
+    # --- Campo Notenübersicht / Bescheinigungen (PDF bulk download) ---
+    if args.campo_bescheinigungen:
+        fetch_campo_exam_documents()
+        return
+
+    # --- Claude Code skill registration ---
+    if args.install_skill:
+        _run_install_skill()
+        return
+
+    if args.uninstall_skill:
+        _run_uninstall_skill()
         return
 
     # --- IMAP setup ---

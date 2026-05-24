@@ -21,3 +21,6 @@ keyring>=24.0.0
 # Tray icon for daily-sync login wait
 pystray>=0.19.0
 Pillow>=10.0.0
+
+# Installer protocol + cron management (shared with AA installer.py)
+cli-tool-kit @ git+https://github.com/Probst1nator/cli-tool-kit.git@v0.1.1
