@@ -2487,7 +2487,9 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
                 continue
 
             # Fire time. Drop it from the queue so we don't refire.
-            fires = [f for f in fires if f is not due]
+            # `due` was rebuilt as a fresh tuple above, so identity (`is not`)
+            # never matches the original list element; tuples are value-equal.
+            fires = [f for f in fires if f != due]
             course = lecture.course
             if course is None:
                 continue
