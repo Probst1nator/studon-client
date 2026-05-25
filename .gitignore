@@ -16,6 +16,7 @@ RECENT_UPDATES.md
 .studon_updater_state.json
 .studon_feedback_state.json
 config.json
+lecture_mapping.json
 
 # ===== Python =====
 __pycache__/
