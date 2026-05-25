@@ -381,6 +381,24 @@ def test_is_studon_url_rejects_substring_lookalikes():
     assert not s._is_studon_url('not-a-url')
 
 
+def test_extract_studon_link_rejects_substring_lookalikes():
+    """_extract_studon_link is the entry point for --discover-from-timetable;
+    its href filter must use the same host-parsing gate as everything else
+    (was a bare `'studon.fau.de' in href` substring check)."""
+    labelled = (
+        '<form><label for="x">Link zur Lehrveranstaltung auf StudOn</label>'
+        '<span id="x"><a href="https://studon.fau.de.attacker.com/payload">x</a>'
+        '</span></form>'
+    )
+    assert s._extract_studon_link(labelled) is None
+
+    fallback = '<a href="https://studon.fau.de.attacker.com/studon/go/exc/1">x</a>'
+    assert s._extract_studon_link(fallback) is None
+
+    legit = '<a href="https://www.studon.fau.de/studon/go/exc/1">x</a>'
+    assert s._extract_studon_link(legit) == 'https://www.studon.fau.de/studon/go/exc/1'
+
+
 # --- 7z symlink containment (verified handled by py7zr >=1.0) ----------------
 
 def test_extract_archive_refuses_7z_with_symlink_member(tmp_path):

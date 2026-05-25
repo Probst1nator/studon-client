@@ -4349,8 +4349,13 @@ def _tui_prompt_url() -> Optional[str]:
                                else "Enter a valid StudOn URL (or leave blank to cancel)",
         ).ask()
         return url.strip() if url and url.strip() else None
-    url = input("StudOn course URL: ").strip()
-    return url if url else None
+    while True:
+        url = input("StudOn course URL: ").strip()
+        if not url:
+            return None
+        if _is_studon_url(url):
+            return url
+        print("Enter a valid StudOn URL (or leave blank to cancel).")
 
 
 def _tui_prompt_download_path() -> Optional[str]:
@@ -4505,12 +4510,13 @@ def _extract_studon_link(detail_html: str) -> Optional[str]:
                 answer = soup.find(id=for_id)
                 if answer:
                     a = answer.find('a', href=True)
-                    if a and 'studon.fau.de' in a['href']:
+                    if a and _url_host_matches(a['href'], STUDON_DOMAIN):
                         return a['href']
     # Fallback: any campo→studon proxy link on the page.
     for a in soup.find_all('a', href=True):
         href = a['href']
-        if 'studon.fau.de/campo/course/' in href or 'studon.fau.de/studon/' in href:
+        if _url_host_matches(href, STUDON_DOMAIN) and (
+                '/campo/course/' in href or '/studon/' in href):
             return href
     return None
 
