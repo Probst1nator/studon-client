@@ -154,6 +154,13 @@ python studon_client.py --timetable
 # Scan campo studyPlanner detail views (opened in Firefox) → pruefungen.md
 python studon_client.py --campo-pruefungen
 
+# Bulk-download Notenübersicht / Bescheinigungen PDFs (exam-side, 12 PDFs)
+python studon_client.py --campo-bescheinigungen
+# Combo: 12 + 7 = 19 PDFs (exam-side + enrollment-side)
+python studon_client.py --campo-bescheinigungen --with-enrollment
+# Enrollment-side only (7 PDFs)
+python studon_client.py --campo-enrollment-bescheinigungen [--dry-run]
+
 # Scan FAUmail for new feedback notifications and download PDFs
 python studon_client.py --check-feedback
 
@@ -180,6 +187,9 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--dry-run` | Discover files without downloading |
 | `--timetable` | Export personal campo timetable |
 | `--campo-pruefungen` | Parse campo studyPlanner Detailansichten (must be pre-opened in Firefox) → `pruefungen.md` |
+| `--campo-bescheinigungen` | Download all 12 exam-side PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/` |
+| `--campo-bescheinigungen --with-enrollment` | 12 + 7 = 19 PDFs (combo with the enrollment-side) |
+| `--campo-enrollment-bescheinigungen` | Download all 7 enrollment-side PDFs via `studyservice-flow` into `<downloads>/Bescheinigungen/Enrollment/`: Benutzerinfobrief, Bescheinigung §9 BAföG, Datenkontrollblatt, Quittung (einzelnes Semester), Beitragskonto, Immatrikulationsbescheinigung, Studienverlaufsbescheinigung. Parameterized reports default to the current semester. |
 | `--install` / `--uninstall` | Install / remove cron entries + bashrc function |
 | `--install-imap` / `--uninstall-imap` | Configure / remove FAUmail feedback checker |
 | `--check-feedback` | Scan inbox now and download any reachable feedback PDFs |

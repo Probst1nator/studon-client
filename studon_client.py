@@ -393,6 +393,7 @@ STUDON_DOMAIN = 'studon.fau.de'
 CAMPO_TIMETABLE_URL = 'https://www.campo.fau.de/qisserver/pages/plan/individualTimetable.xhtml?_flowId=individualTimetableSchedule-flow'
 CAMPO_STUDY_PLANNER_URL = 'https://www.campo.fau.de/qisserver/pages/startFlow.xhtml?_flowId=studyPlanner-flow'
 CAMPO_EXAMS_OVERVIEW_URL = 'https://www.campo.fau.de/qisserver/pages/sul/examAssessment/personExamsReadonly.xhtml?_flowId=examsOverviewForPerson-flow'
+CAMPO_ENROLLMENT_INFO_URL = 'https://www.campo.fau.de/qisserver/pages/cm/exa/enrollment/info/start.xhtml?_flowId=studyservice-flow'
 RECENT_UPDATES_FILE = os.path.join(DOWNLOAD_FOLDER, "RECENT_UPDATES.md")
 LECTURE_MAPPING_PATH = os.path.join(_SCRIPT_DIR, "lecture_mapping.json")
 SYNC_LOCK_PATH = os.path.join(DOWNLOAD_FOLDER, ".studon_sync.lock")
@@ -4813,7 +4814,7 @@ def _filename_from_content_disposition(cd: str, fallback: str) -> str:
     return fallback
 
 
-def fetch_campo_exam_documents(output_dir: Optional[str] = None) -> Optional[List[str]]:
+def fetch_campo_exam_documents(output_dir: Optional[str] = None, dry_run: bool = False) -> Optional[List[str]]:
     """Download every PDF offered on campo's `personExamsReadonly` page
     (`examsOverviewForPerson-flow`) — Notenübersicht, Bescheinigungen,
     BAföG-§48, Angemeldete Prüfungen, etc.
@@ -4822,7 +4823,7 @@ def fetch_campo_exam_documents(output_dir: Optional[str] = None) -> Optional[Lis
     key advances on every interaction, so we re-GET the form before each
     POST to get a fresh ViewState + key.
 
-    Returns list of saved file paths, or None on failure.
+    Returns list of saved file paths (or button labels in dry-run), or None on failure.
     """
     print("🔄 Fetching campo Notenübersicht / Bescheinigungen page...")
     s = _campo_session()
@@ -4849,6 +4850,10 @@ def fetch_campo_exam_documents(output_dir: Optional[str] = None) -> Optional[Lis
     print(f"📄 Found {len(reports)} report(s):")
     for i, (_, label) in enumerate(reports):
         print(f"   [{i:2d}] {label}")
+
+    if dry_run:
+        print("🔎 Dry-run: not downloading.")
+        return [label for _, label in reports]
 
     if output_dir is None:
         output_dir = os.path.join(DOWNLOAD_FOLDER, 'Bescheinigungen')
@@ -4904,6 +4909,467 @@ def fetch_campo_exam_documents(output_dir: Optional[str] = None) -> Optional[Lis
 
     print(f"✅ Saved {len(saved)}/{len(reports)} PDF(s) to {output_dir}")
     return saved
+
+
+_ENROLLMENT_JOB_BUTTON_RE = re.compile(
+    r'^studyserviceForm:report:reports:reportButtons:'
+    r'jobConfigurationButtons:0:jobConfigurationButtons:\d+:job2$'
+)
+
+
+def _form_payload(form) -> Dict[str, str]:
+    """Collect all named input/select/textarea values from a form into a dict."""
+    payload: Dict[str, str] = {}
+    for inp in form.find_all(['input', 'select', 'textarea']):
+        n = inp.get('name')
+        if not n:
+            continue
+        payload[n] = inp.get('value', '') or ''
+    return payload
+
+
+def _parse_partial_response(xml_text: str) -> Tuple[Optional[str], Dict[str, str]]:
+    """Parse a JSF <partial-response> envelope.
+
+    Returns (view_state, updates) where updates maps update-id → inner HTML/CDATA.
+    """
+    try:
+        from xml.etree import ElementTree as ET
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return None, {}
+    view_state: Optional[str] = None
+    updates: Dict[str, str] = {}
+    for upd in root.iter('update'):
+        uid = upd.get('id') or ''
+        text = upd.text or ''
+        if uid.startswith('j_id') and 'ViewState' in uid:
+            view_state = text
+        elif uid == 'javax.faces.ViewState' or uid.endswith(':javax.faces.ViewState'):
+            view_state = text
+        else:
+            updates[uid] = text
+    # Fallback: search any element whose id contains ViewState.
+    if view_state is None:
+        for el in root.iter():
+            if 'ViewState' in (el.get('id') or '') and el.text:
+                view_state = el.text
+                break
+    return view_state, updates
+
+
+def fetch_campo_enrollment_documents(output_dir: Optional[str] = None, dry_run: bool = False) -> Optional[List[str]]:
+    """Download every PDF offered on campo's enrollment-info `studyservice-flow` page.
+
+    Yields 7 PDFs (Immatrikulationsbescheinigung, BAföG §9, Studienverlauf,
+    Datenkontrollblatt, Benutzerinfobrief, Semesterbeiträge × 2). Each PDF is
+    queued via a three-step JSF dance:
+
+      1. Tab POST navigates from "Meine Studiengänge" to "Bescheinigungen".
+      2. JSF AJAX `:job2` request opens a per-report config overlay
+         (`Faces-Request: partial/ajax`, parses `<partial-response>` for the
+         overlay update + fresh ViewState).
+      3. Regular form submit of the overlay's `startJob` button enqueues the
+         print job; polling `jobDownloadPoll:poll` until `data-stop="true"`
+         yields an `asyncDownload` anchor in a partial-response update —
+         GET that to receive the PDF.
+
+    A fresh GET anchors a new `_flowExecutionKey` before each iteration so
+    sequential job submissions don't run on stale flow state.
+
+    Returns list of saved file paths (or button labels in dry-run), or None on failure.
+    """
+    print("🔄 Fetching campo Bescheinigungen (enrollment-info) page...")
+    s = _campo_session()
+    if s is None:
+        return None
+
+    from urllib.parse import urljoin
+
+    def _navigate_to_bescheinigungen() -> Optional[Tuple[str, BeautifulSoup]]:
+        """GET start.xhtml, POST the Bescheinigungen tab, return (final_url, soup)."""
+        try:
+            r = s.get(CAMPO_ENROLLMENT_INFO_URL, timeout=30, allow_redirects=True)
+        except requests.RequestException as e:
+            print(f"❌ Campo request failed: {e}")
+            return None
+        if r.status_code != 200:
+            print(f"❌ Campo enrollment-info GET returned HTTP {r.status_code}.")
+            return None
+        soup = BeautifulSoup(r.text, 'html.parser')
+        tab = soup.find('button', {'name': 'studyserviceForm:content.10'})
+        if not tab:
+            print("❌ Campo enrollment-info not reachable. Log into campo.fau.de in Firefox and retry.")
+            return None
+        form = tab.find_parent('form')
+        if not form:
+            print("❌ Bescheinigungen tab has no enclosing form.")
+            return None
+        action = urljoin(r.url, form.get('action') or r.url)
+        payload = _form_payload(form)
+        payload['studyserviceForm:content.10'] = 'studyserviceForm:content.10'
+        try:
+            post = s.post(action, data=payload, timeout=60,
+                          allow_redirects=True, headers={'Referer': r.url})
+        except requests.RequestException as e:
+            print(f"❌ Bescheinigungen tab POST failed: {e}")
+            return None
+        if post.status_code != 200:
+            print(f"❌ Bescheinigungen tab POST returned HTTP {post.status_code}.")
+            return None
+        return post.url, BeautifulSoup(post.text, 'html.parser')
+
+    nav = _navigate_to_bescheinigungen()
+    if nav is None:
+        return None
+    page_url, soup = nav
+    buttons = soup.find_all('button', {'name': _ENROLLMENT_JOB_BUTTON_RE})
+    if not buttons:
+        print("⚠️  No :job2 buttons found on the Bescheinigungen tab.")
+        return None
+
+    reports = [(b.get('name'), (b.get('value') or '').strip() or b.get_text(strip=True)) for b in buttons]
+    print(f"📄 Found {len(reports)} enrollment report(s):")
+    for i, (_, label) in enumerate(reports):
+        print(f"   [{i:2d}] {label}")
+
+    if dry_run:
+        print("🔎 Dry-run: not downloading.")
+        return [label for _, label in reports]
+
+    if output_dir is None:
+        output_dir = os.path.join(DOWNLOAD_FOLDER, 'Bescheinigungen', 'Enrollment')
+    os.makedirs(output_dir, exist_ok=True)
+
+    saved: List[str] = []
+    for idx, (btn_name, label) in enumerate(reports):
+        result = _fetch_one_enrollment_pdf(s, btn_name, label, idx, output_dir)
+        if result:
+            saved.append(result)
+
+    print(f"✅ Saved {len(saved)}/{len(reports)} PDF(s) to {output_dir}")
+    return saved
+
+
+_DOWNLOAD_HREF_RE = re.compile(r'state=docdownload|asyncDownload|AsyncDownload', re.IGNORECASE)
+
+
+def _find_download_href(updates: Dict[str, str]) -> Optional[str]:
+    """Search partial-response update bodies for a campo doc-download anchor."""
+    for body in updates.values():
+        if not body:
+            continue
+        usoup = BeautifulSoup(body, 'html.parser')
+        for a in usoup.find_all('a', href=True):
+            if _DOWNLOAD_HREF_RE.search(a['href']):
+                return a['href']
+    return None
+
+
+def _fetch_one_enrollment_pdf(
+    s: requests.Session,
+    btn_name: str,
+    label: str,
+    idx: int,
+    output_dir: str,
+) -> Optional[str]:
+    """Run one :job2 → (optionally startJob → poll →) GET docdownload cycle.
+
+    For simple reports (no config needed) the :job2 AJAX POST already enqueues
+    the job and returns a `rds?state=docdownload&docId=…` anchor in the
+    `jobDownload` update of the `<partial-response>`. For parameterized
+    reports the response instead carries a `startJob` button (form submit)
+    inside the `jobConfigurationButtonsOverlay` update, which we then submit
+    and poll until the download anchor materializes.
+
+    Each cycle anchors a fresh `_flowExecutionKey` via re-navigation from the
+    start URL through the Bescheinigungen tab.
+    """
+    from urllib.parse import urljoin
+
+    # Fresh navigation (resets _flowExecutionKey).
+    try:
+        r = s.get(CAMPO_ENROLLMENT_INFO_URL, timeout=30, allow_redirects=True)
+    except requests.RequestException as e:
+        print(f"   ✗ [{idx}] {label}: start GET failed ({e})")
+        return None
+    if r.status_code != 200:
+        print(f"   ✗ [{idx}] {label}: start GET HTTP {r.status_code}")
+        return None
+    soup = BeautifulSoup(r.text, 'html.parser')
+    tab = soup.find('button', {'name': 'studyserviceForm:content.10'})
+    if not tab:
+        print(f"   ✗ [{idx}] {label}: Bescheinigungen tab vanished")
+        return None
+    form = tab.find_parent('form')
+    if not form:
+        print(f"   ✗ [{idx}] {label}: tab has no enclosing form")
+        return None
+    action = urljoin(r.url, form.get('action') or r.url)
+    payload = _form_payload(form)
+    payload['studyserviceForm:content.10'] = 'studyserviceForm:content.10'
+    try:
+        tab_resp = s.post(action, data=payload, timeout=60,
+                          allow_redirects=True, headers={'Referer': r.url})
+    except requests.RequestException as e:
+        print(f"   ✗ [{idx}] {label}: tab POST failed ({e})")
+        return None
+    if tab_resp.status_code != 200:
+        print(f"   ✗ [{idx}] {label}: tab POST HTTP {tab_resp.status_code}")
+        return None
+
+    tab_soup = BeautifulSoup(tab_resp.text, 'html.parser')
+    btn = tab_soup.find('button', {'name': btn_name})
+    if not btn:
+        print(f"   ✗ [{idx}] {label}: button {btn_name} vanished")
+        return None
+    job_form = btn.find_parent('form')
+    if not job_form:
+        print(f"   ✗ [{idx}] {label}: button has no enclosing form")
+        return None
+    job_action = urljoin(tab_resp.url, job_form.get('action') or tab_resp.url)
+    form_payload = _form_payload(job_form)
+    view_state = form_payload.get('javax.faces.ViewState', '')
+    if not view_state:
+        print(f"   ✗ [{idx}] {label}: no ViewState on tab page")
+        return None
+
+    # Step 2: JSF AJAX :job2 — opens the per-report config overlay server-side.
+    overlay_render = (
+        'studyserviceForm:report:reports:reportButtons:jobConfigurationButtonsOverlay '
+        'studyserviceForm:report:reports:reportButtons:jobDownload '
+        'studyserviceForm:messages-infobox'
+    )
+    ajax_headers = {
+        'Faces-Request': 'partial/ajax',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/xml, text/xml, */*; q=0.01',
+        'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+        'Referer': tab_resp.url,
+    }
+    ajax_payload = {
+        'javax.faces.partial.ajax': 'true',
+        'javax.faces.source': btn_name,
+        'javax.faces.partial.execute': btn_name,
+        'javax.faces.partial.render': overlay_render,
+        'javax.faces.behavior.event': 'action',
+        'javax.faces.partial.event': 'action',
+        btn_name: btn_name,
+        'studyserviceForm': 'studyserviceForm',
+        'javax.faces.ViewState': view_state,
+    }
+    try:
+        ajax_resp = s.post(job_action, data=ajax_payload, headers=ajax_headers, timeout=60)
+    except requests.RequestException as e:
+        print(f"   ✗ [{idx}] {label}: :job2 AJAX failed ({e})")
+        return None
+    if ajax_resp.status_code != 200:
+        print(f"   ✗ [{idx}] {label}: :job2 AJAX HTTP {ajax_resp.status_code}")
+        return None
+    new_vs, updates = _parse_partial_response(ajax_resp.text)
+    if new_vs:
+        view_state = new_vs
+
+    # The :job2 AJAX response itself runs the job for simple reports — the
+    # `jobDownload` update will already contain a docdownload anchor. For
+    # parameterized reports it instead carries a non-empty config overlay
+    # with a startJob button that we then submit.
+    download_href = _find_download_href(updates)
+    poll_url = job_action
+
+    if not download_href:
+        overlay_html = updates.get(
+            'studyserviceForm:report:reports:reportButtons:jobConfigurationButtonsOverlay', ''
+        )
+        if not overlay_html.strip() or 'startJob' not in overlay_html:
+            print(f"   ✗ [{idx}] {label}: :job2 returned no download anchor and no startJob overlay")
+            return None
+        # JSF lazy-renders the actual form into `overlayPlaceholder` only
+        # after the user clicks the overlayShowButton. Trigger that AJAX call
+        # so the per-report inputs (semester selectors, date pickers, BAföG
+        # period selectors, …) appear in the response we then submit.
+        show_btn_name = (
+            'studyserviceForm:report:reports:reportButtons:'
+            'jobConfigurationButtonsOverlay:overlayShowButton'
+        )
+        placeholder_render = (
+            'studyserviceForm:report:reports:reportButtons:'
+            'jobConfigurationButtonsOverlay:overlayPlaceholder'
+        )
+        show_payload = {
+            'javax.faces.partial.ajax': 'true',
+            'javax.faces.source': show_btn_name,
+            'javax.faces.partial.execute': '@this',
+            'javax.faces.partial.render': placeholder_render,
+            'javax.faces.behavior.event': 'action',
+            'javax.faces.partial.event': 'action',
+            show_btn_name: show_btn_name,
+            'studyserviceForm': 'studyserviceForm',
+            'javax.faces.ViewState': view_state,
+        }
+        try:
+            show_resp = s.post(job_action, data=show_payload, headers=ajax_headers, timeout=60)
+        except requests.RequestException as e:
+            print(f"   ✗ [{idx}] {label}: overlayShowButton AJAX failed ({e})")
+            return None
+        if show_resp.status_code == 200:
+            svs, supdates = _parse_partial_response(show_resp.text)
+            if svs:
+                view_state = svs
+            placeholder_html = supdates.get(placeholder_render, '')
+            if placeholder_html.strip():
+                overlay_html = overlay_html + placeholder_html
+
+        overlay_soup = BeautifulSoup(overlay_html, 'html.parser')
+        start_btn = overlay_soup.find(
+            'button',
+            {'name': re.compile(r'jobConfigurationButtonsOverlay:.*startJob$')},
+        )
+        if not start_btn:
+            print(f"   ✗ [{idx}] {label}: startJob button not found in overlay")
+            return None
+        start_btn_name = start_btn.get('name')
+
+        # The overlay carries the per-report form fields (date pickers,
+        # semester selectors, etc.) that the server validates when startJob
+        # fires. Merge them into the page-form payload so the POST is
+        # complete; pre-checked checkbox/radio inputs get their values.
+        start_payload = dict(form_payload)
+        for inp in overlay_soup.find_all(['input', 'select', 'textarea']):
+            n = inp.get('name')
+            if not n:
+                continue
+            itype = (inp.get('type') or '').lower()
+            if itype in ('checkbox', 'radio'):
+                if inp.has_attr('checked'):
+                    start_payload[n] = inp.get('value', 'on') or 'on'
+                continue
+            if itype in ('submit', 'button', 'image', 'reset'):
+                continue
+            if inp.name == 'select':
+                # Prefer an explicitly-selected option; otherwise pick the
+                # first option with a non-empty value (skipping the empty
+                # placeholder "" option that JSF cmselect widgets always lead
+                # with). This defaults parameterized reports — semester /
+                # period selectors — to the current semester, which is what
+                # campo lists first after the empty placeholder.
+                chosen = inp.find('option', selected=True)
+                if not chosen:
+                    for o in inp.find_all('option'):
+                        if (o.get('value') or '').strip():
+                            chosen = o
+                            break
+                if not chosen:
+                    chosen = inp.find('option')
+                start_payload[n] = (chosen.get('value', '') if chosen else '') or ''
+            else:
+                start_payload[n] = inp.get('value', '') or ''
+        start_payload['javax.faces.ViewState'] = view_state
+        start_payload[start_btn_name] = start_btn_name
+        try:
+            start_resp = s.post(
+                job_action, data=start_payload, timeout=60,
+                allow_redirects=True,
+                headers={'Referer': tab_resp.url},
+            )
+        except requests.RequestException as e:
+            print(f"   ✗ [{idx}] {label}: startJob POST failed ({e})")
+            return None
+        if start_resp.status_code != 200:
+            print(f"   ✗ [{idx}] {label}: startJob POST HTTP {start_resp.status_code}")
+            return None
+
+        start_soup = BeautifulSoup(start_resp.text, 'html.parser')
+        vs_input = start_soup.find('input', {'name': 'javax.faces.ViewState'})
+        if vs_input and vs_input.get('value'):
+            view_state = vs_input['value']
+        poll_url = start_resp.url
+
+        # The startJob response often already embeds the docdownload anchor
+        # (the job runs synchronously enough for fast reports). Use it
+        # directly and skip the poll loop.
+        for a in start_soup.find_all('a', href=True):
+            if _DOWNLOAD_HREF_RE.search(a['href']):
+                download_href = a['href']
+                break
+
+    if not download_href:
+        # Poll jobDownloadPoll:poll until a download anchor appears.
+        poll_name = 'studyserviceForm:report:reports:reportButtons:jobDownloadPoll:poll'
+        poll_render = 'studyserviceForm:report:reports:reportButtons:jobDownloadPoll'
+        poll_payload = {
+            'javax.faces.partial.ajax': 'true',
+            'javax.faces.source': poll_name,
+            'javax.faces.partial.execute': '@none',
+            'javax.faces.partial.render': poll_render,
+            poll_name: poll_name,
+            'javax.faces.behavior.event': 'poll',
+            'javax.faces.partial.event': 'poll',
+            'studyserviceForm': 'studyserviceForm',
+            'javax.faces.ViewState': view_state,
+        }
+        poll_headers = {
+            'Faces-Request': 'partial/ajax',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/xml, text/xml, */*; q=0.01',
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            'Referer': poll_url,
+        }
+        last_envelope: Optional[str] = None
+        identical_streak = 0
+        for attempt in range(30):
+            time.sleep(3)
+            try:
+                poll_resp = s.post(poll_url, data=poll_payload, headers=poll_headers, timeout=30)
+            except requests.RequestException as e:
+                print(f"   ✗ [{idx}] {label}: poll #{attempt+1} failed ({e})")
+                return None
+            if poll_resp.status_code != 200:
+                print(f"   ✗ [{idx}] {label}: poll #{attempt+1} HTTP {poll_resp.status_code}")
+                return None
+            envelope = poll_resp.text
+            if envelope == last_envelope:
+                identical_streak += 1
+                if identical_streak >= 3:
+                    print(f"   ✗ [{idx}] {label}: poll stalled (3× identical envelope)")
+                    return None
+            else:
+                identical_streak = 0
+                last_envelope = envelope
+            pvs, pupdates = _parse_partial_response(envelope)
+            if pvs:
+                poll_payload['javax.faces.ViewState'] = pvs
+            href = _find_download_href(pupdates)
+            if href:
+                download_href = href
+                break
+        if not download_href:
+            print(f"   ✗ [{idx}] {label}: polling exhausted without a download anchor")
+            return None
+
+    # GET the docdownload anchor → PDF.
+    full_href = urljoin(poll_url, download_href)
+    try:
+        pdf_resp = s.get(full_href, timeout=120, allow_redirects=True,
+                         headers={'Referer': poll_url})
+    except requests.RequestException as e:
+        print(f"   ✗ [{idx}] {label}: PDF GET failed ({e})")
+        return None
+    ct = (pdf_resp.headers.get('Content-Type') or '').lower()
+    is_pdf = 'pdf' in ct or pdf_resp.content[:4] == b'%PDF'
+    if not is_pdf:
+        print(f"   ✗ [{idx}] {label}: download response was {ct or '?'} ({len(pdf_resp.content)} B), not PDF")
+        return None
+    fname = _filename_from_content_disposition(
+        pdf_resp.headers.get('Content-Disposition', ''),
+        fallback=f"enrollment_{idx}_{re.sub(r'[^A-Za-z0-9._-]+', '_', label)[:60] or 'report'}.pdf",
+    )
+    fname = os.path.basename(fname).replace('/', '_').replace('\\', '_')
+    out_path = os.path.join(output_dir, fname)
+    with open(out_path, 'wb') as fh:
+        fh.write(pdf_resp.content)
+    print(f"   ✓ [{idx}] {label}  →  {fname} ({len(pdf_resp.content):,} B)")
+    return out_path
 
 
 def _run_tui_menu(debug: bool = False) -> None:
@@ -5100,6 +5566,10 @@ def main() -> None:
                        help='Scan campo studyPlanner Detailansichten (opened in Firefox) and write pruefungen.md')
     parser.add_argument('--campo-bescheinigungen', action='store_true',
                        help='Download all PDFs from campo Notenübersicht / personExamsReadonly page (Notenübersicht, BAföG-§48, ord. Studium, angemeldete Prüfungen, ...) into <downloads>/Bescheinigungen/')
+    parser.add_argument('--campo-enrollment-bescheinigungen', action='store_true',
+                       help='Download all 7 PDFs from campo enrollment-info studyservice-flow page (Immatrikulationsbescheinigung, BAföG §9, Studienverlauf, Datenkontrollblatt, Benutzerinfobrief, Semesterbeiträge ×2) into <downloads>/Bescheinigungen/Enrollment/')
+    parser.add_argument('--with-enrollment', action='store_true',
+                       help='When combined with --campo-bescheinigungen, also fetch the 7 enrollment-side PDFs (total 19).')
     parser.add_argument('--install-imap', action='store_true',
                        help='Configure FAUmail IMAP credentials (for feedback-file auto-download)')
     parser.add_argument('--uninstall-imap', action='store_true',
@@ -5123,7 +5593,14 @@ def main() -> None:
 
     # --- Campo Notenübersicht / Bescheinigungen (PDF bulk download) ---
     if args.campo_bescheinigungen:
-        fetch_campo_exam_documents()
+        fetch_campo_exam_documents(dry_run=args.dry_run)
+        if args.with_enrollment:
+            fetch_campo_enrollment_documents(dry_run=args.dry_run)
+        return
+
+    # --- Campo Bescheinigungen — enrollment side only (studyservice-flow) ---
+    if args.campo_enrollment_bescheinigungen:
+        fetch_campo_enrollment_documents(dry_run=args.dry_run)
         return
 
     # --- Claude Code skill registration ---
