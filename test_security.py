@@ -399,6 +399,58 @@ def test_extract_studon_link_rejects_substring_lookalikes():
     assert s._extract_studon_link(legit) == 'https://www.studon.fau.de/studon/go/exc/1'
 
 
+# --- First-boot-wins guard: daily sync must not run twice across fleet hosts ---
+# The Workstation and the Ideapad both run `@reboot --daily-sync`; the sync
+# state (RECENT_UPDATES.md "Last updated:" line) lives in the Syncthing-synced
+# download folder. Without re-checking that state right before scraping, both
+# hosts scrape on the same morning and every shared output file conflicts.
+
+def _write_recent_updates(folder, when):
+    """Write a RECENT_UPDATES.md carrying the given 'Last updated' timestamp."""
+    path = os.path.join(str(folder), "RECENT_UPDATES.md")
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write("# Recent updates\n\n")
+        f.write(f"Last updated: {when.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    return path
+
+
+def test_fleet_synced_today_true_when_state_is_from_today(tmp_path, monkeypatch):
+    """A today-dated state (e.g. synced in from the other host) means: skip."""
+    from datetime import datetime
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', str(tmp_path))
+    _write_recent_updates(tmp_path, datetime.now())
+    assert s._fleet_synced_today(grace_seconds=0) is True
+
+
+def test_fleet_synced_today_false_when_state_is_stale(tmp_path, monkeypatch):
+    """A yesterday-or-older state must not suppress today's sync."""
+    from datetime import datetime, timedelta
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', str(tmp_path))
+    _write_recent_updates(tmp_path, datetime.now() - timedelta(days=1))
+    assert s._fleet_synced_today(grace_seconds=0) is False
+
+
+def test_fleet_synced_today_false_when_no_state_exists(tmp_path, monkeypatch):
+    """First ever run (no RECENT_UPDATES.md): sync must proceed."""
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', str(tmp_path))
+    assert s._fleet_synced_today(grace_seconds=0) is False
+
+
+def test_fleet_synced_today_rechecks_after_grace_window(tmp_path, monkeypatch):
+    """The guard re-reads state after the grace sleep — simulating Syncthing
+    delivering another host's freshly completed sync during that window."""
+    from datetime import datetime, timedelta
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', str(tmp_path))
+    _write_recent_updates(tmp_path, datetime.now() - timedelta(days=1))
+
+    def deliver_other_hosts_state(seconds):
+        # what Syncthing would do while we sleep
+        _write_recent_updates(tmp_path, datetime.now())
+
+    monkeypatch.setattr(s.time, 'sleep', deliver_other_hosts_state)
+    assert s._fleet_synced_today(grace_seconds=90) is True
+
+
 # --- 7z symlink containment (verified handled by py7zr >=1.0) ----------------
 
 def test_extract_archive_refuses_7z_with_symlink_member(tmp_path):

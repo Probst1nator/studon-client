@@ -9,6 +9,13 @@ import json
 # heavy imports below (requests, BeautifulSoup, browser_cookie3, …) would
 # blow the budget, so short-circuit here.
 if "--advertise" in sys.argv:
+    # Resolve the configured download folder inline (config.json is loaded much
+    # later, after heavy imports) so the digest tool can read course files.
+    _cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    try:
+        _dl = os.path.expanduser(json.load(open(_cfg)).get("downloads_path", "studon_downloads"))
+    except Exception:
+        _dl = "studon_downloads"
     print(json.dumps([{
         "name": "StudOn Client",
         "desktop_file": "studon_client.desktop",
@@ -26,6 +33,10 @@ if "--advertise" in sys.argv:
         # Skill support: --install-skill / --uninstall-skill write
         # ~/.claude/skills/studon/SKILL.md from inline SKILL_MD_CONTENT.
         "skill_name": "studon",
+        # Digest connection: where course PDFs land + a non-daemon refresh.
+        # (--update-all refreshes tracked courses; --daily-sync is a Firefox-waiting daemon.)
+        "digest_output": os.path.join(_dl, "**", "*.pdf"),
+        "digest_run": ["--update-all"],
     }]))
     sys.exit(0)
 
@@ -40,6 +51,7 @@ import pyperclip
 import browser_cookie3
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
+from bs4.element import Tag
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 import zipfile
@@ -394,6 +406,7 @@ CAMPO_TIMETABLE_URL = 'https://www.campo.fau.de/qisserver/pages/plan/individualT
 CAMPO_STUDY_PLANNER_URL = 'https://www.campo.fau.de/qisserver/pages/startFlow.xhtml?_flowId=studyPlanner-flow'
 CAMPO_EXAMS_OVERVIEW_URL = 'https://www.campo.fau.de/qisserver/pages/sul/examAssessment/personExamsReadonly.xhtml?_flowId=examsOverviewForPerson-flow'
 CAMPO_ENROLLMENT_INFO_URL = 'https://www.campo.fau.de/qisserver/pages/cm/exa/enrollment/info/start.xhtml?_flowId=studyservice-flow'
+CAMPO_BELEGUNGEN_URL = 'https://www.campo.fau.de/qisserver/pages/cm/exa/enrollment/info/start.xhtml?_flowId=searchOwnEnrollmentInfo-flow'
 RECENT_UPDATES_FILE = os.path.join(DOWNLOAD_FOLDER, "RECENT_UPDATES.md")
 LECTURE_MAPPING_PATH = os.path.join(_SCRIPT_DIR, "lecture_mapping.json")
 SYNC_LOCK_PATH = os.path.join(DOWNLOAD_FOLDER, ".studon_sync.lock")
@@ -1927,7 +1940,38 @@ def was_updated_today(state: UpdateState) -> bool:
 
     return last_update_date == today
 
-def update_all_courses(debug: bool = False, session: Optional[requests.Session] = None) -> Tuple[bool, int, int, bool]:
+# Grace window for the first-boot-wins guard: how long to wait for Syncthing
+# to deliver another fleet host's sync state before deciding to scrape.
+FLEET_SYNC_GRACE_SECONDS = 120.0
+
+def _fleet_synced_today(grace_seconds: float = FLEET_SYNC_GRACE_SECONDS) -> bool:
+    """First-boot-wins guard: has another fleet host already synced today?
+
+    Both the Workstation and the Ideapad run `@reboot --daily-sync`, and the
+    sync state (RECENT_UPDATES.md "Last updated:" line) lives inside the
+    Syncthing-replicated download folder. Checking the state only once at
+    process start is not enough: the @reboot daemon usually starts before
+    Syncthing has connected, so both hosts saw "not synced today" and both
+    scraped — every shared output file (METADATA.md etc.) then conflicted.
+
+    This guard is meant to be called right before scraping. If the state still
+    says "not synced today", it waits `grace_seconds` to give Syncthing a
+    chance to deliver a fresher state file from a sibling host, then checks
+    once more. Returns True if today's sync is already done (caller skips).
+    """
+    if was_updated_today(load_state()):
+        return True
+    if grace_seconds > 0:
+        logger.info(
+            f"Daily sync: no fleet sync recorded today — waiting {grace_seconds:.0f}s "
+            "for Syncthing to deliver a possibly fresher state, then re-checking."
+        )
+        time.sleep(grace_seconds)
+        if was_updated_today(load_state()):
+            return True
+    return False
+
+def update_all_courses(debug: bool = False, session: Optional[requests.Session] = None) -> Tuple[bool, int, int, bool, List[str]]:
     """Update all courses by scanning METADATA.md files.
 
     Args:
@@ -1936,7 +1980,7 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
                  from Firefox automatically.
 
     Returns:
-        Tuple of (success, total_downloaded, total_extracted, session_expired).
+        Tuple of (success, total_downloaded, total_extracted, session_expired, downloaded_files).
     """
     try:
         if session is None:
@@ -1952,7 +1996,7 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
 
         if not metadata_files:
             print("No registered courses found.")
-            return False, 0, 0, False
+            return False, 0, 0, False, []
 
         n = len(metadata_files)
         print(f"Updating {n} course{'s' if n != 1 else ''}...")
@@ -1963,15 +2007,17 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
         total_git_failed = 0
         successful_courses = 0
         session_expired = False
+        all_downloaded_files: List[str] = []
 
         for i, (metadata_path, source_url, course_folder) in enumerate(metadata_files, 1):
             name = os.path.basename(course_folder)
             print(f"  [{i}/{n}] {name}", end='', flush=True)
 
             try:
-                downloaded, extracted, _ = process_single_url(source_url, session, course_folder, create_course_subfolder=False, debug=debug)
+                downloaded, extracted, downloaded_paths = process_single_url(source_url, session, course_folder, create_course_subfolder=False, debug=debug)
                 total_downloaded += downloaded
                 total_extracted += extracted
+                all_downloaded_files.extend(downloaded_paths)
                 successful_courses += 1
                 if downloaded:
                     print(f"  — {downloaded} new file{'s' if downloaded != 1 else ''}" +
@@ -1992,7 +2038,7 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
                 continue
 
         if session_expired:
-            return False, 0, 0, True
+            return False, 0, 0, True, []
 
         # Pull all git repos in the entire downloads folder (catches repos not inside any tracked course)
         git_pulled, git_failed = pull_git_repos(DOWNLOAD_FOLDER)
@@ -2010,14 +2056,18 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
             parts.append(f"{total_git_failed} git pull error{'s' if total_git_failed != 1 else ''}")
         print("Done." + (f" {', '.join(parts)}." if parts else " Nothing new."))
 
-        return successful_courses > 0, total_downloaded, total_extracted, False
+        return successful_courses > 0, total_downloaded, total_extracted, False, all_downloaded_files
 
     except Exception as e:
         logger.error(f"Error during update: {e}")
-        return False, 0, 0, False
+        return False, 0, 0, False, []
 
-def _send_desktop_notification(n_downloaded: int, n_extracted: int) -> None:
-    """Send a desktop notification via notify-send (Linux)."""
+def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optional[List[str]] = None) -> None:
+    """Send a desktop notification via notify-send (Linux).
+
+    If `files` is given, lists the basenames (capped) under the summary line
+    so the user can see what was freshly fetched without opening the log.
+    """
     if not shutil.which("notify-send"):
         return
     if n_downloaded:
@@ -2025,6 +2075,13 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int) -> None:
         if n_extracted:
             parts.append(f"{n_extracted} extracted")
         body = ", ".join(parts) + "."
+        if files:
+            max_list = 10
+            shown = files[:max_list]
+            lines = [f"• {os.path.basename(p)}" for p in shown]
+            if len(files) > max_list:
+                lines.append(f"… and {len(files) - max_list} more")
+            body = body + "\n" + "\n".join(lines)
     else:
         body = "Everything already up to date."
     # notify-send needs DBUS_SESSION_BUS_ADDRESS when run from cron.
@@ -2186,22 +2243,37 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                 waiting_logged = False
                 continue
 
+            # First-boot-wins guard: another fleet host (Workstation/Ideapad)
+            # may have completed today's sync while this daemon was waiting
+            # for the Firefox login. Re-check the Syncthing-synced state right
+            # before scraping — includes a grace wait so a freshly-booted host
+            # gives Syncthing time to deliver the sibling's state file.
+            if _fleet_synced_today():
+                logger.info("Daily sync: already completed today by another fleet host — skipping.")
+                return
+
             if not _acquire_sync_lock('daily-sync', wait_seconds=600):
                 logger.info("Daily sync: lock busy, deferring 5 min.")
                 time.sleep(300)
                 continue
             try:
-                success, n_downloaded, n_extracted, session_expired = update_all_courses()
+                # Cheap final re-check inside the lock (no grace wait): closes
+                # the race where the sibling's state arrived during lock wait.
+                if was_updated_today(load_state()):
+                    logger.info("Daily sync: already completed today by another fleet host — skipping.")
+                    return
+                success, n_downloaded, n_extracted, session_expired, downloaded_files = update_all_courses()
                 if success:
                     try:
-                        fb_processed, fb_files = check_and_process_feedback()
+                        fb_processed, fb_files, fb_paths = check_and_process_feedback()
                         if fb_files:
                             logger.info(f"Feedback sync: downloaded {fb_files} file(s) across {fb_processed} exercise(s).")
                             n_downloaded += fb_files
+                            downloaded_files = downloaded_files + fb_paths
                     except Exception as e:
                         logger.warning(f"Feedback check failed (non-fatal): {e}")
                     logger.info("Daily sync complete.")
-                    _send_desktop_notification(n_downloaded, n_extracted)
+                    _send_desktop_notification(n_downloaded, n_extracted, downloaded_files)
                     return
             finally:
                 _release_sync_lock()
@@ -2380,8 +2452,11 @@ def _warn_unmapped_once(resolved: List[ResolvedLecture], warned: set) -> None:
             pass
 
 
-def _lecture_fetch_one(course: TrackedCourse) -> Tuple[int, int]:
-    """Run a single-course fetch via the existing pipeline. Returns (downloaded, extracted)."""
+def _lecture_fetch_one(course: TrackedCourse) -> Tuple[int, int, List[str]]:
+    """Run a single-course fetch via the existing pipeline.
+
+    Returns (downloaded, extracted, downloaded_file_paths).
+    """
     try:
         cj = browser_cookie3.firefox(domain_name=STUDON_DOMAIN)
     except Exception as e:
@@ -2389,11 +2464,11 @@ def _lecture_fetch_one(course: TrackedCourse) -> Tuple[int, int]:
     session = requests.Session()
     session.cookies.update(cj)
     session.headers.update({'User-Agent': 'Mozilla/5.0'})
-    downloaded, extracted, _ = process_single_url(
+    downloaded, extracted, downloaded_paths = process_single_url(
         course.source_url, session, course.course_folder,
         create_course_subfolder=False, debug=False,
     )
-    return downloaded, extracted
+    return downloaded, extracted, downloaded_paths
 
 
 def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
@@ -2510,9 +2585,9 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
             try:
                 logger.info(f"Lecture sync: fetching '{course.course_title}'")
                 try:
-                    downloaded, extracted = _lecture_fetch_one(course)
+                    downloaded, extracted, downloaded_paths = _lecture_fetch_one(course)
                     if downloaded:
-                        _send_desktop_notification(downloaded, extracted)
+                        _send_desktop_notification(downloaded, extracted, downloaded_paths)
                         logger.info(f"Lecture sync: {downloaded} new, {extracted} extracted.")
                     else:
                         logger.info("Lecture sync: nothing new.")
@@ -2978,7 +3053,7 @@ def _run_uninstall() -> None:
         proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
         existing = proc.stdout if proc.returncode == 0 else ''
         clean = [l for l in existing.splitlines()
-                 if not (script_path in l and ('--daily-sync' in l or '--lecture-sync' in l))]
+                 if not (script_path in l and ('--daily-sync' in l or '--lecture-sync' in l or '--campo-bescheinigungen' in l))]
         if len(clean) < len(existing.splitlines()):
             subprocess.run(['crontab', '-'], input='\n'.join(clean) + '\n',
                            capture_output=True, text=True)
@@ -3009,7 +3084,7 @@ SKILL_DIR  = Path.home() / '.claude' / 'skills' / 'studon'
 SKILL_FILE = SKILL_DIR / 'SKILL.md'
 SKILL_MD_CONTENT = '''---
 name: studon
-description: Drive the StudOn / Campo scraper at ~/Synced/repos/AutomatedAlchemy/studon-client/. Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, dump prüfungs-Anmeldefristen, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
+description: Drive the StudOn / Campo scraper at ~/Synced/repos/AutomatedAlchemy/studon-client/. Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, dump prüfungs-Anmeldefristen, export the studyPlanner Modulplan (status/ECTS/Versuch per module), list current Belegungen (angemeldete Prüfungen + Veranstaltungen mit Termin/Raum/Prüfer), reconcile Modulplan ↔ Belegungen for an honest ECTS-Bilanz, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studienfortschritt", "modulplan", "wieviele ects hab ich", "belegungen", "wo bin ich angemeldet", "klausurtermin", "reconcile", "ects bilanz", "stimmt meine ects", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
 ---
 
 # studon
@@ -3023,6 +3098,7 @@ folder (`~/Synced/OneDrive/Studium/KIM4/` on this fleet).
 The scraper is already installed and self-running:
 - `@reboot studon_client.py --daily-sync` — once-per-day full sync of all tracked courses
 - `@reboot studon_client.py --lecture-sync` — per-lecture fetcher driven by the campo timetable
+- `30 6 * * 1 studon_client.py --campo-bescheinigungen` — weekly (Mo 06:30) Prüfungsamt-PDF refresh so `--reconcile` always has the canonical ECTS source
 
 This skill is for **ad-hoc invocations** from a Claude session — anything the
 cron daemons don't already do automatically.
@@ -3032,7 +3108,11 @@ cron daemons don't already do automatically.
 - "Download this StudOn course" → has a URL → `<URL>` mode below.
 - "Update all my courses now" → `--update-all`.
 - "Was kommt diese Woche an Vorlesungen?" → `--timetable` → reads `timetable.md`.
-- "Welche Prüfungsanmeldungen laufen?" → `--campo-pruefungen` (requires Detailansichten pre-opened in Firefox).
+- "Wie steht mein Studienfortschritt?" / "welche Module hab ich bestanden?" → `--modulplan` (deterministic, no Pre-Click) → `Modulplan.md` with Nr/Titel/Status/Semester/Versuch/ECTS for every module in the Studienplan + ECTS-Bilanz footer.
+- "Welche Prüfungsanmeldungen laufen?" → `--campo-pruefungen` (requires Prüfungs-Detailansichten pre-opened in Firefox — Zeiträume live only on per-Prüfung Detail views, not the deterministic Modul-Detail views).
+- "Wo bin ich diesen Semester angemeldet?" / "wann ist Klausur X?" / "welche Räume hat Vorlesung Y?" → `--belegungen` (deterministic, no Pre-Click) → `Belegungen.md` + `Belegungen.json` with angemeldete Prüfungen (Nr/Form/Prüfer/Termin/Status) + Veranstaltungen (Typ/Titel/Termin+Raum/Dozent). Beleg im Streitfall. Pure data — change-detection/notification lives in the sibling **belegungen-watcher** tool (`~/Synced/repos/AutomatedAlchemy/belegungen-watcher/main.py`), which consumes `Belegungen.json` and fires `notify-send` on Termin-Konkretisierung / Status-Flip.
+- "Stimmt meine ECTS-Bilanz?" / "warum sagen `lernplan.md` und Modulplan unterschiedliche ECTS?" / "welche Modul-Anmeldungen haben keine Belegung?" / "BAföG-relevante ECTS-Zahl" → `--reconcile` → `Reconciliation.md`. Wenn `Bescheinigungen/Notenübersicht*Module*.pdf` existiert (lade einmalig via `--campo-bescheinigungen`), wird **die PDF zur kanonischen ECTS-Quelle** (Prüfungsamt-signiert, BAföG-relevant) — der Front-Page-Undercount wird automatisch sichtbar gemacht. Sections: (1) Belegungen-Prüfung → Modulplan-Modul-Match, (2) Modulplan-Angemeldet ohne Belegung, (3) Bestanden-Module ohne `X/Y`-Suffix, (4) PDF-Inhalt mit Gap-zu-Modulplan pro Modul, (5) Lücken die der Modulplan unterläuft.
+- "Suche Kurs X in campo" / "wie viele ECTS hat …" → `--campo-search "<query>" [--term 'eq|1|2026']` (prints LV-Treffer + ECTS to stdout; default Semester = aktuelles).
 - "Lade meine Notenübersicht / BAföG-Bescheinigung / Transcript" → `--campo-bescheinigungen` (downloads all 12 PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/`).
 - "Register a new course from a campo timetable entry I don't have yet" → `--discover-from-timetable`.
 
@@ -3067,7 +3147,11 @@ already has `browser-cookie3`, `beautifulsoup4`, `requests`, `questionary`.)
 | Export campo timetable → `timetable.md` | `$PY $SCRAPER --timetable` |
 | Map unmapped timetable entries → courses | `$PY $SCRAPER --map-lectures` |
 | Auto-register new courses from timetable | `$PY $SCRAPER --discover-from-timetable` |
+| Scan Studienplan-Modulplan (deterministisch) → `Modulplan.md` | `$PY $SCRAPER --modulplan` |
+| Scan Belegungen (Prüfungen + Veranstaltungen, deterministisch) → `Belegungen.md` + Termin-Watcher | `$PY $SCRAPER --belegungen` |
+| Cross-Check Modulplan ↔ Belegungen → `Reconciliation.md` | `$PY $SCRAPER --reconcile` |
 | Dump Prüfungs-Anmeldefristen → `pruefungen.md` | `$PY $SCRAPER --campo-pruefungen` |
+| Search campo courses (+ECTS) | `$PY $SCRAPER --campo-search "<query>" [--term 'eq|1|2026']` |
 | Download all Notenübersicht/Bescheinigungen PDFs | `$PY $SCRAPER --campo-bescheinigungen` |
 | Show next 5 lecture-sync fires (debug) | `$PY $SCRAPER --lecture-sync-once` |
 | Set default download path | `$PY $SCRAPER --set-download-path ~/path` |
@@ -3082,9 +3166,35 @@ Full architecture & dataclasses: `~/Synced/repos/AutomatedAlchemy/studon-client/
   prints `❌ Could not load Firefox cookies` or `make sure you're logged in`.
   Tell the user to refresh both tabs in Firefox, then re-run.
 - For `--campo-pruefungen`: the user must have **manually opened each
-  Modul/Prüfungs-Detailansicht in Firefox** beforehand (the `_flowExecutionKey`
+  Prüfungs-Detailansicht in Firefox** beforehand (the `_flowExecutionKey`
   is server-side per-session state — the scraper can only iterate keys that
-  already exist in the current campo flow stack).
+  already exist in the current campo flow stack). The scan walks flows
+  `e1..e99` (adaptive, stops after 12 consecutive empty flows). Zeiträume
+  (Anmelde-/Abmelde-/Prüfungszeitraum) only render on per-Prüfung Detail
+  pages — the deterministic `--modulplan` route reaches *Modul-Detail* pages
+  which do **not** carry Zeiträume.
+- For `--modulplan`: no Pre-Click required. The studyPlanner-flow front page
+  is fetched fresh; campo mints a `_flowExecutionKey` automatically. ECTS,
+  Status, Semester, Versuch are all extracted from the front-page HTML
+  (`X/Y`-suffix at the end of each `modulePlanItem` div). Output has a
+  Studienfortschritt-Header (Bestanden vs. `modulplan_ects_soll` aus
+  `config.json`, Default 180) plus 3 status-grouped tables (Bestanden /
+  Angemeldet / Offen).
+- For `--belegungen`: no Pre-Click required. The searchOwnEnrollmentInfo-flow
+  front page lists all `Belegung<N>:tableGroup` blocks for the *currently
+  selected* semester (campo defaults to the running one). Termin-spalte
+  carries `<br>`-separated multi-Termine; Prüfer-/Dozent-Spalte ist deduped.
+  Emits `Belegungen.md` (human) + `Belegungen.json` (machine). Change-
+  detection + `notify-send` is owned by the sibling `belegungen-watcher`
+  tool — invoke it separately after `--belegungen`.
+- For `--reconcile`: no Pre-Click required, runs both fetches and writes
+  `Reconciliation.md`. Title-Match ist exakt nach normalisiertem Titel
+  (lowercase, „Praktikum:" Prefix gestrippt, Punctuation entfernt) mit
+  Jaccard-Fallback ab 0.6. Beide Detail-Quellen (Belegungen-Prüfungs-Nr ≠
+  Modulplan-Modul-Nr) sind unabhängig — Match nur über Titel möglich.
+  Wenn eine `Notenübersicht*Module*.pdf` unter `Bescheinigungen/` liegt,
+  parst sie `pdftotext -layout` automatisch und behandelt die PDF-Zahl
+  als kanonisch (Prüfungsamt-Signatur).
 - For `--campo-bescheinigungen`: only requires being logged into campo — the
   page enumerates its own 12 PDF buttons and the scraper re-GETs the form per
   button to refresh the `_flowExecutionKey`.
@@ -3095,7 +3205,15 @@ Full architecture & dataclasses: `~/Synced/repos/AutomatedAlchemy/studon-client/
 ~/Synced/OneDrive/Studium/KIM4/         # configured downloads_path
 ├── timetable.md                        # --timetable
 ├── .timetable_entries.json             # cache consumed by --lecture-sync
-├── pruefungen.md                       # --campo-pruefungen
+├── Modulplan.md                        # --modulplan (Studienplan + Status + ECTS)
+├── Belegungen.md                       # --belegungen human-readable
+├── Belegungen.json                     # --belegungen machine-readable (consumed by belegungen-watcher)
+├── .belegungen_snapshot.json           # belegungen-watcher state (separate tool, not studon-client)
+├── Belegungen_changes.log              # belegungen-watcher audit-trail
+├── Reconciliation.md                   # --reconcile (Modulplan ↔ Belegungen cross-check + ECTS-Bilanz)
+├── Reconciliation.json                 # --reconcile (maschinen-lesbarer Export für Digest/Lernplan/…)
+├── studon_bescheinigungen.log          # weekly --campo-bescheinigungen cron output
+├── pruefungen.md                       # --campo-pruefungen (Anmelde-Zeiträume)
 ├── RECENT_UPDATES.md                   # last sync's download log
 ├── Bescheinigungen/                    # --campo-bescheinigungen
 │   ├── Notenübersicht.pdf
@@ -3240,7 +3358,13 @@ def _run_install(check_interval: int = 5) -> None:
     if check_interval != 5:
         daily_cmd += f" --interval {check_interval}"
     lecture_cmd = f"@reboot cd {script_dir} && {python} {script_path} --lecture-sync"
-    desired_cmds = [daily_cmd, lecture_cmd]
+    # Weekly Prüfungsamt-PDFs (Mondays 06:30) — keeps Notenübersicht.pdf fresh so
+    # --reconcile always has a canonical ECTS source.
+    bescheinigungen_cmd = (
+        f"30 6 * * 1 cd {script_dir} && {python} {script_path} --campo-bescheinigungen "
+        f">> {os.path.join(DOWNLOAD_FOLDER, 'studon_bescheinigungen.log')} 2>&1"
+    )
+    desired_cmds = [daily_cmd, lecture_cmd, bescheinigungen_cmd]
 
     print("Cron entries:")
     for c in desired_cmds:
@@ -3256,7 +3380,7 @@ def _run_install(check_interval: int = 5) -> None:
         existing_tab = None
 
     def _is_studon_line(l: str) -> bool:
-        return 'studon' in l and ('--daily-sync' in l or '--lecture-sync' in l)
+        return 'studon' in l and ('--daily-sync' in l or '--lecture-sync' in l or '--campo-bescheinigungen' in l)
 
     if existing_tab is not None:
         existing_lines = existing_tab.splitlines()
@@ -3728,16 +3852,16 @@ def _resolve_course_name(exc_url: str, session: requests.Session) -> Tuple[str, 
     return clean_filename(title) if title else "Unknown Course", course_url
 
 
-def _process_feedback_queue(session: requests.Session, mark_seen: bool = True, verbose: bool = False) -> Tuple[int, int]:
+def _process_feedback_queue(session: requests.Session, mark_seen: bool = True, verbose: bool = False) -> Tuple[int, int, List[str]]:
     """
     Walk the feedback queue, download PDFs for any URL we can now reach.
     On success, mark the IMAP message as read and move the entry to processed.
-    Returns (n_processed, n_downloaded_files).
+    Returns (n_processed, n_downloaded_files, downloaded_paths).
     """
     state = _load_feedback_state()
     queue = state.get("queue", [])
     if not queue:
-        return 0, 0
+        return 0, 0, []
 
     cfg = load_config()
     email_addr = cfg.get("imap_email")
@@ -3762,6 +3886,7 @@ def _process_feedback_queue(session: requests.Session, mark_seen: bool = True, v
     processed_ids = list(state.get("processed_message_ids", []))
     n_processed = 0
     n_files = 0
+    all_paths: List[str] = []
 
     for entry in queue:
         url = entry["url"]
@@ -3816,6 +3941,7 @@ def _process_feedback_queue(session: requests.Session, mark_seen: bool = True, v
 
         downloaded, downloaded_paths = download_all_files(url, files_to_download, session, course_title=course_name, base_path=str(target_path))
         n_files += downloaded
+        all_paths.extend(downloaded_paths)
         logger.info(f"Feedback: downloaded {downloaded} file(s) for '{course_name}/{sheet}' → {target_path}")
         if verbose:
             print(f"    ✓ {downloaded} file(s) downloaded (from {len(files_to_download)} candidate link(s))")
@@ -3868,10 +3994,10 @@ def _process_feedback_queue(session: requests.Session, mark_seen: bool = True, v
     state["queue"] = remaining
     state["processed_message_ids"] = processed_ids[-500:]  # cap history
     _save_feedback_state(state)
-    return n_processed, n_files
+    return n_processed, n_files, all_paths
 
 
-def check_and_process_feedback(session: Optional[requests.Session] = None, verbose: bool = False) -> Tuple[int, int]:
+def check_and_process_feedback(session: Optional[requests.Session] = None, verbose: bool = False) -> Tuple[int, int, List[str]]:
     """High-level entry: scan inbox for new notifications, then process the queue."""
     new = fetch_feedback_emails(verbose=verbose)
     if new:
@@ -3880,7 +4006,7 @@ def check_and_process_feedback(session: Optional[requests.Session] = None, verbo
         session = _make_session()
     if session is None:
         logger.info("StudOn session not available; feedback URLs remain queued.")
-        return 0, 0
+        return 0, 0, []
     return _process_feedback_queue(session, verbose=verbose)
 
 
@@ -4690,19 +4816,30 @@ def _parse_campo_pruefung_detail(html: str) -> Optional[Dict]:
 
 
 def _iter_campo_detail_pages(session: requests.Session,
-                              max_flow: int = 12,
-                              max_step: int = 30) -> List[Tuple[str, Dict]]:
+                              max_flow: int = 99,
+                              max_step: int = 30,
+                              max_empty_flows: int = 12) -> List[Tuple[str, Dict]]:
     """Iterate Campo studyPlanner flowExecutionKeys (e<f>s<s>) reachable in the
     current Firefox session and return (flow_key, parsed_detail) for each
     Detailansicht with Zeiträume. Dedupes by module name.
 
-    The student must have opened the relevant Modul/Prüfungs-Detailansichten in
-    Firefox beforehand — flow execution keys are server-side per-session state.
+    The student must have opened the relevant Prüfungs-Detailansichten in
+    Firefox beforehand — flow execution keys are server-side per-session state,
+    and Zeiträume (Anmelde-/Abmelde-/Prüfungszeitraum) only render on the
+    *Prüfung*-side Detail page, not the *Modul*-side detail (which can be reached
+    deterministically via unitId/periodId from --modulplan).
+
+    The scan walks up to *max_flow* flows and stops early after *max_empty_flows*
+    consecutive flows that yielded no Detail-hit. A fresh session probe on
+    2026-06-02 minted key `e63s1`, so the old `max_flow=12` silently missed
+    valid Detailansichten in the e13..e60 range — hence the bumped default.
     """
     base = CAMPO_STUDY_PLANNER_URL + '&_flowExecutionKey='
     seen_modules: set = set()
     results: List[Tuple[str, Dict]] = []
+    consecutive_empty_flows = 0
     for f in range(1, max_flow + 1):
+        flow_hit_before = len(results)
         consecutive_misses = 0
         for s in range(1, max_step + 1):
             key = f'e{f}s{s}'
@@ -4720,6 +4857,12 @@ def _iter_campo_detail_pages(session: requests.Session,
             if parsed and parsed['module_name'] not in seen_modules:
                 seen_modules.add(parsed['module_name'])
                 results.append((key, parsed))
+        if len(results) == flow_hit_before:
+            consecutive_empty_flows += 1
+            if consecutive_empty_flows >= max_empty_flows:
+                break
+        else:
+            consecutive_empty_flows = 0
     return results
 
 
@@ -4782,6 +4925,1001 @@ def fetch_campo_pruefungen_markdown(output_path: Optional[str] = None) -> Option
     return output_path
 
 
+# --- CAMPO MODULPLAN (deterministic studyPlanner front-page scraper) ---
+
+_MODULPLAN_STATUS_RE = re.compile(r'Ihr aktueller Status:\s*\|?\s*([^|]+?)(?:\s*\||\s*$)', re.IGNORECASE)
+_MODULPLAN_SEM_RE = re.compile(r'Semester der Leistung:\s*\|?\s*([^|]+?)(?:\s*\||\s*$)', re.IGNORECASE)
+_MODULPLAN_VERSUCH_RE = re.compile(r'Aktueller Versuch:\s*\|?\s*(\d+)', re.IGNORECASE)
+_MODULPLAN_ECTS_RE = re.compile(r'\|\s*(\d+|-)\s*/\s*(\d+(?:[,.]\d+)?)\s*$')
+_DETAIL_URL_RE = re.compile(r'unitId=(\d+).*?periodId=(\d+)')
+
+
+def _parse_modulplan_module(item: Tag) -> Optional[Dict]:
+    """Given a `<div id="...:modulePlanItem">` (the per-module container on the
+    studyPlanner front page), extract structured fields. Each item corresponds
+    to exactly one module slot, with its own detail-link and status block.
+    Returns None if the item lacks the minimum identifiers.
+    """
+    text = item.get_text(' | ', strip=True)
+
+    title_a = item.find('a', id=re.compile(r':showPopup$'))
+    title_raw = title_a.get_text(' ', strip=True) if isinstance(title_a, Tag) else ''
+
+    detail_a = item.find('a', href=re.compile(r'_flowId=detailView-flow'))
+    unit_id = period_id = None
+    detail_url = None
+    if isinstance(detail_a, Tag):
+        href = detail_a.get('href') or ''
+        m = _DETAIL_URL_RE.search(str(href))
+        if m:
+            unit_id, period_id = m.group(1), m.group(2)
+            detail_url = 'https://www.campo.fau.de' + str(href)
+
+    nm = re.search(r'\b(\d{3,6})\s*[-–]\s*', text)
+    module_nr = nm.group(1) if nm else None
+
+    s_status = _MODULPLAN_STATUS_RE.search(text)
+    s_sem = _MODULPLAN_SEM_RE.search(text)
+    s_versuch = _MODULPLAN_VERSUCH_RE.search(text)
+    s_ects = _MODULPLAN_ECTS_RE.search(text)
+    ects_earned = ects_total = ''
+    if s_ects:
+        e = s_ects.group(1).strip()
+        ects_earned = '' if e == '-' else e
+        ects_total = s_ects.group(2).strip().replace(',', '.')
+
+    if not module_nr and not unit_id:
+        return None
+
+    return {
+        'module_nr': module_nr,
+        'title': title_raw,
+        'status': (s_status.group(1).strip() if s_status else '') or '',
+        'semester_leistung': (s_sem.group(1).strip() if s_sem else '') or '',
+        'versuch': (s_versuch.group(1) if s_versuch else '') or '',
+        'ects_earned': ects_earned,
+        'ects_total': ects_total,
+        'unit_id': unit_id,
+        'period_id': period_id,
+        'detail_url': detail_url,
+    }
+
+
+# Studien-Soll in ECTS — default 180 (B.Sc.); überschreibbar via config.json key
+# `modulplan_ects_soll` für Master (typisch 120) oder andere Studiengänge.
+_MODULPLAN_ECTS_SOLL = float(_config.get('modulplan_ects_soll', 180))
+
+_MODULPLAN_STATUS_GROUPS = [
+    ('bestanden', 'Bestanden', ['bestand']),
+    ('angemeldet', 'Angemeldet / Prüfung vorhanden', ['angemeldet', 'prüfung vorhanden', 'pruefung vorhanden', 'in bearbeit', 'zugelassen']),
+    ('offen', 'Offen / Sonstige', []),
+]
+
+
+def _modulplan_group_for(status: str) -> str:
+    s = (status or '').lower()
+    for key, _label, needles in _MODULPLAN_STATUS_GROUPS:
+        for n in needles:
+            if n in s:
+                return key
+    return 'offen'
+
+
+def _render_modulplan_markdown(study_program: str,
+                                modules: List[Dict]) -> str:
+    from datetime import datetime as _dt
+
+    groups: Dict[str, List[Dict]] = {key: [] for key, _, _ in _MODULPLAN_STATUS_GROUPS}
+    for m in modules:
+        groups[_modulplan_group_for(m.get('status') or '')].append(m)
+
+    def in_group_sort(m: Dict) -> tuple:
+        return (m.get('semester_leistung') or 'zzz', m.get('module_nr') or '')
+    for k in groups:
+        groups[k].sort(key=in_group_sort)
+
+    total_ects = 0.0
+    earned_ects = 0.0
+    bestanden_ects = 0.0
+    listed_unit_ids: set = set()
+    for m in modules:
+        uid = m.get('unit_id')
+        if not uid or uid in listed_unit_ids:
+            continue
+        listed_unit_ids.add(uid)
+        ects_total_s = m.get('ects_total') or ''
+        ects_earned_s = m.get('ects_earned') or ''
+        try:
+            if ects_total_s:
+                total_ects += float(ects_total_s)
+            if ects_earned_s:
+                earned_ects += float(ects_earned_s)
+            if ects_earned_s and 'bestand' in (m.get('status') or '').lower():
+                bestanden_ects += float(ects_earned_s)
+        except ValueError:
+            pass
+
+    lines = [
+        f"# Modulplan — {study_program}",
+        '',
+        f"> Auto-generated {_dt.now().strftime('%Y-%m-%d %H:%M')} by `studon-client --modulplan`.",
+        "> Quelle: campo.fau.de studyPlanner-flow Front-Page (deterministisch — kein Pre-Click nötig).",
+        '',
+    ]
+
+    soll = _MODULPLAN_ECTS_SOLL
+    pct = (bestanden_ects / soll * 100.0) if soll else 0.0
+    gap = max(0.0, soll - bestanden_ects)
+    bonus_pool = max(0.0, total_ects - soll)
+    lines.extend([
+        '## Studienfortschritt',
+        '',
+        f"- **Bestanden:** {bestanden_ects:.1f} / {soll:.0f} ECTS  ({pct:.1f} %)",
+        f"- **Fehlend bis Studien-Soll:** {gap:.1f} ECTS",
+        f"- **Erreicht inkl. anlaufender Prüfungen:** {earned_ects:.1f} ECTS",
+        f"- **Modulplan-Summe gelistet:** {total_ects:.1f} ECTS  (Bonus-Pool über Soll: {bonus_pool:.1f} ECTS — entsteht durch Wahlpflicht-Alternativen, von denen pro Slot nur eine belegt wird)",
+        '',
+        f"> Das Studien-Soll ({soll:.0f} ECTS) kommt aus `config.json` (`modulplan_ects_soll`, Default 180); ECTS werden aus dem `X/Y`-Suffix jedes Modulplan-Items extrahiert. Slot-genaue Pflicht/Wahlpflicht-Auflösung ist im HTML nicht abrufbar (flache Modulliste).",
+        '',
+    ])
+
+    header = ['Nr', 'Titel', 'Semester', 'Versuch', 'ECTS', 'Status']
+    sep = '|' + '|'.join(['---'] * len(header)) + '|'
+
+    for key, label, _ in _MODULPLAN_STATUS_GROUPS:
+        bucket = groups.get(key) or []
+        if not bucket:
+            continue
+        bucket_ects = 0.0
+        bucket_uids: set = set()
+        for m in bucket:
+            uid = m.get('unit_id')
+            if uid and uid not in bucket_uids:
+                bucket_uids.add(uid)
+                try:
+                    if key == 'bestanden':
+                        bucket_ects += float(m.get('ects_earned') or 0)
+                    else:
+                        bucket_ects += float(m.get('ects_total') or 0)
+                except ValueError:
+                    pass
+        lines.append(f'## {label} ({len(bucket)} Module · {bucket_ects:.1f} ECTS)')
+        lines.append('')
+        lines.append('| ' + ' | '.join(header) + ' |')
+        lines.append(sep)
+        for m in bucket:
+            ects_total_s = m.get('ects_total') or ''
+            ects_earned_s = m.get('ects_earned') or ''
+            ects_cell = f"{ects_earned_s or '–'}/{ects_total_s}" if ects_total_s else ''
+            row = [
+                m.get('module_nr') or '',
+                (m.get('title') or '').replace('|', '/'),
+                m.get('semester_leistung') or '',
+                m.get('versuch') or '',
+                ects_cell,
+                m.get('status') or '',
+            ]
+            lines.append('| ' + ' | '.join(row) + ' |')
+        lines.append('')
+
+    return '\n'.join(lines)
+
+
+def _fetch_modulplan_data(session: requests.Session) -> Optional[Tuple[str, List[Dict]]]:
+    """Fetch + parse the studyPlanner front page. Returns (study_program, modules) or None."""
+    try:
+        r = session.get(CAMPO_STUDY_PLANNER_URL, allow_redirects=True, timeout=20)
+    except requests.RequestException as e:
+        print(f"❌ studyPlanner not reachable: {e}")
+        return None
+    if r.status_code != 200 or 'Studienplaner' not in r.text:
+        print("❌ Campo studyPlanner not reachable. Log into campo.fau.de in Firefox and retry.")
+        return None
+    soup = BeautifulSoup(r.text, 'html.parser')
+    title_tag = soup.find('h1')
+    study_program = title_tag.get_text(' ', strip=True) if title_tag else 'Modulplan'
+    study_program = study_program.replace('Studienplaner mit Modulplan', '').strip() or 'Modulplan'
+    modules: List[Dict] = []
+    seen_keys: set = set()
+    for item in soup.find_all('div', id=re.compile(r':modulePlanItem$')):
+        if not isinstance(item, Tag):
+            continue
+        parsed = _parse_modulplan_module(item)
+        if not parsed:
+            continue
+        key = (parsed.get('unit_id'), parsed.get('module_nr'))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        modules.append(parsed)
+    return study_program, modules
+
+
+def fetch_campo_modulplan(output_path: Optional[str] = None) -> Optional[str]:
+    """Scan the campo studyPlanner-flow front page and write a per-module
+    Modulplan markdown with status, Versuch, Semester der Leistung, and
+    ECTS (earned/total) — all extracted from the deterministic front-page HTML.
+    """
+    print("🔄 Scanning campo studyPlanner front page (deterministic)...")
+    session = _campo_session()
+    if session is None:
+        return None
+    data = _fetch_modulplan_data(session)
+    if data is None:
+        return None
+    study_program, modules = data
+    if not modules:
+        print("⚠️  No modules parsed from studyPlanner front page.")
+        return None
+    print(f"✅ Parsed {len(modules)} module(s) from Modulplan.")
+
+    md = _render_modulplan_markdown(study_program, modules)
+    if output_path is None:
+        output_path = os.path.join(DOWNLOAD_FOLDER, 'Modulplan.md')
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(md)
+    print(f"✅ Modulplan written to {output_path}")
+    return output_path
+
+
+# --- CAMPO BELEGUNGEN (deterministic searchOwnEnrollmentInfo-flow scraper) ---
+
+_BELEGUNG_GROUP_ID_RE = re.compile(r':unit-Belegung(\d+):tableGroup$')
+_LV_TYPE_PREFIXES = ('Vorlesung mit Übung ', 'Vorlesung ', 'Übung ', 'Seminar ', 'Praktikum ', 'Tutorium ', 'Kolloquium ', 'Projekt ')
+_WEEKDAY_RE = re.compile(r'\b(?:jeden\s+)?(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag)\b')
+_NAME_TILL_WEEKDAY_RE = re.compile(r'^(.+?)(?=\s+(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag|jeden\b|Keine Uhrzeit|Ihr aktueller Status:|Semester der Leistung:|$))', re.DOTALL)
+_STATUS_LINE_RE = re.compile(r'Ihr aktueller Status:\s*(.+?)(?=\s*(?:Semester der Leistung:|Aktueller Versuch:|$))', re.IGNORECASE | re.DOTALL)
+_SEMESTER_LINE_RE = re.compile(r'Semester der Leistung:\s*(.+?)(?=\s*(?:Aktueller Versuch:|$))', re.IGNORECASE | re.DOTALL)
+_VERSUCH_LINE_RE = re.compile(r'Aktueller Versuch:\s*(\d+)', re.IGNORECASE)
+_PRUEFFORM_RE = re.compile(r'Prüfungsform:\s*(.+?)(?=\s+(?:Prüfer/-in:|Dozent/-in:|Ihr aktueller Status:|$))', re.IGNORECASE | re.DOTALL)
+
+
+def _ws(s: str) -> str:
+    return ' '.join(s.split())
+
+
+def _split_personen(text: str, label: str) -> List[str]:
+    """Find all occurrences of `<label>: <name>` and return names trimmed to the
+    next weekday/label boundary, deduped while preserving order."""
+    parts = re.split(rf'{re.escape(label)}\s*:?\s*', text)
+    out: List[str] = []
+    seen: set = set()
+    for seg in parts[1:]:
+        m = _NAME_TILL_WEEKDAY_RE.match(seg)
+        name = _ws(m.group(1) if m else seg.split(' Ihr aktueller')[0])
+        if not name:
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _extract_termine(info_text: str, title: str) -> str:
+    """Strip the Parallelgruppe header and label-spans, leaving only the Termin
+    description(s). Multiple Termine are joined with `<br>` so they render
+    cleanly inside a markdown table cell."""
+    # Drop "N. Parallelgruppe <title-echo>" prefix
+    t = re.sub(r'^\s*\d+\.\s*Parallelgruppe\s*', '', info_text)
+    # Drop the title echo if it appears once at the start
+    if title and t.startswith(title):
+        t = t[len(title):].strip()
+    # Cut off everything past status/semester labels
+    cut = re.search(r'\s+(?:Ihr aktueller Status:|Semester der Leistung:|Aktueller Versuch:)', t)
+    if cut:
+        t = t[:cut.start()]
+    # Drop Prüfungsform/Prüfer/Dozent labels and their values (already captured separately)
+    for label in ('Prüfungsform:', 'Prüfer/-in:', 'Dozent/-in:'):
+        # Strip "<label> <value-until-next-weekday>" segments
+        t = re.sub(rf'\s*{re.escape(label)}\s*.+?(?=\s+(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag|jeden\b|$))', '', t, flags=re.DOTALL)
+        # And trailing form-name only (no weekday follows)
+        t = re.sub(rf'\s*{re.escape(label)}\s*[^|]*$', '', t)
+    t = _ws(t)
+    # Capture each Termin starting at optional "jeden" + Weekday, running until the next such anchor
+    termin_re = re.compile(
+        r'(?:jeden\s+)?(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag)\b'
+        r'.*?(?=(?:\s|^)(?:jeden\s+)?(?:Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag)\b|$)',
+        re.DOTALL,
+    )
+    chunks = [_ws(m) for m in termin_re.findall(t) if m.strip()]
+    if len(chunks) > 1:
+        return '<br>'.join(chunks)
+    return t
+
+
+def _parse_belegung_group(group: Tag) -> Optional[Dict]:
+    """Parse one `div.dataTableTableGroup` block from the Belegungen page."""
+    h2 = group.find('h2')
+    if not isinstance(h2, Tag):
+        return None
+    heading = h2.get_text(' ', strip=True)
+    if ':' not in heading:
+        return None
+    kind_raw, _, title = heading.partition(':')
+    kind = kind_raw.strip().lower()
+    title = title.strip()
+
+    lv_type = ''
+    pruef_nr = ''
+    if kind == 'prüfung':
+        m = re.match(r'(\d{4,6})\s+(.*)', title)
+        if m:
+            pruef_nr = m.group(1)
+            title = m.group(2).strip()
+    else:  # veranstaltung
+        for prefix in _LV_TYPE_PREFIXES:
+            if title.startswith(prefix):
+                lv_type = prefix.strip()
+                title = title[len(prefix):].strip()
+                break
+
+    table = group.find('table', class_='belegungen') or group.find('table')
+    if not isinstance(table, Tag):
+        return None
+    body = table.find('tbody')
+    if not isinstance(body, Tag):
+        return None
+    rows = body.find_all('tr', recursive=False)
+    if not rows:
+        return None
+
+    parallelgruppen: List[Dict] = []
+    for row in rows:
+        if not isinstance(row, Tag):
+            continue
+        cells = row.find_all('td', recursive=False)
+        if len(cells) < 2:
+            continue
+        info_text = cells[0].get_text(' ', strip=True)
+        status_text = cells[1].get_text(' ', strip=True)
+
+        m_form = _PRUEFFORM_RE.search(info_text)
+        m_status = _STATUS_LINE_RE.search(status_text)
+        m_sem = _SEMESTER_LINE_RE.search(status_text)
+        m_versuch = _VERSUCH_LINE_RE.search(status_text)
+
+        pg = {
+            'termine': _extract_termine(info_text, title),
+            'pruefungsform': _ws(m_form.group(1)) if m_form else '',
+            'pruefer': ', '.join(_split_personen(info_text, 'Prüfer/-in')),
+            'dozent': ', '.join(_split_personen(info_text, 'Dozent/-in')),
+            'status': _ws(m_status.group(1)) if m_status else '',
+            'semester': _ws(m_sem.group(1)) if m_sem else '',
+            'versuch': m_versuch.group(1) if m_versuch else '',
+        }
+        parallelgruppen.append(pg)
+
+    return {
+        'kind': kind,
+        'title': title,
+        'lv_type': lv_type,
+        'pruef_nr': pruef_nr,
+        'parallelgruppen': parallelgruppen,
+    }
+
+
+def _render_belegungen_markdown(term_label: str, blocks: List[Dict]) -> str:
+    from datetime import datetime as _dt
+    pruefungen = [b for b in blocks if b.get('kind') == 'prüfung']
+    veranstaltungen = [b for b in blocks if b.get('kind') == 'veranstaltung']
+
+    lines = [
+        f"# Belegungen — {term_label}",
+        '',
+        f"> Auto-generated {_dt.now().strftime('%Y-%m-%d %H:%M')} by `studon-client --belegungen`.",
+        "> Quelle: campo.fau.de searchOwnEnrollmentInfo-flow (deterministisch — kein Pre-Click nötig).",
+        "> Beleg im Streitfall, dass eine Anmeldung systemseitig durchging.",
+        '',
+        f"## Prüfungen ({len(pruefungen)})",
+        '',
+    ]
+    if pruefungen:
+        lines.append('| Nr | Titel | Termin | Form | Prüfer/-in | Status | Semester | Versuch |')
+        lines.append('|---|---|---|---|---|---|---|---|')
+        for b in sorted(pruefungen, key=lambda x: x.get('pruef_nr') or ''):
+            pg = b['parallelgruppen'][0] if b['parallelgruppen'] else {}
+            lines.append('| ' + ' | '.join([
+                b.get('pruef_nr') or '',
+                (b.get('title') or '').replace('|', '/'),
+                (pg.get('termine') or '').replace('|', '/'),
+                (pg.get('pruefungsform') or '').replace('|', '/'),
+                (pg.get('pruefer') or '').replace('|', '/'),
+                (pg.get('status') or '').replace('|', '/'),
+                (pg.get('semester') or '').replace('|', '/'),
+                (pg.get('versuch') or '').replace('|', '/'),
+            ]) + ' |')
+    else:
+        lines.append('_keine_')
+
+    lines.extend(['', f"## Veranstaltungen ({len(veranstaltungen)})", ''])
+    if veranstaltungen:
+        lines.append('| Typ | Titel | Termin / Raum | Dozent/-in | Status |')
+        lines.append('|---|---|---|---|---|')
+        for b in sorted(veranstaltungen, key=lambda x: (x.get('title') or '').lower()):
+            pg = b['parallelgruppen'][0] if b['parallelgruppen'] else {}
+            lines.append('| ' + ' | '.join([
+                (b.get('lv_type') or '').replace('|', '/'),
+                (b.get('title') or '').replace('|', '/'),
+                (pg.get('termine') or '').replace('|', '/'),
+                (pg.get('dozent') or '').replace('|', '/'),
+                (pg.get('status') or '').replace('|', '/'),
+            ]) + ' |')
+    else:
+        lines.append('_keine_')
+
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def _fetch_belegungen_data(session: requests.Session) -> Optional[Tuple[str, List[Dict]]]:
+    """Fetch + parse the Belegungen page. Returns (term_label, blocks) or None."""
+    try:
+        r = session.get(CAMPO_BELEGUNGEN_URL, allow_redirects=True, timeout=20)
+    except requests.RequestException as e:
+        print(f"❌ Belegungen not reachable: {e}")
+        return None
+    if r.status_code != 200 or 'Belegungen' not in r.text:
+        print("❌ Campo Belegungen not reachable. Log into campo.fau.de in Firefox and retry.")
+        return None
+    soup = BeautifulSoup(r.text, 'html.parser')
+    term_label = ''
+    for sel in soup.find_all('select'):
+        if not isinstance(sel, Tag):
+            continue
+        sid = str(sel.get('id') or '')
+        if 'termPeriod' in sid:
+            opt = sel.find('option', selected=True)
+            if isinstance(opt, Tag):
+                term_label = opt.get_text(' ', strip=True)
+            break
+    if not term_label:
+        term_label = 'Aktuelles Semester'
+    blocks: List[Dict] = []
+    for group in soup.find_all('div', class_='dataTableTableGroup'):
+        if not isinstance(group, Tag):
+            continue
+        gid = str(group.get('id') or '')
+        if not _BELEGUNG_GROUP_ID_RE.search(gid):
+            continue
+        parsed = _parse_belegung_group(group)
+        if parsed:
+            blocks.append(parsed)
+    return term_label, blocks
+
+
+def fetch_campo_belegungen(output_path: Optional[str] = None) -> Optional[str]:
+    """Scrape the campo Belegungen page (searchOwnEnrollmentInfo-flow) and write
+    a per-Belegung markdown + structured JSON of angemeldete Prüfungen +
+    Veranstaltungen for the currently selected semester. Pure data fetch — any
+    diff/notify behaviour lives in the sibling `belegungen-watcher` tool that
+    consumes Belegungen.json.
+    """
+    print("🔄 Scanning campo Belegungen page (deterministic)...")
+    session = _campo_session()
+    if session is None:
+        return None
+    data = _fetch_belegungen_data(session)
+    if data is None:
+        return None
+    term_label, blocks = data
+    if not blocks:
+        print("⚠️  No Belegungen-Blöcke gefunden.")
+        return None
+    print(f"✅ Parsed {len(blocks)} Belegungs-Block(s) ({sum(1 for b in blocks if b['kind']=='prüfung')} Prüfungen + {sum(1 for b in blocks if b['kind']=='veranstaltung')} Veranstaltungen).")
+
+    md = _render_belegungen_markdown(term_label, blocks)
+    if output_path is None:
+        output_path = os.path.join(DOWNLOAD_FOLDER, 'Belegungen.md')
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(md)
+    print(f"✅ Belegungen written to {output_path}")
+
+    # Maschinen-lesbarer JSON-Export — konsumiert vom belegungen-watcher Tool
+    from datetime import datetime as _dt
+    json_path = os.path.splitext(output_path)[0] + '.json'
+    payload = {
+        'generated_at': _dt.now().isoformat(timespec='seconds'),
+        'term_label': term_label,
+        'blocks': blocks,
+    }
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        print(f"✅ Belegungen JSON written to {json_path}")
+    except OSError as e:
+        print(f"⚠️  Could not write JSON export: {e}")
+    return output_path
+
+
+# --- PDF: NOTENÜBERSICHT PARSER (Prüfungsamt-kanonisch) ---
+
+_PDF_ROW_RE = re.compile(
+    r'^\s*(\d{4,6})\s+(.+?)\s{2,}(?:(\d{2}\.\d{2}\.\d{4}))?\s*(?:([\d,]+))?\s+(bestanden|BE|EB|AR)\s+([\d,]+)\s*$'
+)
+_PDF_TOTAL_RE = re.compile(r'(\d+(?:,\d+)?)\s+ECTS\s+von\s+insgesamt\s+(\d+)')
+
+
+def _find_latest_notenuebersicht_pdf() -> Optional[str]:
+    """Return the path to the most recently mtime'd 'Notenübersicht*Module*.pdf'
+    under <downloads>/Bescheinigungen/, preferring the German bestandene-Module
+    variant. Returns None if no candidate exists."""
+    bescheinigungen = os.path.join(DOWNLOAD_FOLDER, 'Bescheinigungen')
+    if not os.path.isdir(bescheinigungen):
+        return None
+    candidates: List[Tuple[float, int, str]] = []
+    for name in os.listdir(bescheinigungen):
+        if not name.lower().endswith('.pdf'):
+            continue
+        if 'notenübersicht' not in name.lower() and 'notenubersicht' not in name.lower():
+            continue
+        if 'englisch' in name.lower():
+            continue
+        priority = 0  # higher = preferred
+        if 'bestandene module' in name.lower():
+            priority = 2
+        elif 'bestandene leistungen' in name.lower():
+            priority = 1
+        path = os.path.join(bescheinigungen, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        candidates.append((mtime, priority, path))
+    if not candidates:
+        return None
+    # Sort by (priority desc, mtime desc) — preferred variant first, then newest
+    candidates.sort(key=lambda t: (-t[1], -t[0]))
+    return candidates[0][2]
+
+
+def _parse_notenuebersicht_pdf(pdf_path: str) -> Optional[Dict]:
+    """Run pdftotext -layout and parse the resulting text into module rows +
+    overall ECTS total. Returns {modules: [...], total_earned, total_soll,
+    pdf_path, pdf_mtime_iso, generation_date} or None on failure."""
+    try:
+        out = subprocess.run(
+            ['pdftotext', '-layout', pdf_path, '-'],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError) as e:
+        print(f"⚠️  pdftotext failed for {os.path.basename(pdf_path)}: {e}")
+        return None
+    if out.returncode != 0:
+        print(f"⚠️  pdftotext exit {out.returncode} for {os.path.basename(pdf_path)}")
+        return None
+
+    modules: List[Dict] = []
+    for line in out.stdout.splitlines():
+        m = _PDF_ROW_RE.match(line)
+        if not m:
+            continue
+        prnr, title, date, note, status, ects = m.groups()
+        # Skip the synthetic "10000 Bachelorprüfung" summary row
+        if prnr == '10000':
+            continue
+        modules.append({
+            'module_nr': prnr,
+            'title': title.strip(),
+            'pruef_datum': date or '',
+            'note': (note or '').replace(',', '.'),
+            'status': status,
+            'ects': ects.replace(',', '.'),
+        })
+
+    total_earned = total_soll = ''
+    m_total = _PDF_TOTAL_RE.search(out.stdout)
+    if m_total:
+        total_earned = m_total.group(1).replace(',', '.')
+        total_soll = m_total.group(2)
+
+    if not modules:
+        return None
+
+    from datetime import datetime as _dt
+    return {
+        'modules': modules,
+        'total_earned': total_earned,
+        'total_soll': total_soll,
+        'pdf_path': pdf_path,
+        'pdf_basename': os.path.basename(pdf_path),
+        'pdf_mtime_iso': _dt.fromtimestamp(os.path.getmtime(pdf_path)).isoformat(timespec='seconds'),
+    }
+
+
+# --- J: BELEGUNGEN <-> MODULPLAN RECONCILIATION ---
+
+_RECONCILE_PRAKTIKUM_RE = re.compile(r'^praktikum:?\s*', re.IGNORECASE)
+
+
+def _reconcile_normalize(title: str) -> str:
+    """Lowercase, strip 'Praktikum:' prefix, drop punctuation, collapse ws."""
+    s = (title or '').lower()
+    s = _RECONCILE_PRAKTIKUM_RE.sub('', s)
+    s = re.sub(r'[^\w\s]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def _reconcile_match(title: str, index: Dict[str, Dict], threshold: float = 0.6) -> Tuple[Optional[Dict], float]:
+    """Find best match for `title` in `index` (keyed by normalized title).
+    Returns (matched_record_or_None, jaccard_score). Exact match → score 1.0."""
+    n = _reconcile_normalize(title)
+    if not n:
+        return None, 0.0
+    if n in index:
+        return index[n], 1.0
+    toks = set(n.split())
+    if not toks:
+        return None, 0.0
+    best: Optional[Dict] = None
+    best_score = 0.0
+    for k, rec in index.items():
+        k_toks = set(k.split())
+        if not k_toks:
+            continue
+        overlap = len(toks & k_toks)
+        union = len(toks | k_toks)
+        score = overlap / union
+        if score > best_score:
+            best_score = score
+            best = rec
+    if best_score >= threshold:
+        return best, best_score
+    return None, best_score
+
+
+def _reconcile_data(modules: List[Dict], blocks: List[Dict], pdf_data: Optional[Dict] = None) -> Dict:
+    """Compute the cross-check between Modulplan, Belegungen, and optionally the
+    Prüfungsamt-PDF Notenübersicht. If pdf_data is given, the PDF is treated as
+    canonical for bestanden-ECTS (signed by Prüfungsamt; BAföG-relevant)."""
+    pruefungen = [b for b in blocks if b.get('kind') == 'prüfung']
+    mp_index = {_reconcile_normalize(m.get('title', '')): m for m in modules if m.get('title')}
+    bg_index: Dict[str, List[Dict]] = {}
+    for b in pruefungen:
+        n = _reconcile_normalize(b.get('title', ''))
+        bg_index.setdefault(n, []).append(b)
+
+    # Section 1: each Belegungen-Prüfung → Modulplan-Modul
+    pruefung_to_modul: List[Dict] = []
+    for b in pruefungen:
+        match, score = _reconcile_match(b.get('title', ''), mp_index)
+        pruefung_to_modul.append({
+            'pruef_nr': b.get('pruef_nr', ''),
+            'pruef_title': b.get('title', ''),
+            'modul_nr': (match.get('module_nr') if match else '') or '',
+            'modul_title': (match.get('title') if match else '') or '',
+            'modul_status': (match.get('status') if match else '') or '',
+            'modul_ects_total': (match.get('ects_total') if match else '') or '',
+            'match_score': score,
+        })
+
+    # Section 2: Modulplan-Angemeldet/Prüfung-Vorhanden ohne Belegungs-Match
+    modul_angemeldet_ohne_belegung: List[Dict] = []
+    for m in modules:
+        status = (m.get('status') or '').lower()
+        if not ('prüfung vorhanden' in status or 'pruefung vorhanden' in status or 'angemeldet' in status):
+            continue
+        n = _reconcile_normalize(m.get('title', ''))
+        if any(_reconcile_normalize(b.get('title', '')) == n for b in pruefungen):
+            continue
+        # Fuzzy fallback: skip if any Belegung scores ≥0.6 against this Modul
+        toks = set(n.split())
+        if toks and any(
+            len(toks & set(_reconcile_normalize(b.get('title', '')).split())) / max(len(toks | set(_reconcile_normalize(b.get('title', '')).split())), 1) >= 0.6
+            for b in pruefungen
+        ):
+            continue
+        modul_angemeldet_ohne_belegung.append(m)
+
+    # Section 3: Status=bestanden aber ects_earned leer (= ECTS-undercount)
+    bestanden_ohne_ects: List[Dict] = []
+    for m in modules:
+        if 'bestand' in (m.get('status') or '').lower() and not (m.get('ects_earned') or '').strip():
+            bestanden_ohne_ects.append(m)
+
+    # ECTS-Bilanz korrigiert
+    base_bestanden = 0.0
+    listed_unit_ids: set = set()
+    for m in modules:
+        uid = m.get('unit_id')
+        if not uid or uid in listed_unit_ids:
+            continue
+        listed_unit_ids.add(uid)
+        if 'bestand' in (m.get('status') or '').lower() and (m.get('ects_earned') or '').strip():
+            try:
+                base_bestanden += float(m['ects_earned'])
+            except ValueError:
+                pass
+    corrected_min = base_bestanden
+    corrected_max = base_bestanden
+    for m in bestanden_ohne_ects:
+        try:
+            corrected_max += float(m.get('ects_total') or 0)
+        except ValueError:
+            pass
+
+    # Optional: PDF-Cross-Check
+    pdf_section: Optional[Dict] = None
+    if pdf_data:
+        # Map Modulplan modules by Modul-Nr for fast lookup
+        mp_by_nr = {m.get('module_nr'): m for m in modules if m.get('module_nr')}
+        pdf_rows: List[Dict] = []
+        pdf_total = 0.0
+        for pr in pdf_data['modules']:
+            nr = pr['module_nr']
+            try:
+                ects = float(pr['ects'])
+            except ValueError:
+                ects = 0.0
+            pdf_total += ects
+            mp_match = mp_by_nr.get(nr)
+            mp_ects_earned = ''
+            mp_status = ''
+            if mp_match:
+                mp_ects_earned = mp_match.get('ects_earned') or ''
+                mp_status = mp_match.get('status') or ''
+            # Diskrepanz: PDF zeigt ECTS, Modulplan-Front-Page liefert leeren oder anderen Wert
+            try:
+                mp_e = float(mp_ects_earned) if mp_ects_earned else None
+            except ValueError:
+                mp_e = None
+            gap = None if mp_e is None else round(ects - mp_e, 2)
+            pdf_rows.append({
+                'module_nr': nr,
+                'title': pr['title'],
+                'pruef_datum': pr['pruef_datum'],
+                'note': pr['note'],
+                'ects': ects,
+                'mp_in_modulplan': mp_match is not None,
+                'mp_status': mp_status,
+                'mp_ects_earned': mp_ects_earned,
+                'gap': gap,  # None if no MP match or MP-suffix empty
+            })
+        # Modules in PDF but not in Modulplan (shouldn't happen, but report)
+        pdf_only = [r for r in pdf_rows if not r['mp_in_modulplan']]
+        # Modules in PDF where Modulplan undercounts (gap > 0 or MP-suffix empty)
+        gap_rows = [r for r in pdf_rows if (r['gap'] is None and r['ects'] > 0 and r['mp_in_modulplan']) or (r['gap'] is not None and r['gap'] != 0)]
+        try:
+            pdf_soll = float(pdf_data['total_soll']) if pdf_data['total_soll'] else _MODULPLAN_ECTS_SOLL
+        except ValueError:
+            pdf_soll = _MODULPLAN_ECTS_SOLL
+        try:
+            pdf_total_declared = float(pdf_data['total_earned']) if pdf_data['total_earned'] else pdf_total
+        except ValueError:
+            pdf_total_declared = pdf_total
+        pdf_section = {
+            'rows': pdf_rows,
+            'pdf_only': pdf_only,
+            'gap_rows': gap_rows,
+            'pdf_total_summed': pdf_total,
+            'pdf_total_declared': pdf_total_declared,
+            'pdf_soll': pdf_soll,
+            'pdf_basename': pdf_data['pdf_basename'],
+            'pdf_mtime_iso': pdf_data['pdf_mtime_iso'],
+            'mp_undercount': round(pdf_total_declared - base_bestanden, 2),
+        }
+
+    return {
+        'pruefung_to_modul': pruefung_to_modul,
+        'modul_angemeldet_ohne_belegung': modul_angemeldet_ohne_belegung,
+        'bestanden_ohne_ects': bestanden_ohne_ects,
+        'ects_summary': {
+            'base_bestanden': base_bestanden,
+            'corrected_min': corrected_min,
+            'corrected_max': corrected_max,
+            'soll': _MODULPLAN_ECTS_SOLL,
+        },
+        'pdf_section': pdf_section,
+    }
+
+
+def _render_reconciliation_markdown(study_program: str, term_label: str, recon: Dict) -> str:
+    from datetime import datetime as _dt
+    lines = [
+        f"# Reconciliation — {study_program} ({term_label})",
+        '',
+        f"> Auto-generated {_dt.now().strftime('%Y-%m-%d %H:%M')} by `studon-client --reconcile`.",
+        "> Cross-Check zwischen `Modulplan.md` (Studienplan-Sicht) und `Belegungen.md` (angemeldete Prüfungen für das laufende Semester).",
+        '',
+    ]
+
+    es = recon['ects_summary']
+    pdf = recon.get('pdf_section')
+
+    if pdf:
+        lines.extend([
+            '## ECTS-Bilanz (Prüfungsamt-PDF = kanonisch)',
+            '',
+            f"- **Bestanden lt. PDF:** {pdf['pdf_total_declared']:.1f} / {pdf['pdf_soll']:.0f} ECTS  ({pdf['pdf_total_declared']/pdf['pdf_soll']*100:.1f} %)",
+            f"- **Modulplan-Front-Page zählt:** {es['base_bestanden']:.1f} ECTS  (Undercount: {pdf['mp_undercount']:+.1f} ECTS)",
+            f"- **Quelle:** `Bescheinigungen/{pdf['pdf_basename']}`  (mtime {pdf['pdf_mtime_iso']})",
+            '',
+            "> Die PDF-Zahl ist die offizielle Prüfungsamt-Berechnung — relevant für BAföG §48, Bundeskindergeld, Stipendien. Bei Diskrepanz zum Modulplan-Front-Page gewinnt die PDF.",
+            "> PDF wird nicht automatisch aktualisiert — frische Zahl via `--campo-bescheinigungen`.",
+            '',
+        ])
+    else:
+        lines.extend([
+            '## ECTS-Bilanz korrigiert (ohne PDF — schätzt nur ab Modulplan-Front-Page)',
+            '',
+            f"- **Aus `X/Y`-Suffix gezählt (Modulplan-Front-Page):** {es['base_bestanden']:.1f} ECTS",
+            f"- **Untergrenze nach Korrektur:** {es['corrected_min']:.1f} ECTS  *(identisch — keine Korrektur möglich ohne ECTS-Soll je bestandenem Modul ohne X/Y-Suffix)*",
+            f"- **Obergrenze nach Korrektur:** {es['corrected_max']:.1f} ECTS  *(Wenn jedes Bestanden-ohne-ECTS Modul mit seinem listed-Soll zählt)*",
+            f"- **Studien-Soll:** {es['soll']:.0f} ECTS",
+            '',
+            "> Hinweis: für die offizielle Zahl wäre die Prüfungsamt-PDF kanonisch. `--campo-bescheinigungen` einmal ausführen, dann liest `--reconcile` die Zahl automatisch.",
+            '',
+        ])
+
+    lines.append(f"## Belegungen → Modulplan ({len(recon['pruefung_to_modul'])})")
+    lines.append('')
+    lines.append('| Prüfungs-Nr | Prüfungs-Titel | Modul-Nr | Modul-Titel | Modul-Status | Modul-ECTS-Soll | Match |')
+    lines.append('|---|---|---|---|---|---|---|')
+    for r in recon['pruefung_to_modul']:
+        match_marker = '✅' if r['match_score'] >= 1.0 else (f"≈ {r['match_score']:.0%}" if r['match_score'] >= 0.6 else '❌')
+        lines.append('| ' + ' | '.join([
+            r['pruef_nr'],
+            (r['pruef_title'] or '').replace('|', '/'),
+            r['modul_nr'],
+            (r['modul_title'] or '').replace('|', '/'),
+            r['modul_status'],
+            r['modul_ects_total'],
+            match_marker,
+        ]) + ' |')
+    lines.append('')
+
+    sec2 = recon['modul_angemeldet_ohne_belegung']
+    lines.append(f"## Modulplan-Angemeldet ohne Belegungs-Match ({len(sec2)})")
+    lines.append('')
+    if sec2:
+        lines.append('> Modulplan zeigt „Prüfung Vorhanden" / „angemeldet", aber `Belegungen.md` listet *keine* zugehörige Prüfung. Mögliche Gründe: Anmeldung steht noch aus, Praktikums-/Übungsleistung ohne separate Prüfung, oder administrative Sondermodule (Zusatzleistungen, Schlüsselqualifikationen).')
+        lines.append('')
+        lines.append('| Modul-Nr | Titel | Status | ECTS-Soll | Semester |')
+        lines.append('|---|---|---|---|---|')
+        for m in sec2:
+            lines.append('| ' + ' | '.join([
+                m.get('module_nr') or '',
+                (m.get('title') or '').replace('|', '/'),
+                m.get('status') or '',
+                m.get('ects_total') or '',
+                m.get('semester_leistung') or '',
+            ]) + ' |')
+    else:
+        lines.append('_alle Modulplan-Angemeldungen haben Belegungs-Match_')
+    lines.append('')
+
+    sec3 = recon['bestanden_ohne_ects']
+    lines.append(f"## Bestanden ohne ECTS-Suffix ({len(sec3)})")
+    lines.append('')
+    if sec3:
+        lines.append('> Modulplan-Status = „bestanden", aber das `X/Y`-Suffix auf der Front-Page ist leer. Diese Module fehlen daher in der gemessenen ECTS-Summe und erklären die `lernplan.md` / `Prüfungen.md` Diskrepanz.')
+        if pdf:
+            lines.append('> Die echten ECTS-Werte stehen im PDF-Section weiter unten.')
+        lines.append('')
+        lines.append('| Modul-Nr | Titel | Listed-Soll | Semester |')
+        lines.append('|---|---|---|---|')
+        for m in sec3:
+            lines.append('| ' + ' | '.join([
+                m.get('module_nr') or '',
+                (m.get('title') or '').replace('|', '/'),
+                m.get('ects_total') or '',
+                m.get('semester_leistung') or '',
+            ]) + ' |')
+    else:
+        lines.append('_keine Bestanden-Module ohne ECTS-Suffix_')
+    lines.append('')
+
+    if pdf:
+        lines.append(f"## Prüfungsamt-PDF Inhalt ({len(pdf['rows'])} Module)")
+        lines.append('')
+        lines.append('| PrNr | Titel | Prüf.-Datum | Note | ECTS-PDF | Modulplan-Status | Modulplan-ECTS | Gap |')
+        lines.append('|---|---|---|---|---|---|---|---|')
+        for r in pdf['rows']:
+            gap_cell = '—' if r['gap'] is None else (f"+{r['gap']:.1f}" if r['gap'] > 0 else f"{r['gap']:.1f}")
+            mp_status = r['mp_status'] if r['mp_in_modulplan'] else '⚠️ nicht im Modulplan'
+            lines.append('| ' + ' | '.join([
+                r['module_nr'],
+                (r['title'] or '').replace('|', '/'),
+                r['pruef_datum'],
+                r['note'] or '—',
+                f"{r['ects']:.1f}",
+                mp_status,
+                r['mp_ects_earned'] or '—',
+                gap_cell,
+            ]) + ' |')
+        lines.append('')
+
+        if pdf['gap_rows']:
+            lines.append(f"### Lücken die der Modulplan unterläuft ({len(pdf['gap_rows'])})")
+            lines.append('')
+            lines.append('> Module wo PDF eine ECTS-Zahl hat aber das Modulplan-`X/Y`-Suffix leer ist (oder abweicht). Diese Zeilen sind die *konkrete Auflösung* der ECTS-Diskrepanz.')
+            lines.append('')
+            for r in pdf['gap_rows']:
+                lines.append(f"- **{r['module_nr']} {r['title']}** — PDF: {r['ects']:.1f} ECTS · Modulplan: {r['mp_ects_earned'] or '(leer)'}")
+            lines.append('')
+
+        if pdf['pdf_only']:
+            lines.append(f"### PDF-Module ohne Modulplan-Eintrag ({len(pdf['pdf_only'])})")
+            lines.append('')
+            for r in pdf['pdf_only']:
+                lines.append(f"- {r['module_nr']} {r['title']} ({r['ects']:.1f} ECTS)")
+            lines.append('')
+
+    return '\n'.join(lines)
+
+
+def fetch_campo_reconciliation(output_path: Optional[str] = None) -> Optional[str]:
+    """Fetch Modulplan + Belegungen in one go and write Reconciliation.md
+    with the cross-check that resolves the lernplan ↔ Prüfungen ECTS gap."""
+    print("🔄 Reconciling Modulplan ↔ Belegungen ...")
+    session = _campo_session()
+    if session is None:
+        return None
+    mp = _fetch_modulplan_data(session)
+    if mp is None:
+        return None
+    study_program, modules = mp
+    if not modules:
+        print("⚠️  No modules parsed from Modulplan.")
+        return None
+    bg = _fetch_belegungen_data(session)
+    if bg is None:
+        return None
+    term_label, blocks = bg
+    if not blocks:
+        print("⚠️  No Belegungen-Blöcke gefunden.")
+        return None
+
+    pdf_data: Optional[Dict] = None
+    pdf_path = _find_latest_notenuebersicht_pdf()
+    if pdf_path:
+        print(f"📄 Notenübersicht-PDF gefunden: {os.path.basename(pdf_path)}")
+        pdf_data = _parse_notenuebersicht_pdf(pdf_path)
+        if pdf_data:
+            print(f"   → {len(pdf_data['modules'])} Modul(e) aus PDF · Total {pdf_data['total_earned']}/{pdf_data['total_soll']} ECTS")
+    else:
+        print("ℹ️  Keine Notenübersicht-PDF unter Bescheinigungen/ — für kanonische ECTS-Zahl: `--campo-bescheinigungen` einmal laufen lassen.")
+
+    recon = _reconcile_data(modules, blocks, pdf_data=pdf_data)
+    print(f"✅ Reconciled {len(modules)} Module ↔ {sum(1 for b in blocks if b['kind']=='prüfung')} Prüfungen.")
+    print(f"   - Belegungen→Modul matches: {sum(1 for r in recon['pruefung_to_modul'] if r['match_score']>=1.0)} exakt + {sum(1 for r in recon['pruefung_to_modul'] if 0.6<=r['match_score']<1.0)} fuzzy + {sum(1 for r in recon['pruefung_to_modul'] if r['match_score']<0.6)} ohne Match")
+    print(f"   - Modulplan-Angemeldet ohne Belegung: {len(recon['modul_angemeldet_ohne_belegung'])}")
+    print(f"   - Bestanden ohne ECTS-Suffix: {len(recon['bestanden_ohne_ects'])}")
+    es = recon['ects_summary']
+    print(f"   - ECTS bestanden (Modulplan): {es['base_bestanden']:.1f}; (PDF kanonisch): {recon['pdf_section']['pdf_total_declared'] if recon['pdf_section'] else 'n/a'} / Soll {es['soll']:.0f}")
+
+    md = _render_reconciliation_markdown(study_program, term_label, recon)
+    if output_path is None:
+        output_path = os.path.join(DOWNLOAD_FOLDER, 'Reconciliation.md')
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(md)
+    print(f"✅ Reconciliation written to {output_path}")
+
+    # Maschinen-lesbarer JSON-Export für nachgelagerte Tools (Digest, Lernplan, …)
+    from datetime import datetime as _dt
+    json_path = os.path.splitext(output_path)[0] + '.json'
+    payload = {
+        'generated_at': _dt.now().isoformat(timespec='seconds'),
+        'study_program': study_program,
+        'term_label': term_label,
+        'reconciliation': recon,
+        'modules': modules,
+        'belegungen': blocks,
+    }
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+        print(f"✅ Reconciliation JSON written to {json_path}")
+    except OSError as e:
+        print(f"⚠️  Could not write JSON export: {e}")
+
+    return output_path
+
+
 def _campo_session() -> Optional[requests.Session]:
     """Build a requests.Session populated with current Firefox cookies for campo."""
     try:
@@ -4793,6 +5931,40 @@ def _campo_session() -> Optional[requests.Session]:
     except Exception as e:
         print(f"❌ Could not load Firefox cookies: {e}")
         return None
+
+
+def _run_campo_search(query: str, term: Optional[str] = None) -> None:
+    """Search campo's Lehrveranstaltungssuche for *query* and print hits + ECTS.
+
+    Delegates the flow mechanics to the campo_search module (imported lazily so
+    the --advertise fast-path stays light) and reuses _campo_session() so cookie
+    handling lives in one place. ECTS is always fetched per hit (one extra GET
+    each). Stdout only — nothing is written to disk.
+    """
+    from campo_search import search_courses, fetch_detail_ects
+
+    session = _campo_session()
+    if session is None:
+        return
+    try:
+        term_label, hits = search_courses(query, term=term, session=session)
+    except RuntimeError as e:
+        print(f"❌ {e}")
+        return
+
+    if not hits:
+        print(f"⚠️  Keine Treffer für '{query}' (Semester: {term_label}).")
+        return
+
+    print(f"✅ Semester: {term_label} — {len(hits)} Treffer\n")
+    for h in hits:
+        ects = fetch_detail_ects(h.get("detail_url"), session=session)
+        line = f"• {h['title']}  [{h['art']}]  — {h['dozent']}"
+        if ects:
+            line += f"  ({ects} ECTS)"
+        print(line)
+        if h.get("unitId"):
+            print(f"    unitId={h['unitId']} periodId={h['periodId']}")
 
 
 def _filename_from_content_disposition(cd: str, fallback: str) -> str:
@@ -5447,7 +6619,7 @@ def _run_tui_menu(debug: bool = False) -> None:
         return
 
     if action == "check_feedback":
-        n_processed, n_files = check_and_process_feedback(verbose=True)
+        n_processed, n_files, _ = check_and_process_feedback(verbose=True)
         print(f"Feedback: processed {n_processed} exercise(s), downloaded {n_files} file(s).")
         return
 
@@ -5462,7 +6634,7 @@ def _run_tui_menu(debug: bool = False) -> None:
         return
 
     if action == "update_all":
-        success, n_downloaded, n_extracted, session_expired = update_all_courses(debug=debug)
+        success, n_downloaded, n_extracted, session_expired, _ = update_all_courses(debug=debug)
         if session_expired:
             recovered_session = _interactive_login_recovery()
             if recovered_session is not None:
@@ -5562,8 +6734,18 @@ def main() -> None:
                        help='Remove ~/.claude/skills/studon/SKILL.md')
     parser.add_argument('--timetable', action='store_true',
                        help='Fetch personal campo timetable and write to timetable.md')
+    parser.add_argument('--modulplan', action='store_true',
+                        help='Scan campo studyPlanner front page (deterministic) → Modulplan.md with status/Versuch/Semester/ECTS')
+    parser.add_argument('--belegungen', action='store_true',
+                        help='Scan campo Belegungen page (searchOwnEnrollmentInfo-flow, deterministic) → Belegungen.md + Belegungen.json. Pure fetch; change-detection lives in sibling belegungen-watcher tool.')
+    parser.add_argument('--reconcile', action='store_true',
+                        help='Cross-check Modulplan ↔ Belegungen and write Reconciliation.md (resolves ECTS-Bilanz-Diskrepanz, lists Prüfungen ohne Modul-Match, Modulplan-Angemeldet ohne Belegung, Bestanden ohne ECTS-Suffix)')
     parser.add_argument('--campo-pruefungen', action='store_true',
                        help='Scan campo studyPlanner Detailansichten (opened in Firefox) and write pruefungen.md')
+    parser.add_argument('--campo-search', metavar='QUERY',
+                       help='Search campo courses for QUERY in a semester (default: current) and print hits + ECTS to stdout')
+    parser.add_argument('--term', metavar='TERMID',
+                       help="Semester for --campo-search, e.g. 'eq|1|2026' (SoSe26) / 'eq|2|2026' (WiSe26); default = current semester")
     parser.add_argument('--campo-bescheinigungen', action='store_true',
                        help='Download all PDFs from campo Notenübersicht / personExamsReadonly page (Notenübersicht, BAföG-§48, ord. Studium, angemeldete Prüfungen, ...) into <downloads>/Bescheinigungen/')
     parser.add_argument('--campo-enrollment-bescheinigungen', action='store_true',
@@ -5586,9 +6768,29 @@ def main() -> None:
         fetch_timetable_markdown()
         return
 
+    # --- Campo Modulplan (deterministic studyPlanner scan) ---
+    if args.modulplan:
+        fetch_campo_modulplan()
+        return
+
+    # --- Campo Belegungen (deterministic searchOwnEnrollmentInfo scan) ---
+    if args.belegungen:
+        fetch_campo_belegungen()
+        return
+
+    # --- Campo Reconciliation (Modulplan ↔ Belegungen cross-check) ---
+    if args.reconcile:
+        fetch_campo_reconciliation()
+        return
+
     # --- Campo Prüfungstermine / Anmeldefristen ---
     if args.campo_pruefungen:
         fetch_campo_pruefungen_markdown()
+        return
+
+    # --- Campo course search (Lehrveranstaltungssuche) ---
+    if args.campo_search:
+        _run_campo_search(args.campo_search, term=args.term)
         return
 
     # --- Campo Notenübersicht / Bescheinigungen (PDF bulk download) ---
@@ -5631,7 +6833,7 @@ def main() -> None:
 
     # --- Feedback inbox scan ---
     if args.check_feedback:
-        n_processed, n_files = check_and_process_feedback(verbose=True)
+        n_processed, n_files, _ = check_and_process_feedback(verbose=True)
         print(f"Feedback: processed {n_processed} exercise(s), downloaded {n_files} file(s).")
         return
 
@@ -5689,7 +6891,7 @@ def main() -> None:
     if args.update_all:
         if args.download_path:
             DOWNLOAD_FOLDER = args.download_path
-        success, n_downloaded, n_extracted, session_expired = update_all_courses(debug=args.debug)
+        success, n_downloaded, n_extracted, session_expired, _ = update_all_courses(debug=args.debug)
         if session_expired and sys.stdin.isatty():
             recovered_session = _interactive_login_recovery()
             if recovered_session is not None:
