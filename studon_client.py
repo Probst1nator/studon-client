@@ -6238,6 +6238,42 @@ def _find_download_href(updates: Dict[str, str]) -> Optional[str]:
     return None
 
 
+def _download_enrollment_pdf(s: requests.Session, poll_url: str, download_href: str,
+                             label: str, idx: int, output_dir: str) -> Optional[str]:
+    """GET the resolved docdownload anchor → save the PDF. Returns the saved path or None.
+
+    The anchor is lifted from a server-controlled JSF partial-response, so the
+    resolved host is re-validated before the GET — an absolute (or protocol-
+    relative) off-campo href would otherwise exfiltrate the campo session
+    cookies. Mirrors the _url_host_matches gates used on the StudOn side.
+    """
+    full_href = urljoin(poll_url, download_href)
+    if not _url_host_matches(full_href, 'campo.fau.de'):
+        print(f"   ✗ [{idx}] {label}: refusing off-campo download host: {full_href}")
+        return None
+    try:
+        pdf_resp = s.get(full_href, timeout=120, allow_redirects=True,
+                         headers={'Referer': poll_url})
+    except requests.RequestException as e:
+        print(f"   ✗ [{idx}] {label}: PDF GET failed ({e})")
+        return None
+    ct = (pdf_resp.headers.get('Content-Type') or '').lower()
+    is_pdf = 'pdf' in ct or pdf_resp.content[:4] == b'%PDF'
+    if not is_pdf:
+        print(f"   ✗ [{idx}] {label}: download response was {ct or '?'} ({len(pdf_resp.content)} B), not PDF")
+        return None
+    fname = _filename_from_content_disposition(
+        pdf_resp.headers.get('Content-Disposition', ''),
+        fallback=f"enrollment_{idx}_{re.sub(r'[^A-Za-z0-9._-]+', '_', label)[:60] or 'report'}.pdf",
+    )
+    fname = os.path.basename(fname).replace('/', '_').replace('\\', '_')
+    out_path = os.path.join(output_dir, fname)
+    with open(out_path, 'wb') as fh:
+        fh.write(pdf_resp.content)
+    print(f"   ✓ [{idx}] {label}  →  {fname} ({len(pdf_resp.content):,} B)")
+    return out_path
+
+
 def _fetch_one_enrollment_pdf(
     s: requests.Session,
     btn_name: str,
@@ -6519,29 +6555,8 @@ def _fetch_one_enrollment_pdf(
             print(f"   ✗ [{idx}] {label}: polling exhausted without a download anchor")
             return None
 
-    # GET the docdownload anchor → PDF.
-    full_href = urljoin(poll_url, download_href)
-    try:
-        pdf_resp = s.get(full_href, timeout=120, allow_redirects=True,
-                         headers={'Referer': poll_url})
-    except requests.RequestException as e:
-        print(f"   ✗ [{idx}] {label}: PDF GET failed ({e})")
-        return None
-    ct = (pdf_resp.headers.get('Content-Type') or '').lower()
-    is_pdf = 'pdf' in ct or pdf_resp.content[:4] == b'%PDF'
-    if not is_pdf:
-        print(f"   ✗ [{idx}] {label}: download response was {ct or '?'} ({len(pdf_resp.content)} B), not PDF")
-        return None
-    fname = _filename_from_content_disposition(
-        pdf_resp.headers.get('Content-Disposition', ''),
-        fallback=f"enrollment_{idx}_{re.sub(r'[^A-Za-z0-9._-]+', '_', label)[:60] or 'report'}.pdf",
-    )
-    fname = os.path.basename(fname).replace('/', '_').replace('\\', '_')
-    out_path = os.path.join(output_dir, fname)
-    with open(out_path, 'wb') as fh:
-        fh.write(pdf_resp.content)
-    print(f"   ✓ [{idx}] {label}  →  {fname} ({len(pdf_resp.content):,} B)")
-    return out_path
+    # GET the docdownload anchor → PDF (host-validated against campo).
+    return _download_enrollment_pdf(s, poll_url, download_href, label, idx, output_dir)
 
 
 def _run_tui_menu(debug: bool = False) -> None:

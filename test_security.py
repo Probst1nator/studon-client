@@ -472,3 +472,63 @@ def test_extract_archive_refuses_7z_with_symlink_member(tmp_path):
         a.writeall(str(src), 'data')
     assert s.extract_archive(str(archive)) is False
     assert not os.path.lexists(str(course / 'mal' / 'data' / 'evil_link'))
+
+
+# --- Enrollment-PDF download: host-validate the server-supplied anchor -------
+# The campo docdownload anchor is lifted from a server-controlled JSF
+# partial-response, then GETted with the campo session cookies. An absolute
+# off-campo href in that anchor would otherwise exfiltrate the session — so
+# _download_enrollment_pdf re-validates the *resolved* host before the GET,
+# mirroring the _url_host_matches gates already used on the StudOn side.
+
+class _FakePdfResponse:
+    def __init__(self, content=b'%PDF-1.4 fake pdf bytes', headers=None):
+        self.content = content
+        self.headers = headers if headers is not None else {'Content-Type': 'application/pdf'}
+
+
+class _FakeGetRecorder:
+    """Session double recording every .get() URL; returns a canned PDF."""
+    def __init__(self, response=None):
+        self.calls = []
+        self._response = response if response is not None else _FakePdfResponse()
+
+    def get(self, url, **kwargs):
+        self.calls.append(url)
+        return self._response
+
+
+def test_enrollment_download_accepts_on_campo_anchor(tmp_path):
+    """A relative anchor resolves to campo.fau.de → GET fires and the PDF saves."""
+    sess = _FakeGetRecorder()
+    poll = 'https://campo.fau.de/qisserver/pages/cm/exa/enrollment/info/start.xhtml'
+    out = s._download_enrollment_pdf(
+        sess, poll, '/qisserver/rds?state=docdownload&docId=1',
+        'Immatrikulationsbescheinigung', 1, str(tmp_path))
+    assert out is not None
+    assert os.path.exists(out)
+    assert sess.calls == ['https://campo.fau.de/qisserver/rds?state=docdownload&docId=1']
+
+
+def test_enrollment_download_refuses_off_campo_anchor(tmp_path):
+    """An absolute off-campo anchor (server-controlled partial-response) must be
+    refused BEFORE the cookie-bearing GET fires — else the campo session leaks."""
+    sess = _FakeGetRecorder()
+    poll = 'https://campo.fau.de/qisserver/pages/cm/exa/enrollment/info/start.xhtml'
+    out = s._download_enrollment_pdf(
+        sess, poll, 'https://attacker.example/rds?state=docdownload&docId=1',
+        'Immatrikulationsbescheinigung', 1, str(tmp_path))
+    assert out is None
+    assert sess.calls == []          # the cookie-bearing GET never fired off-host
+    assert os.listdir(str(tmp_path)) == []   # nothing written
+
+
+def test_enrollment_download_refuses_protocol_relative_anchor(tmp_path):
+    """A protocol-relative '//host' anchor also resolves off campo and is refused."""
+    sess = _FakeGetRecorder()
+    poll = 'https://campo.fau.de/qisserver/pages/cm/exa/enrollment/info/start.xhtml'
+    out = s._download_enrollment_pdf(
+        sess, poll, '//attacker.example/rds?state=docdownload',
+        'Immatrikulationsbescheinigung', 1, str(tmp_path))
+    assert out is None
+    assert sess.calls == []
