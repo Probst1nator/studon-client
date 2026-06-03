@@ -169,6 +169,10 @@ python studon_client.py --belegungen
 # (3) Bestanden ohne ECTS-Suffix (= ECTS-Undercount).
 python studon_client.py --reconcile
 
+# Search campo's Lehrveranstaltungssuche for a term (default: current semester) → stdout
+# Prints LV-Treffer + ECTS. Also runnable standalone: python campo_search.py "<query>" [--ects] [--json]
+python studon_client.py --campo-search "Künstliche Intelligenz" [--term 'eq|1|2026']
+
 # Scan campo studyPlanner Prüfungs-Detailansichten (opened in Firefox) → pruefungen.md
 # Zeiträume live nur auf Prüfungs-Detail views, daher Pre-Click required.
 python studon_client.py --campo-pruefungen
@@ -208,6 +212,7 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--modulplan` | Scan studyPlanner-flow front page (deterministic, no Pre-Click) → `Modulplan.md`: every module in the Studienplan with Nr / Titel / Status / Semester / Versuch / ECTS-erreicht/-Soll, Studienfortschritt-Header (Bestanden gegen 180 ECTS-Soll), und drei Status-gruppierte Tabellen (Bestanden / Angemeldet / Offen). ECTS comes from the `X/Y`-suffix on each `modulePlanItem` div — no extra HTTP request. |
 | `--belegungen` | Scan searchOwnEnrollmentInfo-flow front page (deterministic, no Pre-Click) → `Belegungen.md` + `Belegungen.json`: angemeldete Prüfungen (Nr / Titel / Termin / Form / Prüfer/-in / Status) + Veranstaltungen (Typ / Titel / Termin+Raum / Dozent/-in) für das aktuell ausgewählte Semester. Multi-Termin-Vorlesungen werden mit `<br>` getrennt. **Pure data fetch** — Change-Detection + `notify-send` ist in das Schwester-Tool `~/Synced/repos/AutomatedAlchemy/belegungen-watcher/main.py` ausgelagert, das die JSON konsumiert. |
 | `--reconcile` | Cross-Check Modulplan ↔ Belegungen → `Reconciliation.md` + `Reconciliation.json` (gleicher Inhalt maschinen-lesbar) mit (1) Belegungen-Prüfungen → Modulplan-Modul-Match (Title-Normalize + Jaccard ≥ 0.6), (2) Modulplan-Angemeldet ohne Belegungs-Eintrag, (3) Bestanden-Module ohne `X/Y`-Suffix (= ECTS-Undercount-Quelle). Wenn eine `Notenübersicht*Module*.pdf` unter `Bescheinigungen/` existiert (Auto-Detection via `pdftotext -layout`), wird sie als **kanonische ECTS-Quelle** integriert (Prüfungsamt-Berechnung, BAföG-/Kindergeld-relevant) — Diskrepanz zum Modulplan-Front-Page wird automatisch sichtbar gemacht. Der `--install`-Cron pflegt die PDF wöchentlich (Mo 06:30) via `--campo-bescheinigungen`. |
+| `--campo-search "<query>" [--term 'eq\|1\|2026']` | Search campo's Lehrveranstaltungssuche (searchCourseNonStaff-flow) for a term (default: current semester) and print LV-Treffer + ECTS to stdout. Flow mechanics live in the standalone, unit-runnable `campo_search.py` (`python campo_search.py "<query>" [--ects] [--json]`). |
 | `--campo-pruefungen` | Parse campo studyPlanner Prüfungs-Detailansichten (must be pre-opened in Firefox; flow-key scan now adaptive up to e99) → `pruefungen.md`. Zeiträume (Anmelde-/Abmelde-/Prüfungszeitraum) only render on per-Prüfung Detail views, not on the deterministic Modul-Detail views. |
 | `--campo-bescheinigungen` | Download all 12 exam-side PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/` |
 | `--campo-bescheinigungen --with-enrollment` | 12 + 7 = 19 PDFs (combo with the enrollment-side) |
