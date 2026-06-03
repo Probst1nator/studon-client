@@ -151,7 +151,26 @@ python studon_client.py --clip
 # Export campo timetable to timetable.md
 python studon_client.py --timetable
 
-# Scan campo studyPlanner detail views (opened in Firefox) → pruefungen.md
+# Scan campo studyPlanner front page (deterministic, no Pre-Click) → Modulplan.md
+# Lists every module in the Studienplan with Status / Semester / Versuch / ECTS-erreicht / ECTS-Soll,
+# Studienfortschritt-Header (Bestanden/180 ECTS) + 3 status-grouped tables.
+python studon_client.py --modulplan
+
+# Scan campo Belegungen page (deterministic, no Pre-Click) → Belegungen.md + Belegungen.json
+# Lists all angemeldeten Prüfungen (Nr/Titel/Termin/Form/Prüfer/Status) + Veranstaltungen
+# (Typ/Titel/Termin+Raum/Dozent) for the currently selected semester. Pure data fetch.
+# Change-detection + notify-send lives in the sibling `belegungen-watcher` tool.
+python studon_client.py --belegungen
+
+# Cross-check Modulplan ↔ Belegungen → Reconciliation.md
+# Resolves the lernplan.md / Prüfungen.md ECTS-Diskrepanz by listing:
+# (1) Belegungen-Prüfungen mit Modulplan-Modul-Match,
+# (2) Modulplan-Angemeldet ohne Belegung,
+# (3) Bestanden ohne ECTS-Suffix (= ECTS-Undercount).
+python studon_client.py --reconcile
+
+# Scan campo studyPlanner Prüfungs-Detailansichten (opened in Firefox) → pruefungen.md
+# Zeiträume live nur auf Prüfungs-Detail views, daher Pre-Click required.
 python studon_client.py --campo-pruefungen
 
 # Bulk-download Notenübersicht / Bescheinigungen PDFs (exam-side, 12 PDFs)
@@ -186,7 +205,10 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--clip` | Read clipboard, preview, confirm, download |
 | `--dry-run` | Discover files without downloading |
 | `--timetable` | Export personal campo timetable |
-| `--campo-pruefungen` | Parse campo studyPlanner Detailansichten (must be pre-opened in Firefox) → `pruefungen.md` |
+| `--modulplan` | Scan studyPlanner-flow front page (deterministic, no Pre-Click) → `Modulplan.md`: every module in the Studienplan with Nr / Titel / Status / Semester / Versuch / ECTS-erreicht/-Soll, Studienfortschritt-Header (Bestanden gegen 180 ECTS-Soll), und drei Status-gruppierte Tabellen (Bestanden / Angemeldet / Offen). ECTS comes from the `X/Y`-suffix on each `modulePlanItem` div — no extra HTTP request. |
+| `--belegungen` | Scan searchOwnEnrollmentInfo-flow front page (deterministic, no Pre-Click) → `Belegungen.md` + `Belegungen.json`: angemeldete Prüfungen (Nr / Titel / Termin / Form / Prüfer/-in / Status) + Veranstaltungen (Typ / Titel / Termin+Raum / Dozent/-in) für das aktuell ausgewählte Semester. Multi-Termin-Vorlesungen werden mit `<br>` getrennt. **Pure data fetch** — Change-Detection + `notify-send` ist in das Schwester-Tool `~/Synced/repos/AutomatedAlchemy/belegungen-watcher/main.py` ausgelagert, das die JSON konsumiert. |
+| `--reconcile` | Cross-Check Modulplan ↔ Belegungen → `Reconciliation.md` + `Reconciliation.json` (gleicher Inhalt maschinen-lesbar) mit (1) Belegungen-Prüfungen → Modulplan-Modul-Match (Title-Normalize + Jaccard ≥ 0.6), (2) Modulplan-Angemeldet ohne Belegungs-Eintrag, (3) Bestanden-Module ohne `X/Y`-Suffix (= ECTS-Undercount-Quelle). Wenn eine `Notenübersicht*Module*.pdf` unter `Bescheinigungen/` existiert (Auto-Detection via `pdftotext -layout`), wird sie als **kanonische ECTS-Quelle** integriert (Prüfungsamt-Berechnung, BAföG-/Kindergeld-relevant) — Diskrepanz zum Modulplan-Front-Page wird automatisch sichtbar gemacht. Der `--install`-Cron pflegt die PDF wöchentlich (Mo 06:30) via `--campo-bescheinigungen`. |
+| `--campo-pruefungen` | Parse campo studyPlanner Prüfungs-Detailansichten (must be pre-opened in Firefox; flow-key scan now adaptive up to e99) → `pruefungen.md`. Zeiträume (Anmelde-/Abmelde-/Prüfungszeitraum) only render on per-Prüfung Detail views, not on the deterministic Modul-Detail views. |
 | `--campo-bescheinigungen` | Download all 12 exam-side PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/` |
 | `--campo-bescheinigungen --with-enrollment` | 12 + 7 = 19 PDFs (combo with the enrollment-side) |
 | `--campo-enrollment-bescheinigungen` | Download all 7 enrollment-side PDFs via `studyservice-flow` into `<downloads>/Bescheinigungen/Enrollment/`: Benutzerinfobrief, Bescheinigung §9 BAföG, Datenkontrollblatt, Quittung (einzelnes Semester), Beitragskonto, Immatrikulationsbescheinigung, Studienverlaufsbescheinigung. Parameterized reports default to the current semester. |
@@ -286,7 +308,8 @@ python3 studon_client.py --install
 1. Log into StudOn in Firefox and enrol in new courses.
 2. Download each new course once: `python studon_client.py "<url>"`
 3. Refresh campo timetable: `python studon_client.py --timetable`
-   - For exam-registration deadlines: open each module's *Detailansicht* in Firefox once, then `python studon_client.py --campo-pruefungen` → `pruefungen.md`.
+   - For Studienfortschritt / ECTS-Bilanz: `python studon_client.py --modulplan` → `Modulplan.md` (deterministic, no Pre-Click).
+   - For exam-registration deadlines: open each Prüfungs-Detailansicht in Firefox once, then `python studon_client.py --campo-pruefungen` → `pruefungen.md`.
 4. Run `python studon_client.py --map-lectures` to link new timetable
    entries to the new course folders (or mark them as no-course).
 5. Daily sync + lecture sync track them automatically from then on.
