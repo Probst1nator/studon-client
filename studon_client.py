@@ -33,10 +33,12 @@ if "--advertise" in sys.argv:
         # Skill support: --install-skill / --uninstall-skill write
         # ~/.claude/skills/studon/SKILL.md from inline SKILL_MD_CONTENT.
         "skill_name": "studon",
-        # Digest connection: where course PDFs land + a non-daemon refresh.
-        # (--update-all refreshes tracked courses; --daily-sync is a Firefox-waiting daemon.)
+        # Digest connection: advertise WHERE course PDFs land, but NO digest_run —
+        # this client keeps its own download folder fresh via its @reboot
+        # --daily-sync / --lecture-sync crons, so the digest must only OBSERVE the
+        # directory (its ledger detects new/changed files) and never drive a fetch.
+        # (--update-all is interactive/slow and would block an unattended digest run.)
         "digest_output": os.path.join(_dl, "**", "*.pdf"),
-        "digest_run": ["--update-all"],
     }]))
     sys.exit(0)
 
