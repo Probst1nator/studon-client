@@ -31,8 +31,8 @@ if "--advertise" in sys.argv:
         # so --install / .desktop launches don't pick up --clip.
         "alias_args": ["--clip"],
         # Skill support: --install-skill / --uninstall-skill write
-        # ~/.claude/skills/studon/SKILL.md from inline SKILL_MD_CONTENT.
-        "skill_name": "studon",
+        # ~/.claude/skills/search-studon/SKILL.md from inline SKILL_MD_CONTENT.
+        "skill_name": "search-studon",
         # Digest connection: advertise WHERE course PDFs land, but NO digest_run —
         # this client keeps its own download folder fresh via its @reboot
         # --daily-sync / --lecture-sync crons, so the digest must only OBSERVE the
@@ -3458,17 +3458,22 @@ def _run_uninstall() -> None:
 
 
 # --- Claude Code skill registration ---------------------------------------
-# Single source of truth for ~/.claude/skills/studon/SKILL.md. Update this
-# when CLI flags change so `python3 studon_client.py --install-skill` re-
+# Single source of truth for ~/.claude/skills/search-studon/SKILL.md. Update
+# this when CLI flags change so `python3 studon_client.py --install-skill` re-
 # registers a fresh manifest. Kept inline so the script stays self-contained.
-SKILL_DIR  = Path.home() / '.claude' / 'skills' / 'studon'
+# (Renamed from `studon` → `search-studon` 2026-06-07 for legibility + to group
+# with sibling source-fetcher skills like `search-youtube`.)
+SKILL_DIR  = Path.home() / '.claude' / 'skills' / 'search-studon'
 SKILL_FILE = SKILL_DIR / 'SKILL.md'
+# Pre-rename installs left a `studon` skill dir; prune it on (un)install so
+# other fleet hosts converge when they next run --install / --install-skill.
+LEGACY_SKILL_DIRS = ('studon',)
 SKILL_MD_CONTENT = '''---
-name: studon
+name: search-studon
 description: Drive the StudOn / Campo scraper at ~/Synced/repos/AutomatedAlchemy/studon-client/. Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, dump prüfungs-Anmeldefristen, export the studyPlanner Modulplan (status/ECTS/Versuch per module), list current Belegungen (angemeldete Prüfungen + Veranstaltungen mit Termin/Raum/Prüfer), reconcile Modulplan ↔ Belegungen for an honest ECTS-Bilanz, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studienfortschritt", "modulplan", "wieviele ects hab ich", "belegungen", "wo bin ich angemeldet", "klausurtermin", "reconcile", "ects bilanz", "stimmt meine ects", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
 ---
 
-# studon
+# search-studon
 
 Wrapper for the StudOn / Campo scraper at
 `~/Synced/repos/AutomatedAlchemy/studon-client/studon_client.py`.
@@ -3623,8 +3628,22 @@ def _is_skill_installed() -> bool:
     return SKILL_FILE.exists()
 
 
+def _prune_legacy_skill_dirs() -> None:
+    """Remove a pre-rename ~/.claude/skills/studon/ that older installs created."""
+    for legacy in LEGACY_SKILL_DIRS:
+        legacy_file = Path.home() / '.claude' / 'skills' / legacy / 'SKILL.md'
+        if legacy_file.exists():
+            legacy_file.unlink()
+            print(f"  ✅ Removed legacy skill {legacy_file}")
+        try:
+            legacy_file.parent.rmdir()  # only if now empty
+        except OSError:
+            pass
+
+
 def _run_install_skill() -> None:
-    """Write (or refresh) ~/.claude/skills/studon/SKILL.md from the inline source."""
+    """Write (or refresh) ~/.claude/skills/search-studon/SKILL.md from the inline source."""
+    _prune_legacy_skill_dirs()
     SKILL_DIR.mkdir(parents=True, exist_ok=True)
     pre_existed = SKILL_FILE.exists()
     if pre_existed and SKILL_FILE.read_text(encoding='utf-8') == SKILL_MD_CONTENT:
@@ -3637,7 +3656,8 @@ def _run_install_skill() -> None:
 
 
 def _run_uninstall_skill() -> None:
-    """Remove ~/.claude/skills/studon/SKILL.md (and the empty dir)."""
+    """Remove ~/.claude/skills/search-studon/SKILL.md (and the empty dir, plus any legacy `studon` dir)."""
+    _prune_legacy_skill_dirs()
     if SKILL_FILE.exists():
         SKILL_FILE.unlink()
         print(f"  ✅ Removed {SKILL_FILE}")
@@ -7125,9 +7145,9 @@ def main() -> None:
     parser.add_argument('--install', action='store_true',
                        help='Install cron job and shell function (replaces setup_daily_sync.sh)')
     parser.add_argument('--install-skill', action='store_true',
-                       help='(Re)write ~/.claude/skills/studon/SKILL.md from the inline source so Claude Code surfaces this scraper as a skill')
+                       help='(Re)write ~/.claude/skills/search-studon/SKILL.md from the inline source so Claude Code surfaces this scraper as a skill')
     parser.add_argument('--uninstall-skill', action='store_true',
-                       help='Remove ~/.claude/skills/studon/SKILL.md')
+                       help='Remove ~/.claude/skills/search-studon/SKILL.md')
     parser.add_argument('--timetable', action='store_true',
                        help='Fetch personal campo timetable and write to timetable.md')
     parser.add_argument('--modulplan', action='store_true',
