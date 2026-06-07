@@ -532,3 +532,244 @@ def test_enrollment_download_refuses_protocol_relative_anchor(tmp_path):
         'Immatrikulationsbescheinigung', 1, str(tmp_path))
     assert out is None
     assert sess.calls == []
+
+
+# --- Post-boot Syncthing readiness gate -------------------------------------
+# The @reboot daemons start before Syncthing has connected, so both fleet hosts
+# see stale state and all scrape — the root cause of the METADATA.md conflict
+# cluster. _wait_for_syncthing_ready() blocks until a peer is connected and the
+# DOWNLOAD_FOLDER's Syncthing folder is in-sync, with mandatory graceful
+# degradation to the legacy blind grace-sleep on any failure. All REST calls
+# are mocked here — no live Syncthing is required.
+
+_SYNCTHING_CONFIG_XML = """<configuration>
+  <gui enabled="true"><address>127.0.0.1:8384</address><apikey>TESTKEY123</apikey></gui>
+  <folder id="OneDrive" path="{base}"></folder>
+  <folder id="other" path="/some/other/path"></folder>
+</configuration>
+"""
+
+
+def _write_syncthing_config(tmp_path, base):
+    cfg = tmp_path / "config.xml"
+    cfg.write_text(_SYNCTHING_CONFIG_XML.format(base=base))
+    return str(cfg)
+
+
+class _FakeRestResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+def _make_rest_router(responses):
+    """Build a fake requests.get that routes by endpoint substring.
+
+    `responses` maps an endpoint substring -> payload dict (or None to simulate
+    a transport error / unreachable endpoint).
+    """
+    def fake_get(url, headers=None, timeout=None):
+        assert headers and headers.get("X-API-Key") == "TESTKEY123"
+        for needle, payload in responses.items():
+            if needle in url:
+                if payload is None:
+                    raise OSError("simulated unreachable")
+                return _FakeRestResponse(payload)
+        raise AssertionError(f"unexpected Syncthing endpoint: {url}")
+    return fake_get
+
+
+def test_read_syncthing_config_parses_apikey_and_folders(tmp_path, monkeypatch):
+    cfg = _write_syncthing_config(tmp_path, str(tmp_path / "Sync" / "OneDrive"))
+    monkeypatch.setattr(s, 'SYNCTHING_CONFIG_PATHS', [cfg])
+    apikey, folders = s._read_syncthing_config()
+    assert apikey == "TESTKEY123"
+    # The OneDrive path is keyed by its realpath; id resolves correctly.
+    assert "OneDrive" in folders.values()
+
+
+def test_read_syncthing_config_returns_none_when_absent(tmp_path, monkeypatch):
+    monkeypatch.setattr(s, 'SYNCTHING_CONFIG_PATHS', [str(tmp_path / "nope.xml")])
+    assert s._read_syncthing_config() is None
+
+
+def test_syncthing_folder_id_picks_longest_prefix(tmp_path):
+    base = str(tmp_path / "Sync" / "OneDrive")
+    deep = base + "/Studium/KIM4"
+    folders = {
+        os.path.realpath(str(tmp_path / "Sync")): "Synced",
+        os.path.realpath(base): "OneDrive",
+    }
+    # KIM4 is under both Synced and OneDrive — the longer (OneDrive) wins.
+    assert s._syncthing_folder_id_for_path(deep, folders) == "OneDrive"
+
+
+def test_syncthing_folder_id_none_when_uncovered(tmp_path):
+    folders = {"/completely/unrelated": "x"}
+    assert s._syncthing_folder_id_for_path(str(tmp_path), folders) is None
+
+
+def test_wait_for_syncthing_ready_true_when_peer_and_folder_in_sync(tmp_path, monkeypatch):
+    """Happy path: a peer is connected and the folder is at 100% — returns True
+    without ever falling back to the blind sleep."""
+    base = str(tmp_path / "Sync" / "OneDrive")
+    os.makedirs(base)
+    cfg = _write_syncthing_config(tmp_path, base)
+    monkeypatch.setattr(s, 'SYNCTHING_CONFIG_PATHS', [cfg])
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', os.path.join(base, "Studium", "KIM4"))
+    monkeypatch.setattr(s.requests, 'get', _make_rest_router({
+        "/rest/system/ping": {"ping": "pong"},
+        "/rest/system/connections": {"connections": {"PEER1": {"connected": True}}},
+        "/rest/db/completion": {"completion": 100.0},
+    }))
+    slept = []
+    monkeypatch.setattr(s.time, 'sleep', lambda secs: slept.append(secs))
+    assert s._wait_for_syncthing_ready() is True
+    assert slept == []  # readiness confirmed via REST, no blind fallback
+
+
+def test_wait_for_syncthing_ready_falls_back_when_no_config(tmp_path, monkeypatch):
+    """No config.xml: must blind-sleep the grace window and return False (so the
+    caller's own state re-check still runs and the scrape proceeds)."""
+    monkeypatch.setattr(s, 'SYNCTHING_CONFIG_PATHS', [str(tmp_path / "absent.xml")])
+    slept = []
+    monkeypatch.setattr(s.time, 'sleep', lambda secs: slept.append(secs))
+    assert s._wait_for_syncthing_ready(fallback_grace_seconds=42) is False
+    assert slept == [42]
+
+
+def test_wait_for_syncthing_ready_falls_back_when_folder_uncovered(tmp_path, monkeypatch):
+    """DOWNLOAD_FOLDER not covered by any Syncthing folder → blind fallback."""
+    cfg = _write_syncthing_config(tmp_path, "/some/other/onedrive")
+    monkeypatch.setattr(s, 'SYNCTHING_CONFIG_PATHS', [cfg])
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', str(tmp_path / "elsewhere"))
+    slept = []
+    monkeypatch.setattr(s.time, 'sleep', lambda secs: slept.append(secs))
+    # requests.get must never be called when there is no folder to probe.
+    monkeypatch.setattr(s.requests, 'get', _make_rest_router({}))
+    assert s._wait_for_syncthing_ready(fallback_grace_seconds=7) is False
+    assert slept == [7]
+
+
+def test_wait_for_syncthing_ready_falls_back_when_api_unreachable(tmp_path, monkeypatch):
+    """Syncthing config exists but the REST API ping errors → blind fallback."""
+    base = str(tmp_path / "Sync" / "OneDrive")
+    os.makedirs(base)
+    cfg = _write_syncthing_config(tmp_path, base)
+    monkeypatch.setattr(s, 'SYNCTHING_CONFIG_PATHS', [cfg])
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', base)
+    monkeypatch.setattr(s.requests, 'get', _make_rest_router({
+        "/rest/system/ping": None,  # simulate unreachable daemon
+    }))
+    slept = []
+    monkeypatch.setattr(s.time, 'sleep', lambda secs: slept.append(secs))
+    assert s._wait_for_syncthing_ready(fallback_grace_seconds=9) is False
+    assert slept == [9]
+
+
+def test_wait_for_syncthing_ready_times_out_then_falls_back(tmp_path, monkeypatch):
+    """Daemon is up but never reaches in-sync within the timeout → blind
+    fallback. The poll-sleep is patched out so the timeout is reached fast."""
+    base = str(tmp_path / "Sync" / "OneDrive")
+    os.makedirs(base)
+    cfg = _write_syncthing_config(tmp_path, base)
+    monkeypatch.setattr(s, 'SYNCTHING_CONFIG_PATHS', [cfg])
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', base)
+    monkeypatch.setattr(s.requests, 'get', _make_rest_router({
+        "/rest/system/ping": {"ping": "pong"},
+        "/rest/system/connections": {"connections": {}},  # no peers ever
+        "/rest/db/completion": {"completion": 0.0},
+    }))
+    # Drive the clock past the deadline on the first poll-sleep; record the
+    # final blind grace-sleep separately.
+    import time as _t
+    t0 = _t.time()
+    fake_now = {"v": t0}
+    monkeypatch.setattr(s.time, 'time', lambda: fake_now["v"])
+    blind = []
+
+    def fake_sleep(secs):
+        fake_now["v"] += 1000  # jump past the deadline so the loop exits
+        blind.append(secs)
+    monkeypatch.setattr(s.time, 'sleep', fake_sleep)
+    assert s._wait_for_syncthing_ready(timeout_seconds=10, fallback_grace_seconds=3) is False
+    # The last sleep is the blind grace-sleep with the configured fallback.
+    assert blind[-1] == 3
+
+
+# --- First-fire-wins lecture-sync marker (per-course-per-window) -------------
+# --lecture-sync fires three times per lecture on BOTH hosts and each fire
+# rewrites the same per-course METADATA.md — the root of a recurring conflict
+# cluster. A small synced .lecture_sync_state.json marker lets the first fire
+# (on either host) claim the window so the others skip.
+
+def _make_tracked_course(folder):
+    return s.TrackedCourse(
+        metadata_path=os.path.join(folder, "METADATA.md"),
+        course_folder=folder,
+        course_title="Test Course",
+        source_url="https://studon.fau.de/course/1",
+        timetable_titles=[],
+    )
+
+
+def test_lecture_window_key_shared_across_three_fires(tmp_path):
+    """All three fires (−5m / start / +5m) of one lecture share ONE key, so the
+    first fire on either host claims the whole window."""
+    from datetime import datetime, timedelta
+    course = _make_tracked_course(str(tmp_path / "MyCourse"))
+    start = datetime(2026, 6, 8, 10, 0, 0)
+    # The marker is keyed by the lecture START, not the fire time — so callers
+    # always derive `lecture_start` and pass that; here we assert the key is
+    # identical regardless of which fire produced that start.
+    k = s._lecture_window_key(course, start)
+    assert s._lecture_window_key(course, start) == k
+    # A different day or a different start time is a different key.
+    assert s._lecture_window_key(course, start + timedelta(days=1)) != k
+    assert s._lecture_window_key(course, start.replace(hour=12)) != k
+
+
+def test_lecture_already_synced_roundtrip(tmp_path, monkeypatch):
+    from datetime import datetime
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', str(tmp_path))
+    course = _make_tracked_course(str(tmp_path / "MyCourse"))
+    start = datetime(2026, 6, 8, 10, 0, 0)
+    assert s._lecture_already_synced(course, start) is False
+    s._mark_lecture_synced(course, start)
+    assert s._lecture_already_synced(course, start) is True
+
+
+def test_lecture_marker_records_host_and_timestamp(tmp_path, monkeypatch):
+    import json as _json
+    from datetime import datetime
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', str(tmp_path))
+    course = _make_tracked_course(str(tmp_path / "MyCourse"))
+    start = datetime(2026, 6, 8, 10, 0, 0)
+    s._mark_lecture_synced(course, start)
+    state = _json.loads((tmp_path / s.LECTURE_SYNC_STATE_FILE).read_text())
+    (entry,) = state.values()
+    assert entry["host"]            # this host's identity is recorded
+    assert entry["ts"]              # and a timestamp the sibling can read
+
+
+def test_lecture_marker_prunes_stale_entries(tmp_path, monkeypatch):
+    """Old entries (beyond the retention window) are dropped on each write so
+    the synced marker file can't grow without bound."""
+    import json as _json
+    from datetime import datetime, timedelta
+    monkeypatch.setattr(s, 'DOWNLOAD_FOLDER', str(tmp_path))
+    course = _make_tracked_course(str(tmp_path / "MyCourse"))
+    # Seed a marker far older than the retention window, by its key's date.
+    old_date = (datetime.now() - timedelta(days=s.LECTURE_SYNC_STATE_RETENTION_DAYS + 5))
+    old_key = s._lecture_window_key(course, old_date)
+    path = tmp_path / s.LECTURE_SYNC_STATE_FILE
+    path.write_text(_json.dumps({old_key: {"host": "ancient", "ts": "x"}}))
+    # A fresh write must prune the ancient key and keep the new one.
+    now_start = datetime.now().replace(second=0, microsecond=0)
+    s._mark_lecture_synced(course, now_start)
+    state = _json.loads(path.read_text())
+    assert old_key not in state
+    assert s._lecture_window_key(course, now_start) in state

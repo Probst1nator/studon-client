@@ -1943,8 +1943,214 @@ def was_updated_today(state: UpdateState) -> bool:
     return last_update_date == today
 
 # Grace window for the first-boot-wins guard: how long to wait for Syncthing
-# to deliver another fleet host's sync state before deciding to scrape.
+# to deliver another fleet host's sync state before deciding to scrape. Used as
+# the blind-sleep fallback inside the Syncthing readiness gate below, so it is
+# defined here (before that gate) rather than next to _fleet_synced_today().
 FLEET_SYNC_GRACE_SECONDS = 120.0
+
+# --- POST-BOOT SYNCTHING READINESS GATE (root-cause fix for both daemons) ---
+#
+# Both the Workstation and the Ideapad run their sync daemons from `@reboot`,
+# which fires *before* Syncthing has connected to its peers. Each host then
+# reads stale local state ("nobody synced today" / no fleet marker yet) and so
+# every host scrapes — and every shared output file (RECENT_UPDATES.md,
+# per-course METADATA.md, "Link to StudOn.html") becomes a Syncthing conflict.
+#
+# This gate blocks until the *local* Syncthing daemon has (a) connected to at
+# least one peer and (b) the folder replicating our DOWNLOAD_FOLDER is in-sync,
+# so a sibling host's "already-done" state is actually delivered before any
+# first-fire-wins guard decides. It is deliberately best-effort: if Syncthing
+# is down, the API key can't be read, the REST call errors, or no peers are
+# configured, it falls back to the old blind grace-sleep and lets the scrape
+# proceed — it must never crash the scrape and never hang past the timeout.
+
+# Local Syncthing REST API base (GUI address). Localhost-only by config.
+SYNCTHING_API_BASE = "http://127.0.0.1:8384"
+# Syncthing config.xml carrying the <apikey> and <folder> definitions. On
+# syncthing >=1.27 the XDG_STATE_HOME default is ~/.local/state/syncthing/.
+SYNCTHING_CONFIG_PATHS = [
+    os.path.expanduser("~/.local/state/syncthing/config.xml"),
+    os.path.expanduser("~/.config/syncthing/config.xml"),
+]
+# Hard ceiling on how long the readiness gate may block before giving up and
+# falling back to the blind grace-sleep. Sized > FLEET_SYNC_GRACE_SECONDS so
+# the gate normally supersedes (rather than stacks on top of) the blind wait.
+SYNCTHING_READINESS_TIMEOUT_SECONDS = 180.0
+# Poll cadence while waiting for peers + folder completion.
+SYNCTHING_READINESS_POLL_SECONDS = 5.0
+# A folder is treated as in-sync once REST completion is at or above this.
+SYNCTHING_COMPLETION_THRESHOLD = 99.0
+
+
+def _read_syncthing_config() -> Optional[Tuple[str, Dict[str, str]]]:
+    """Read the local Syncthing config.xml at runtime.
+
+    Returns ``(apikey, {abs_folder_path: folder_id})`` or ``None`` if no config
+    file exists or it can't be parsed. The API key is read fresh on every call
+    and never hardcoded; folder paths are expanded so they can be matched
+    against DOWNLOAD_FOLDER.
+    """
+    import xml.etree.ElementTree as ET
+
+    for cfg_path in SYNCTHING_CONFIG_PATHS:
+        if not os.path.exists(cfg_path):
+            continue
+        try:
+            root = ET.parse(cfg_path).getroot()
+        except (ET.ParseError, OSError) as e:
+            logger.debug(f"Syncthing config {cfg_path} unparseable: {e}")
+            continue
+        apikey_el = root.find("./gui/apikey")
+        apikey = (apikey_el.text or "").strip() if apikey_el is not None else ""
+        if not apikey:
+            logger.debug(f"Syncthing config {cfg_path} has no apikey.")
+            continue
+        folders: Dict[str, str] = {}
+        for folder_el in root.findall("./folder"):
+            fid = folder_el.get("id", "")
+            fpath = folder_el.get("path", "")
+            if fid and fpath:
+                folders[os.path.realpath(os.path.expanduser(fpath))] = fid
+        return apikey, folders
+    return None
+
+
+def _syncthing_folder_id_for_path(path: str, folders: Dict[str, str]) -> Optional[str]:
+    """Find the Syncthing folder id whose path is `path` or an ancestor of it.
+
+    DOWNLOAD_FOLDER is typically a sub-path of a shared folder (e.g.
+    ~/Synced/OneDrive/Studium/KIM4 inside the `OneDrive` folder), so we pick
+    the longest matching folder root that contains `path`.
+    """
+    target = os.path.realpath(os.path.expanduser(path))
+    best_id: Optional[str] = None
+    best_len = -1
+    for froot, fid in folders.items():
+        if target == froot or target.startswith(froot + os.sep):
+            if len(froot) > best_len:
+                best_id, best_len = fid, len(froot)
+    return best_id
+
+
+def _syncthing_get(endpoint: str, apikey: str, timeout: float = 5.0) -> Optional[dict]:
+    """GET a Syncthing REST endpoint with the X-API-Key header.
+
+    Returns the parsed JSON dict, or None on any transport/parse error (the
+    caller treats None as "not ready yet / can't tell").
+    """
+    try:
+        resp = requests.get(
+            SYNCTHING_API_BASE + endpoint,
+            headers={"X-API-Key": apikey},
+            timeout=timeout,
+        )
+        if resp.status_code != 200:
+            logger.debug(f"Syncthing GET {endpoint} -> HTTP {resp.status_code}")
+            return None
+        return resp.json()
+    except Exception as e:
+        logger.debug(f"Syncthing GET {endpoint} failed: {e}")
+        return None
+
+
+def _syncthing_is_ready(folder_id: str, apikey: str) -> bool:
+    """One readiness probe: is a peer connected AND the folder in-sync?
+
+    (a) /rest/system/connections — at least one peer with connected=True.
+    (b) /rest/db/completion?folder=<id> — global completion >= threshold.
+    Returns False (not ready) whenever either probe can't be answered.
+    """
+    conns = _syncthing_get("/rest/system/connections", apikey)
+    if not conns:
+        return False
+    peers = conns.get("connections", {}) or {}
+    if not any(info.get("connected") for info in peers.values()):
+        logger.debug("Syncthing: no peers connected yet.")
+        return False
+
+    completion = _syncthing_get(f"/rest/db/completion?folder={folder_id}", apikey)
+    if completion is None:
+        return False
+    pct = completion.get("completion")
+    if pct is None:
+        return False
+    if pct < SYNCTHING_COMPLETION_THRESHOLD:
+        logger.debug(f"Syncthing: folder {folder_id} at {pct:.1f}% (< threshold).")
+        return False
+    return True
+
+
+def _wait_for_syncthing_ready(
+    folder_path: Optional[str] = None,
+    timeout_seconds: float = SYNCTHING_READINESS_TIMEOUT_SECONDS,
+    poll_seconds: float = SYNCTHING_READINESS_POLL_SECONDS,
+    fallback_grace_seconds: float = FLEET_SYNC_GRACE_SECONDS,
+) -> bool:
+    """Block until the local Syncthing has delivered fresh fleet state.
+
+    Polls the local Syncthing REST API until a peer is connected and the folder
+    replicating `folder_path` reports in-sync, up to `timeout_seconds`. Returns
+    True when readiness was confirmed via the API. `folder_path` defaults to the
+    live DOWNLOAD_FOLDER global (resolved at call time, so --set-download-path
+    and test monkeypatching are honoured).
+
+    Graceful degradation (mandatory) — in every failure mode this falls back to
+    the legacy blind `time.sleep(fallback_grace_seconds)` and returns False,
+    so the caller's existing state re-check still runs and the scrape proceeds:
+      * Syncthing config / API key can't be read,
+      * the DOWNLOAD_FOLDER isn't covered by any Syncthing folder,
+      * the REST API is unreachable or keeps erroring,
+      * readiness isn't reached before the timeout.
+    It never raises and never blocks past `timeout_seconds`.
+    """
+    def _blind_fallback(reason: str) -> bool:
+        if fallback_grace_seconds > 0:
+            logger.info(
+                f"Syncthing readiness gate: {reason} — falling back to a "
+                f"{fallback_grace_seconds:.0f}s blind grace-sleep."
+            )
+            time.sleep(fallback_grace_seconds)
+        else:
+            logger.info(f"Syncthing readiness gate: {reason} — continuing.")
+        return False
+
+    if folder_path is None:
+        folder_path = DOWNLOAD_FOLDER
+
+    cfg = _read_syncthing_config()
+    if cfg is None:
+        return _blind_fallback("Syncthing config/API key unavailable")
+    apikey, folders = cfg
+    folder_id = _syncthing_folder_id_for_path(folder_path, folders)
+    if folder_id is None:
+        return _blind_fallback(
+            f"no Syncthing folder covers {folder_path}"
+        )
+
+    deadline = time.time() + timeout_seconds
+    probed_alive = False
+    while time.time() < deadline:
+        # First probe doubles as an "is Syncthing even up?" check.
+        if not probed_alive:
+            if _syncthing_get("/rest/system/ping", apikey) is None:
+                return _blind_fallback("Syncthing REST API not reachable")
+            probed_alive = True
+            logger.info(
+                f"Syncthing readiness gate: waiting for peer + folder '{folder_id}' "
+                f"in-sync (up to {timeout_seconds:.0f}s)."
+            )
+        if _syncthing_is_ready(folder_id, apikey):
+            logger.info(
+                f"Syncthing readiness gate: folder '{folder_id}' in-sync with a "
+                "connected peer — fleet state is fresh."
+            )
+            return True
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.time())))
+
+    return _blind_fallback(
+        f"folder '{folder_id}' not in-sync within {timeout_seconds:.0f}s"
+    )
+
 
 def _fleet_synced_today(grace_seconds: float = FLEET_SYNC_GRACE_SECONDS) -> bool:
     """First-boot-wins guard: has another fleet host already synced today?
@@ -1957,21 +2163,117 @@ def _fleet_synced_today(grace_seconds: float = FLEET_SYNC_GRACE_SECONDS) -> bool
     scraped — every shared output file (METADATA.md etc.) then conflicted.
 
     This guard is meant to be called right before scraping. If the state still
-    says "not synced today", it waits `grace_seconds` to give Syncthing a
-    chance to deliver a fresher state file from a sibling host, then checks
-    once more. Returns True if today's sync is already done (caller skips).
+    says "not synced today", it waits for Syncthing to actually deliver a
+    fresher state file from a sibling host via the readiness gate
+    (`_wait_for_syncthing_ready`, which polls peer-connection + folder
+    completion and degrades to a blind `grace_seconds` sleep when the REST API
+    is unavailable), then checks once more. Returns True if today's sync is
+    already done (caller skips).
     """
     if was_updated_today(load_state()):
         return True
     if grace_seconds > 0:
         logger.info(
-            f"Daily sync: no fleet sync recorded today — waiting {grace_seconds:.0f}s "
-            "for Syncthing to deliver a possibly fresher state, then re-checking."
+            "Daily sync: no fleet sync recorded today — waiting for Syncthing to "
+            "deliver a possibly fresher state, then re-checking."
         )
-        time.sleep(grace_seconds)
+        _wait_for_syncthing_ready(fallback_grace_seconds=grace_seconds)
         if was_updated_today(load_state()):
             return True
     return False
+
+
+# --- FIRST-FIRE-WINS GUARD FOR --lecture-sync (per-course-per-window) ---
+#
+# Same idea as _fleet_synced_today() but at finer granularity: --lecture-sync
+# fires three times per lecture (start-5m / start / start+5m) on BOTH hosts,
+# and each fire writes the same per-course METADATA.md / "Link to StudOn.html".
+# That is the root of the recurring METADATA.md conflict cluster. We persist a
+# tiny marker INTO the synced tree so a sibling host (and our own later fires)
+# can see "this course's window was already serviced today" and skip.
+#
+# The marker lives in its OWN small file rather than inside METADATA.md on
+# purpose: METADATA.md is itself the file that conflicts, and every host
+# rewriting it re-creates the churn we are trying to kill. A dedicated
+# .lecture_sync_state.json keyed by course+date+window keeps the conflict
+# surface tiny (one short JSON dict) and, being append-keyed, merges cleanly.
+LECTURE_SYNC_STATE_FILE = ".lecture_sync_state.json"
+# Markers older than this many days are pruned on each write so the file
+# doesn't grow unbounded (one key per course per lecture per day).
+LECTURE_SYNC_STATE_RETENTION_DAYS = 14
+
+
+def _lecture_sync_state_path() -> str:
+    """Path of the synced per-course-per-window marker file."""
+    return os.path.join(DOWNLOAD_FOLDER, LECTURE_SYNC_STATE_FILE)
+
+
+def _lecture_window_key(course: TrackedCourse, lecture_start: datetime) -> str:
+    """Stable key for one course's lecture window on one day.
+
+    All three fires of a lecture (start-5m / start / start+5m) share the same
+    key because it is built from the lecture's START time, not the fire time —
+    so the first fire on either host claims the whole window.
+    """
+    course_id = os.path.basename(os.path.normpath(course.course_folder))
+    return f"{course_id}|{lecture_start.strftime('%Y-%m-%d')}|{lecture_start.strftime('%H:%M')}"
+
+
+def _load_lecture_sync_state() -> dict:
+    """Read .lecture_sync_state.json (synced). Returns {} when missing/broken."""
+    path = _lecture_sync_state_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug(f"lecture_sync_state unreadable, treating as empty: {e}")
+        return {}
+
+
+def _lecture_already_synced(course: TrackedCourse, lecture_start: datetime) -> bool:
+    """True if some fleet host already serviced this course+window today."""
+    key = _lecture_window_key(course, lecture_start)
+    return key in _load_lecture_sync_state()
+
+
+def _mark_lecture_synced(course: TrackedCourse, lecture_start: datetime) -> None:
+    """Record that this host serviced course+window, so peers/later fires skip.
+
+    Reads-modifies-writes the synced marker file with this host's identity and a
+    timestamp, pruning entries older than the retention window. Best-effort:
+    any I/O error is logged and swallowed (a failed marker just means a sibling
+    might double-scrape once, not a crash).
+    """
+    import socket
+    key = _lecture_window_key(course, lecture_start)
+    state = _load_lecture_sync_state()
+    # Prune stale keys (date is the middle field of the key).
+    cutoff = (datetime.now() - timedelta(days=LECTURE_SYNC_STATE_RETENTION_DAYS)).date()
+    pruned = {}
+    for k, v in state.items():
+        parts = k.split('|')
+        try:
+            kdate = datetime.strptime(parts[1], '%Y-%m-%d').date()
+        except (IndexError, ValueError):
+            continue  # drop malformed keys
+        if kdate >= cutoff:
+            pruned[k] = v
+    pruned[key] = {
+        "host": socket.gethostname(),
+        "ts": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    path = _lecture_sync_state_path()
+    try:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(pruned, f, indent=2, ensure_ascii=False, sort_keys=True)
+            f.write("\n")
+    except OSError as e:
+        logger.warning(f"Could not write lecture-sync marker {path}: {e}")
+
 
 def update_all_courses(debug: bool = False, session: Optional[requests.Session] = None) -> Tuple[bool, int, int, bool, List[str]]:
     """Update all courses by scanning METADATA.md files.
@@ -2572,6 +2874,29 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
             if course is None:
                 continue
 
+            # The lecture's START time (not the fire time) keys the per-window
+            # marker, so all three fires (−5m / start / +5m) on either host
+            # share one key. Derive it from the entry's parsed start time on the
+            # fire's date; fall back to the fire time itself if unparseable.
+            lecture_start = fire_time
+            _times = _parse_entry_times(lecture.entry.get('time', ''))
+            if _times is not None:
+                lecture_start = fire_time.replace(
+                    hour=_times[0], minute=_times[1], second=0, microsecond=0)
+
+            # First-fire-wins: gate on Syncthing readiness so a sibling host's
+            # marker is actually delivered, then check it. If this course+window
+            # was already serviced today (by the other host or an earlier fire),
+            # skip — this is the per-lecture analogue of _fleet_synced_today().
+            _wait_for_syncthing_ready()
+            if _lecture_already_synced(course, lecture_start):
+                logger.info(
+                    f"Lecture sync: '{course.course_title}' window "
+                    f"{lecture_start.strftime('%Y-%m-%d %H:%M')} already serviced by "
+                    "another fleet host (or an earlier fire); skipping."
+                )
+                continue
+
             if not can_access_studon():
                 logger.info(f"Lecture sync: not logged in at fire {fire_time.isoformat()}; "
                             f"opening tray (max {tray_wait_seconds}s).")
@@ -2585,9 +2910,21 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
                 logger.info("Lecture sync: another sync is running; skipping this fire.")
                 continue
             try:
+                # Re-check the marker inside the lock (no extra wait): closes the
+                # race where the sibling's marker arrived during the steps above.
+                if _lecture_already_synced(course, lecture_start):
+                    logger.info(
+                        f"Lecture sync: '{course.course_title}' window serviced by a "
+                        "sibling while acquiring the lock; skipping."
+                    )
+                    continue
                 logger.info(f"Lecture sync: fetching '{course.course_title}'")
                 try:
                     downloaded, extracted, downloaded_paths = _lecture_fetch_one(course)
+                    # Claim the window so the other host (and our own later
+                    # fires) skip — write the marker even when nothing new was
+                    # downloaded, because the scrape itself is what conflicts.
+                    _mark_lecture_synced(course, lecture_start)
                     if downloaded:
                         _send_desktop_notification(downloaded, extracted, downloaded_paths)
                         logger.info(f"Lecture sync: {downloaded} new, {extracted} extracted.")
