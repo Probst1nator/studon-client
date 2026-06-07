@@ -2433,7 +2433,7 @@ def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = N
     even if the user has not interacted. Used by --lecture-sync to
     avoid blocking a fire window indefinitely.
     """
-    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+    if not _has_display():
         return False
     try:
         import threading
@@ -2508,10 +2508,34 @@ def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = N
     return state["logged_in"]
 
 
+def _has_display() -> bool:
+    """True if a graphical session is available to show the login tray icon."""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+# When --daily-sync runs in a headless/no-display context (the @reboot cron on a
+# server with no interactive session) and the StudOn session is expired, there is
+# no way for a human to complete the Firefox login — the tray icon can't be shown.
+# Polling forever in that case just thrashed the Workstation log on 2026-06-07
+# (an expired session at boot spun every few minutes until killed by hand). Bound
+# the total no-display wait and exit instead; the @reboot cron retries on next
+# boot and the fleet-guard (_fleet_synced_today) covers today. A real desktop
+# session (display present) keeps the unbounded tray wait — the user can still log
+# in there, so we must not give up on them.
+DAILY_SYNC_HEADLESS_MAX_WAIT_SECONDS = float(
+    os.getenv('STUDON_DAILY_SYNC_HEADLESS_MAX_WAIT_SECONDS', str(30 * 60))
+)
+
+
 def run_daily_sync(check_interval_seconds: int = 300) -> None:
     """
     Run until a daily sync is performed, then exit.
     Waits for StudOn login (via Firefox cookies) and performs sync once per day.
+
+    In a headless/no-display context the login can never be completed (no tray,
+    no human), so the wait is bounded by DAILY_SYNC_HEADLESS_MAX_WAIT_SECONDS and
+    the function returns rather than polling forever; @reboot + fleet-guard cover
+    the rest. With a graphical session the wait stays unbounded.
 
     Args:
         check_interval_seconds: How often to check for StudOn access (default: 5 minutes)
@@ -2529,6 +2553,7 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
     logger.debug(f"Daily sync started, checking every {check_interval_seconds // 60}m")
 
     waiting_logged = False
+    headless_wait_started: Optional[float] = None
     while True:
         try:
             if not can_access_studon():
@@ -2543,9 +2568,26 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                 tray_ok = _wait_for_login_via_tray(login_url)
                 if not tray_ok:
                     # Tray unavailable, user quit, or icon errored — poll silently.
+                    if not _has_display():
+                        # No graphical session: a human can never complete the
+                        # Firefox login here, so bound the total wait instead of
+                        # spinning forever (the 2026-06-07 Workstation incident).
+                        now = time.time()
+                        if headless_wait_started is None:
+                            headless_wait_started = now
+                        elif now - headless_wait_started >= DAILY_SYNC_HEADLESS_MAX_WAIT_SECONDS:
+                            logger.warning(
+                                "Daily sync: session expired and no display to prompt "
+                                f"login — gave up after {int(now - headless_wait_started)}s. "
+                                "Will retry on next @reboot; fleet-guard covers today."
+                            )
+                            return
                     time.sleep(check_interval_seconds)
                 waiting_logged = False
                 continue
+            # Session is accessible again — reset the headless give-up timer so a
+            # later mid-run expiry starts its own bounded wait, not a stale one.
+            headless_wait_started = None
 
             # First-boot-wins guard: another fleet host (Workstation/Ideapad)
             # may have completed today's sync while this daemon was waiting

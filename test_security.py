@@ -773,3 +773,81 @@ def test_lecture_marker_prunes_stale_entries(tmp_path, monkeypatch):
     state = _json.loads(path.read_text())
     assert old_key not in state
     assert s._lecture_window_key(course, now_start) in state
+
+
+# --- Headless daily-sync login-wait bound -----------------------------------
+# run_daily_sync waits for a Firefox login when the StudOn session is expired.
+# In a headless @reboot/cron context (no DISPLAY) no human can ever complete
+# that login, so the wait must be bounded and the daemon must exit — otherwise
+# it polls forever (the 2026-06-07 Workstation incident: an expired session at
+# boot spun the log every few minutes until killed by hand). With a graphical
+# session the wait must stay unbounded so the user can still log in.
+
+def _stub_daily_sync_preamble(monkeypatch):
+    """Neuter everything before the wait loop so the loop is what we exercise:
+    platform check, state load, and 'already updated today' all pass through to
+    'session expired, keep waiting'."""
+    monkeypatch.setattr(s, 'check_platform_compatibility', lambda: None)
+    monkeypatch.setattr(s, 'load_state', lambda: None)
+    monkeypatch.setattr(s, 'was_updated_today', lambda state: False)
+    monkeypatch.setattr(s, 'can_access_studon', lambda: False)   # session never returns
+    monkeypatch.setattr(s, '_wait_for_login_via_tray', lambda *a, **k: False)
+    monkeypatch.setattr(s, '_get_first_course_url', lambda: 'https://studon.fau.de/')
+
+
+def test_daily_sync_headless_gives_up_instead_of_looping_forever(monkeypatch):
+    """No display + expired session → bound the wait and return, don't spin."""
+    _stub_daily_sync_preamble(monkeypatch)
+    monkeypatch.setattr(s, '_has_display', lambda: False)         # headless
+    monkeypatch.setattr(s, 'DAILY_SYNC_HEADLESS_MAX_WAIT_SECONDS', 1800.0)
+
+    import time as _t
+    fake_now = {"v": _t.time()}
+    monkeypatch.setattr(s.time, 'time', lambda: fake_now["v"])
+
+    calls = {"n": 0}
+
+    def fake_sleep(secs):
+        calls["n"] += 1
+        if calls["n"] > 50:
+            raise AssertionError("run_daily_sync did not terminate — headless bound is broken")
+        fake_now["v"] += 10_000  # jump past the give-up deadline
+    monkeypatch.setattr(s.time, 'sleep', fake_sleep)
+
+    assert s.run_daily_sync() is None          # returns, does not hang
+    assert calls["n"] <= 3                      # gives up within a couple polls
+
+
+def test_daily_sync_with_display_does_not_give_up(monkeypatch):
+    """A graphical session is present → the wait stays unbounded even well past
+    the headless cap; the give-up branch must never fire. Proven by raising a
+    sentinel out of sleep after a few iterations and asserting it propagates
+    (the function kept looping instead of returning)."""
+    class _LoopStop(BaseException):
+        pass
+
+    _stub_daily_sync_preamble(monkeypatch)
+    monkeypatch.setattr(s, '_has_display', lambda: True)          # graphical session
+    monkeypatch.setattr(s, 'DAILY_SYNC_HEADLESS_MAX_WAIT_SECONDS', 1.0)  # tiny cap
+
+    import time as _t
+    t0 = _t.time()
+    # Clock is already far past the (tiny) cap on every poll — a headless run
+    # would give up at once; a display run must keep looping regardless.
+    monkeypatch.setattr(s.time, 'time', lambda: t0 + 10_000)
+
+    calls = {"n": 0}
+
+    def fake_sleep(secs):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise _LoopStop()
+    monkeypatch.setattr(s.time, 'sleep', fake_sleep)
+
+    raised = False
+    try:
+        s.run_daily_sync()
+    except _LoopStop:
+        raised = True
+    assert raised, "with a display present, run_daily_sync must NOT give up — it returned"
+    assert calls["n"] == 3                       # kept looping past the cap
