@@ -55,7 +55,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import zipfile
 import tarfile
 import argparse
@@ -1912,6 +1912,30 @@ def can_access_studon() -> bool:
         logger.debug(f"Cannot access StudOn: {e}")
         return False
 
+def can_access_campo() -> bool:
+    """
+    Verify we can reach campo.fau.de with Firefox cookies (i.e. the session
+    is authenticated). Does a lightweight GET to a campo flow page and checks
+    we are not bounced to the IdP login. Returns True if campo content serves.
+    """
+    try:
+        cj = browser_cookie3.firefox(domain_name='campo.fau.de')
+        session = requests.Session()
+        session.cookies.update(cj)
+        session.headers.update({'User-Agent': 'Mozilla/5.0'})
+        r = session.get(CAMPO_STUDY_PLANNER_URL, timeout=10, allow_redirects=True)
+        if r.status_code != 200:
+            return False
+        # IdP redirect / login form means we are not authenticated yet.
+        if 'idp.fau.de' in r.url or 'login' in r.url.lower():
+            return False
+        if 'j_security_check' in r.text or 'SAMLRequest' in r.text:
+            return False
+        return True
+    except Exception as e:
+        logger.debug(f"Cannot access campo: {e}")
+        return False
+
 def load_state() -> UpdateState:
     """Load the last update timestamp from RECENT_UPDATES.md."""
     recent_updates_path = os.path.join(DOWNLOAD_FOLDER, "RECENT_UPDATES.md")
@@ -2418,8 +2442,109 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optio
         logger.debug(f"Desktop notification failed: {e}")
 
 
-def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = None) -> bool:
-    """Show a tray icon while polling for a valid StudOn login.
+def _notify_env() -> dict:
+    """Environment for notify-send, self-discovering DBUS when run from cron.
+
+    The @reboot cron context has no DBUS_SESSION_BUS_ADDRESS, so notify-send
+    can't reach the session bus. Inherit it from a running user process, then
+    fall back to the well-known per-user socket path.
+    """
+    env = os.environ.copy()
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        try:
+            uid = os.getuid()
+            result = subprocess.run(
+                ["grep", "-z", "DBUS_SESSION_BUS_ADDRESS", f"/proc/{uid}/environ"],
+                capture_output=True, text=True
+            )
+            for line in result.stdout.replace('\x00', '\n').splitlines():
+                if line.startswith("DBUS_SESSION_BUS_ADDRESS="):
+                    env["DBUS_SESSION_BUS_ADDRESS"] = line.split("=", 1)[1]
+                    break
+        except Exception:
+            pass
+        if "DBUS_SESSION_BUS_ADDRESS" not in env:
+            uid = os.getuid()
+            env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    return env
+
+
+# One-click login prompt state. Holds the live notify-send process so a later
+# successful login can dismiss the still-open notification, and the last-fire
+# epoch so repeated poll cycles don't stack a notification per cycle.
+_login_prompt: dict = {"proc": None, "last_fire": 0.0}
+
+
+def _notify_login_required(login_url: str, refire_after_seconds: float = 600.0) -> None:
+    """Fire a clickable desktop notification asking the user to log into StudOn.
+
+    Visible, one-click: clicking the "In Firefox einloggen" action opens the
+    login URL in the browser. The caller's existing poll loop then picks up the
+    refreshed Firefox cookie on its next cycle (no extra wiring needed — polling
+    already happens). The (blocking, --action implies --wait) notify-send call
+    runs in a daemon thread so the poll loop is never blocked, and is
+    de-duplicated so repeated polls don't spam one notification per cycle.
+
+    Unlike the tray icon, this needs only DBUS (not DISPLAY), so it works even
+    from the headless @reboot cron context.
+    """
+    if not shutil.which("notify-send"):
+        return
+    import threading
+    now = time.time()
+    proc = _login_prompt.get("proc")
+    if proc is not None and proc.poll() is None:
+        return  # a prompt is already on screen
+    if now - _login_prompt.get("last_fire", 0.0) < refire_after_seconds:
+        return  # fired recently — don't re-nag every poll cycle
+    _login_prompt["last_fire"] = now
+    try:
+        proc = subprocess.Popen(
+            ["notify-send", "--app-name=StudOn Scraper", "--icon=dialog-password",
+             "--urgency=critical", "--action=login=In Firefox einloggen",
+             "StudOn-Login abgelaufen",
+             "Sync pausiert. Klicken zum Einloggen — danach holt der Sync automatisch nach."],
+            env=_notify_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except Exception as e:
+        logger.debug(f"Login notification failed: {e}")
+        return
+    _login_prompt["proc"] = proc
+
+    def _wait_for_click() -> None:
+        try:
+            out, _ = proc.communicate(timeout=3600)
+            if out and "login" in out:
+                logger.info("Login notification clicked — opening StudOn login in browser.")
+                _open_url_in_browser(login_url)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"Login notification click-wait failed: {e}")
+
+    threading.Thread(target=_wait_for_click, daemon=True).start()
+
+
+def _dismiss_login_prompt() -> None:
+    """Close any still-open 'login required' notification after a successful login."""
+    proc = _login_prompt.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    _login_prompt["proc"] = None
+
+
+def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = None,
+                             access_check: Callable[[], bool] = can_access_studon) -> bool:
+    """Show a tray icon while polling for a valid login.
+
+    access_check: the predicate polled to detect a successful login. Defaults
+    to can_access_studon; pass can_access_campo for a campo (re-)login.
 
     Returns True when login is detected, False if the tray library is not
     available / no display, the user quits via the menu, or the optional
@@ -2467,10 +2592,9 @@ def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = N
         icon.stop()
 
     def poller(icon):
-        icon.visible = True
         while not stop_event.is_set():
             try:
-                if can_access_studon():
+                if access_check():
                     state["logged_in"] = True
                     icon.stop()
                     return
@@ -2489,6 +2613,10 @@ def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = N
                 interval = min(interval, max(1, int(deadline - time.time())))
             stop_event.wait(interval)
 
+    def setup(icon):
+        icon.visible = True
+        threading.Thread(target=poller, args=(icon,), daemon=True).start()
+
     menu = pystray.Menu(
         pystray.MenuItem("Open StudOn login", open_login, default=True),
         pystray.MenuItem("Check now", lambda icon, item: state.update(fast_until=time.time() + 120)),
@@ -2496,10 +2624,8 @@ def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = N
     )
     icon = pystray.Icon("studon-client", img, "StudOn: waiting for login", menu)
 
-    thread = threading.Thread(target=poller, args=(icon,), daemon=True)
-    thread.start()
     try:
-        icon.run()
+        icon.run(setup=setup)
     except Exception as e:
         logger.warning(f"Tray icon failed to run: {e}; falling back to silent polling.")
         stop_event.set()
@@ -2557,14 +2683,21 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
     while True:
         try:
             if not can_access_studon():
-                if not waiting_logged:
-                    logger.info("Daily sync: waiting for StudOn login (tray icon active)")
-                    waiting_logged = True
                 login_url = f"https://{STUDON_DOMAIN}"
                 try:
                     login_url = _get_first_course_url()
                 except Exception:
                     pass
+                if not waiting_logged:
+                    logger.info(
+                        "Daily sync: waiting for StudOn login (%s)",
+                        "tray icon active" if _has_display()
+                        else "no display — desktop notification only",
+                    )
+                    waiting_logged = True
+                # Visible, one-click login prompt (DBUS-only, works headless);
+                # de-duped internally so it doesn't re-nag every poll cycle.
+                _notify_login_required(login_url)
                 tray_ok = _wait_for_login_via_tray(login_url)
                 if not tray_ok:
                     # Tray unavailable, user quit, or icon errored — poll silently.
@@ -2586,8 +2719,10 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                 waiting_logged = False
                 continue
             # Session is accessible again — reset the headless give-up timer so a
-            # later mid-run expiry starts its own bounded wait, not a stale one.
+            # later mid-run expiry starts its own bounded wait, not a stale one,
+            # and dismiss any still-open "login required" notification.
             headless_wait_started = None
+            _dismiss_login_prompt()
 
             # First-boot-wins guard: another fleet host (Workstation/Ideapad)
             # may have completed today's sync while this daemon was waiting
@@ -2940,13 +3075,19 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
                 continue
 
             if not can_access_studon():
-                logger.info(f"Lecture sync: not logged in at fire {fire_time.isoformat()}; "
-                            f"opening tray (max {tray_wait_seconds}s).")
                 login_url = course.source_url or f"https://{STUDON_DOMAIN}"
+                logger.info(
+                    f"Lecture sync: not logged in at fire {fire_time.isoformat()}; "
+                    + (f"opening tray (max {tray_wait_seconds}s)." if _has_display()
+                       else "firing desktop notification (no display for tray).")
+                )
+                # Visible, one-click login prompt (works headless via DBUS).
+                _notify_login_required(login_url)
                 tray_ok = _wait_for_login_via_tray(login_url, max_wait_seconds=tray_wait_seconds)
                 if not tray_ok or not can_access_studon():
-                    logger.info("Lecture sync: still not logged in after tray window; skipping this fire.")
+                    logger.info("Lecture sync: still not logged in after tray/notification window; skipping this fire.")
                     continue
+                _dismiss_login_prompt()
 
             if not _acquire_sync_lock(f'lecture-sync:{os.path.basename(course.course_folder)}', wait_seconds=0):
                 logger.info("Lecture sync: another sync is running; skipping this fire.")
@@ -3527,6 +3668,7 @@ already has `browser-cookie3`, `beautifulsoup4`, `requests`, `questionary`.)
 
 | Intent | Command |
 |---|---|
+| (Re-)login Firefox & wait until authenticated | `$PY $SCRAPER --login campo` (or `studon` / `both`; bare `--login` == studon) |
 | Download one course by URL | `$PY $SCRAPER <studon_course_url>` |
 | Preview without downloading | `$PY $SCRAPER <url> --dry-run` |
 | Refresh every tracked course | `$PY $SCRAPER --update-all` |
@@ -3549,8 +3691,13 @@ Full architecture & dataclasses: `~/Synced/repos/AutomatedAlchemy/studon-client/
 
 - **Firefox must be logged into both StudOn and campo.** The scraper reads
   Firefox cookies via `browser-cookie3`. If the cookie is stale, the scraper
-  prints `❌ Could not load Firefox cookies` or `make sure you're logged in`.
-  Tell the user to refresh both tabs in Firefox, then re-run.
+  prints `❌ Could not load Firefox cookies`, `make sure you're logged in`, or
+  e.g. `❌ Campo personExamsReadonly not reachable. Log into campo.fau.de`.
+  Fastest fix: run `$PY $SCRAPER --login campo` (or `--login studon` /
+  `--login both`) — it auto-opens Firefox at the right login page and blocks
+  until the session is authenticated, then re-run the data command. Bare
+  `--login` defaults to `studon`. Alternatively just refresh the relevant tab
+  in Firefox manually and re-run.
 - For `--campo-pruefungen`: the user must have **manually opened each
   Prüfungs-Detailansicht in Firefox** beforehand (the `_flowExecutionKey`
   is server-side per-session state — the scraper can only iterate keys that
@@ -7176,8 +7323,38 @@ def main() -> None:
                        help='Scan FAUmail inbox for StudOn feedback notifications and download any reachable PDFs')
     parser.add_argument('--reset-feedback-state', action='store_true',
                        help='Delete .studon_feedback_state.json (forces reprocessing of all matching emails)')
+    parser.add_argument('--login', nargs='?', const='studon', default=None,
+                       choices=['studon', 'campo', 'both'], metavar='TARGET',
+                       help="Open Firefox at the login page and wait until the session is "
+                            "authenticated. TARGET selects which service: 'studon' (default), "
+                            "'campo' (campo.fau.de — for --modulplan/--belegungen/--reconcile/"
+                            "--campo-bescheinigungen), or 'both'. Bare --login == --login studon.")
 
     args = parser.parse_args()
+
+    # --- Open Firefox for (re-)login and wait ---
+    if args.login:
+        targets = ['studon', 'campo'] if args.login == 'both' else [args.login]
+        for target in targets:
+            if target == 'campo':
+                login_url = CAMPO_STUDY_PLANNER_URL
+                access_check = can_access_campo
+                label = 'campo'
+            else:
+                login_url = _get_first_course_url()
+                access_check = can_access_studon
+                label = 'StudOn'
+            print(f"Opening Firefox for {label} login…")
+            print(f"   URL: {login_url}")
+            _open_url_in_browser(login_url)
+            ok = _wait_for_login_via_tray(login_url, access_check=access_check)
+            if not ok:
+                # Tray unavailable — fall back to silent polling
+                print(f"Waiting for {label} login (checking every 10 s)…")
+                while not access_check():
+                    time.sleep(10)
+            print(f"✅ {label} session is active.")
+        return
 
     # --- Timetable export ---
     if args.timetable:
