@@ -5064,7 +5064,20 @@ def _fetch_timetable_entries() -> Optional[Tuple[str, List[Dict]]]:
         print(f"❌ Could not fetch timetable: {e}")
         return None
 
-    soup = BeautifulSoup(r.text, 'html.parser')
+    return _parse_timetable_html(r.text)
+
+
+def _parse_timetable_html(html: str) -> Optional[Tuple[str, List[Dict]]]:
+    """Parse a campo timetable page (Wochen- or Vorlesungszeitansicht) into
+    (page_title, entries).
+
+    Shared by the current-semester fetch (`_fetch_timetable_entries`) and the
+    non-current-semester fetch (`_fetch_timetable_entries_for_term`) so the
+    span-parsing lives in exactly one place. Returns None if no entries parse.
+    """
+    import re as _re
+
+    soup = BeautifulSoup(html, 'html.parser')
     title_tag = soup.title
     raw_title = title_tag.get_text(strip=True) if title_tag else "Stundenplan"
     page_title = _re.sub(r'\s*[-–]\s*campo\.fau\.de.*$', '', _re.sub(r'\s+', ' ', raw_title)).strip()
@@ -5137,6 +5150,201 @@ def _fetch_timetable_entries() -> Optional[Tuple[str, List[Dict]]]:
 
     entries.sort(key=lambda e: (e['col'], e['time']))
     return page_title, entries
+
+
+def _short_term_label(full_label: str) -> str:
+    """Compact filename token for a campo term label.
+
+    'Wintersemester 2026/27' → 'WS2627'; 'Sommersemester 2026' → 'SS26'.
+    Falls back to a slug of the raw label for anything unexpected.
+    """
+    m = re.match(r'\s*(Sommer|Winter)semester\s+(\d{4})(?:/(\d{2,4}))?', full_label)
+    if not m:
+        return re.sub(r'\W+', '', full_label) or 'term'
+    season, y1, y2 = m.group(1), m.group(2), m.group(3)
+    if season == 'Sommer':
+        return f"SS{y1[-2:]}"
+    y2s = y2[-2:] if y2 else f"{int(y1) + 1:04d}"[-2:]
+    return f"WS{y1[-2:]}{y2s}"
+
+
+def _resolve_timetable_term(page_html: str, term_spec: str) -> Optional[Tuple[str, str, str]]:
+    """Resolve a --term specifier against the changeTerm select on a campo
+    timetable page. Returns (term_id, full_label, short_label) or None.
+
+    Accepts the campo-search style ``eq|<season>|<year>`` (season 1 = Sommer-,
+    2 = Wintersemester; the label is matched, not a hardcoded id) as well as a
+    raw numeric option id (e.g. ``590``). Matching the select's option *labels*
+    keeps the resolution robust across years without pinning IDs.
+    """
+    soup = BeautifulSoup(page_html, 'html.parser')
+    sel = soup.find('select', id=lambda x: x and x.endswith(':changeTerm_input'))
+    if sel is None:
+        sel = soup.find('select', attrs={'name': lambda x: x and x.endswith(':changeTerm_input')})
+    if sel is None:
+        return None
+
+    options: List[Tuple[str, str]] = []
+    for opt in sel.find_all('option'):
+        value = (opt.get('value') or '').strip()
+        label = re.sub(r'\s+', ' ', opt.get_text(strip=True))
+        if value:
+            options.append((value, label))
+
+    target_label: Optional[str] = None
+    m = re.match(r'\s*eq\|([12])\|(\d{4})\s*$', term_spec)
+    if m:
+        season, year = m.group(1), int(m.group(2))
+        if season == '1':
+            target_label = f"Sommersemester {year}"
+        else:
+            target_label = f"Wintersemester {year}/{(year + 1) % 100:02d}"
+        for value, label in options:
+            if label == target_label:
+                return value, label, _short_term_label(label)
+        return None
+
+    if term_spec.strip().isdigit():
+        want = term_spec.strip()
+        for value, label in options:
+            if value == want:
+                return value, label, _short_term_label(label)
+        return None
+
+    # Last resort: case-insensitive label match (accepts a full label string).
+    want_l = re.sub(r'\s+', ' ', term_spec.strip()).lower()
+    for value, label in options:
+        if label.lower() == want_l:
+            return value, label, _short_term_label(label)
+    return None
+
+
+def _post_timetable_form(
+    session: requests.Session, page_html: str, page_url: str,
+    overrides: Dict[str, str], button_name: str
+) -> Optional[str]:
+    """Full-form POST of campo's ``form#plan``: collect every non-submit input
+    plus each select's current value, apply *overrides*, trigger *button_name*.
+
+    Mirrors ``_post_jsf_detail_button`` but also carries ``<select>`` values,
+    which the timesheet's InputRefresh buttons (changeTerm / auswahlZeitraum)
+    need — a JSF AJAX partial to those buttons does not work headlessly, but a
+    plain full-form POST re-renders the page with the term/view switched.
+    Returns the response HTML on success, or None on failure.
+    """
+    from urllib.parse import urljoin
+    soup = BeautifulSoup(page_html, 'html.parser')
+    form = soup.find('form', id='plan') or soup.find('form')
+    if form is None:
+        return None
+    action = form.get('action') or page_url
+    post_url = urljoin(page_url, action)
+    data: List[Tuple[str, str]] = []
+    for inp in form.find_all('input'):
+        name = inp.get('name')
+        if not name or name in overrides:
+            continue
+        itype = (inp.get('type') or 'text').lower()
+        if itype in ('submit', 'button', 'image'):
+            continue
+        data.append((name, inp.get('value', '') or ''))
+    for sel in form.find_all('select'):
+        name = sel.get('name')
+        if not name or name in overrides:
+            continue
+        chosen = None
+        for opt in sel.find_all('option'):
+            if opt.has_attr('selected'):
+                chosen = opt.get('value', '') or ''
+                break
+        if chosen is None:
+            first = sel.find('option')
+            chosen = (first.get('value', '') or '') if first else ''
+        data.append((name, chosen))
+    for name, value in overrides.items():
+        data.append((name, value))
+    data.append((button_name, ''))
+    try:
+        r = session.post(post_url, data=data, allow_redirects=True)
+    except Exception as e:
+        logger.warning(f"Timetable form POST failed: {e}")
+        return None
+    if r.status_code != 200:
+        logger.warning(f"Timetable form POST returned HTTP {r.status_code}.")
+        return None
+    return r.text
+
+
+def _find_form_control_name(html: str, suffix: str) -> Optional[str]:
+    """Return the name of the form control whose name/id ends with *suffix*."""
+    soup = BeautifulSoup(html, 'html.parser')
+    el = soup.find(attrs={'name': lambda x: x and x.endswith(suffix)})
+    if el is not None:
+        return el.get('name')
+    el = soup.find(id=lambda x: x and x.endswith(suffix))
+    return el.get('name') if el is not None else None
+
+
+def _fetch_timetable_entries_for_term(term_spec: str) -> Optional[Tuple[str, List[Dict], str]]:
+    """Fetch the personal campo timetable for a non-current semester.
+
+    Resolves *term_spec* to a changeTerm option id, then issues two full-form
+    POSTs (switch term, then switch to the Vorlesungszeitansicht) and parses the
+    resulting page with the shared span-parser. Returns
+    (page_title, entries, short_label) on success, None on failure. Requires
+    Firefox cookies for both fau.de and campo.fau.de.
+    """
+    print(f"🔄 Loading campo timetable for term '{term_spec}'...")
+    session = _campo_session()
+    if session is None:
+        return None
+    try:
+        r = session.get(CAMPO_TIMETABLE_URL)
+        if r.status_code != 200:
+            print(f"❌ campo returned HTTP {r.status_code}. Make sure you are logged in via Firefox.")
+            return None
+    except Exception as e:
+        print(f"❌ Could not fetch timetable: {e}")
+        return None
+
+    resolved = _resolve_timetable_term(r.text, term_spec)
+    if resolved is None:
+        print(f"❌ Could not resolve term '{term_spec}' against campo's semester list.")
+        return None
+    term_id, full_label, short_label = resolved
+    print(f"   → {full_label} (id {term_id})")
+
+    change_name = _find_form_control_name(r.text, ':changeTerm_input')
+    refresh_term = _find_form_control_name(r.text, ':refreshChangeTerm')
+    if not (change_name and refresh_term):
+        print("❌ campo timetable page is missing the term-switch controls.")
+        return None
+
+    html_term = _post_timetable_form(
+        session, r.text, r.url, {change_name: term_id}, refresh_term)
+    if html_term is None:
+        print("❌ Term switch POST failed.")
+        return None
+
+    zeitraum_name = _find_form_control_name(html_term, ':auswahl_zeitraum_input')
+    refresh_zeit = _find_form_control_name(html_term, ':refreshAuswahlZeitraum')
+    change_name2 = _find_form_control_name(html_term, ':changeTerm_input') or change_name
+    if not (zeitraum_name and refresh_zeit):
+        print("❌ campo timetable page is missing the view-switch controls.")
+        return None
+
+    html_view = _post_timetable_form(
+        session, html_term, r.url,
+        {change_name2: term_id, zeitraum_name: 'vorlesungszeit'}, refresh_zeit)
+    if html_view is None:
+        print("❌ Vorlesungszeit view POST failed.")
+        return None
+
+    parsed = _parse_timetable_html(html_view)
+    if parsed is None:
+        return None
+    page_title, entries = parsed
+    return page_title, entries, short_label
 
 
 def _post_jsf_detail_button(
@@ -5296,25 +5504,44 @@ def _read_timetable_cache() -> Optional[Tuple[datetime, str, List[Dict]]]:
         return None
 
 
-def fetch_timetable_markdown(output_path: Optional[str] = None) -> Optional[str]:
-    """Fetch campo timetable, write Markdown + structured JSON cache.
+def fetch_timetable_markdown(output_path: Optional[str] = None,
+                             term: Optional[str] = None) -> Optional[str]:
+    """Fetch campo timetable, write Markdown (+ structured JSON cache).
+
+    Without *term*, behaviour is unchanged: the current semester is written to
+    ``timetable.md`` and the ``.timetable_entries.json`` cache consumed by
+    --lecture-sync. With *term* (e.g. ``eq|2|2026`` for WiSe 2026/27, or a raw
+    numeric option id), a non-current semester is fetched via the term-switch
+    POSTs and written to ``timetable_<label>.md`` (e.g. ``timetable_WS2627.md``)
+    — the current-semester ``timetable.md`` and cache are left untouched.
 
     Returns the output Markdown path on success, None on failure. Requires
     Firefox cookies for both fau.de and campo.fau.de.
     """
-    result = _fetch_timetable_entries()
-    if result is None:
-        return None
-    page_title, entries = result
+    short_label: Optional[str] = None
+    if term is not None:
+        result = _fetch_timetable_entries_for_term(term)
+        if result is None:
+            return None
+        page_title, entries, short_label = result
+    else:
+        result = _fetch_timetable_entries()
+        if result is None:
+            return None
+        page_title, entries = result
 
     md = _render_timetable_markdown(page_title, entries)
     if output_path is None:
-        output_path = os.path.join(DOWNLOAD_FOLDER, 'timetable.md')
+        filename = f'timetable_{short_label}.md' if short_label else 'timetable.md'
+        output_path = os.path.join(DOWNLOAD_FOLDER, filename)
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(md)
     print(f"✅ Timetable written to {output_path}")
-    _write_timetable_cache(page_title, entries)
+    # The structured cache feeds --lecture-sync and must reflect the CURRENT
+    # semester only — never overwrite it with a non-current export.
+    if short_label is None:
+        _write_timetable_cache(page_title, entries)
     return output_path
 
 
@@ -7308,7 +7535,10 @@ def main() -> None:
     parser.add_argument('--campo-search', metavar='QUERY',
                        help='Search campo courses for QUERY in a semester (default: current) and print hits + ECTS to stdout')
     parser.add_argument('--term', metavar='TERMID',
-                       help="Semester for --campo-search, e.g. 'eq|1|2026' (SoSe26) / 'eq|2|2026' (WiSe26); default = current semester")
+                       help="Semester for --campo-search or --timetable, e.g. 'eq|1|2026' (SoSe26) / "
+                            "'eq|2|2026' (WiSe26/27) or a raw campo option id (e.g. 590); "
+                            "default = current semester. For --timetable a non-current term writes "
+                            "timetable_<label>.md (e.g. timetable_WS2627.md) and leaves timetable.md untouched.")
     parser.add_argument('--campo-bescheinigungen', action='store_true',
                        help='Download all PDFs from campo Notenübersicht / personExamsReadonly page (Notenübersicht, BAföG-§48, ord. Studium, angemeldete Prüfungen, ...) into <downloads>/Bescheinigungen/')
     parser.add_argument('--campo-enrollment-bescheinigungen', action='store_true',
@@ -7358,7 +7588,7 @@ def main() -> None:
 
     # --- Timetable export ---
     if args.timetable:
-        fetch_timetable_markdown()
+        fetch_timetable_markdown(term=args.term)
         return
 
     # --- Campo Modulplan (deterministic studyPlanner scan) ---

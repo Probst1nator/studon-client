@@ -851,3 +851,90 @@ def test_daily_sync_with_display_does_not_give_up(monkeypatch):
         raised = True
     assert raised, "with a display present, run_daily_sync must NOT give up — it returned"
     assert calls["n"] == 3                       # kept looping past the cap
+
+
+# --- Timetable non-current-term export (--timetable --term) ----------------
+#
+# Offline coverage for the term-label resolution and shared span-parsing that
+# back a non-current-semester timetable export. No network: the campo pages are
+# mocked as minimal HTML mirroring the changeTerm select + schedulePanel shape.
+
+_MOCK_CHANGETERM_HTML = """
+<html><body><form id="plan" action="/qisserver/pages/plan/x.xhtml">
+  <select name="plan:scheduleConfiguration:anzeigeoptionen:changeTerm_input"
+          id="plan:scheduleConfiguration:anzeigeoptionen:changeTerm_input">
+    <option value="595">Sommersemester 2027</option>
+    <option value="590">Wintersemester 2026/27</option>
+    <option value="589" selected="selected">Sommersemester 2026</option>
+    <option value="565">Wintersemester 2025/26</option>
+  </select>
+</form></body></html>
+"""
+
+_MOCK_TIMETABLE_VIEW_HTML = """
+<html><head><title>Stundenplan für  Muster, Max  - campo.fau.de</title></head>
+<body><form id="plan">
+  <div class="colhead">Montag</div>
+  <div class="colhead">Dienstag</div>
+  <div id="plan:schedule:scheduleColumn:0:termin:0:scheduleItem:schedulePanelGroup"
+       class="schedulePanel">
+    <h3 class="scheduleTitle">Biomaterialien</h3>
+    <span id="a:eventtypeShorttext">Vorlesung mit Übung</span>
+    <span id="a:times">12:15 bis 13:45</span>
+    <span id="a:rhythmDefaulttext">wöchentlich</span>
+    <span id="a:scheduleStartDate">19.10.2026</span>
+    <span id="a:scheduleEndDate">01.02.2027</span>
+    <span id="a:buildingDefaulttext">Verbundlabor</span>
+    <span id="a:instructorLink1">Prof. Dr. Boccaccini</span>
+    <div class="note">Diese Veranstaltung ist in Ihrem Stundenplan nur vorgemerkt und noch nicht belegt.</div>
+  </div>
+</form></body></html>
+"""
+
+
+def test_short_term_label_forms():
+    assert s._short_term_label('Wintersemester 2026/27') == 'WS2627'
+    assert s._short_term_label('Sommersemester 2026') == 'SS26'
+    assert s._short_term_label('Sommersemester 2027') == 'SS27'
+
+
+def test_resolve_timetable_term_eq_style_winter():
+    """'eq|2|2026' resolves to the Wintersemester 2026/27 option by label."""
+    resolved = s._resolve_timetable_term(_MOCK_CHANGETERM_HTML, 'eq|2|2026')
+    assert resolved == ('590', 'Wintersemester 2026/27', 'WS2627')
+
+
+def test_resolve_timetable_term_eq_style_summer():
+    resolved = s._resolve_timetable_term(_MOCK_CHANGETERM_HTML, 'eq|1|2027')
+    assert resolved == ('595', 'Sommersemester 2027', 'SS27')
+
+
+def test_resolve_timetable_term_raw_numeric_id():
+    """A raw campo option id resolves to that option and derives its label."""
+    resolved = s._resolve_timetable_term(_MOCK_CHANGETERM_HTML, '590')
+    assert resolved == ('590', 'Wintersemester 2026/27', 'WS2627')
+
+
+def test_resolve_timetable_term_unknown_returns_none():
+    assert s._resolve_timetable_term(_MOCK_CHANGETERM_HTML, 'eq|1|1999') is None
+    assert s._resolve_timetable_term(_MOCK_CHANGETERM_HTML, '99999') is None
+
+
+def test_parse_timetable_html_extracts_entry():
+    """The shared span-parser reads a schedulePanel into a normalized entry."""
+    parsed = s._parse_timetable_html(_MOCK_TIMETABLE_VIEW_HTML)
+    assert parsed is not None
+    page_title, entries = parsed
+    assert page_title == 'Stundenplan für Muster, Max'
+    assert len(entries) == 1
+    e = entries[0]
+    assert e['day'] == 'Montag'
+    assert e['title'] == 'Biomaterialien'
+    assert e['time'] == '12:15 bis 13:45'
+    assert e['start'] == '19.10.2026'
+    assert e['end'] == '01.02.2027'
+    assert e['note']  # vorgemerkt-Hinweis captured
+
+
+def test_parse_timetable_html_empty_returns_none():
+    assert s._parse_timetable_html('<html><body>nothing</body></html>') is None

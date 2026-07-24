@@ -151,6 +151,12 @@ python studon_client.py --clip
 # Export campo timetable to timetable.md
 python studon_client.py --timetable
 
+# Export a NON-current semester's timetable (e.g. Wintersemester 2026/27) →
+# timetable_WS2627.md; --term accepts the campo-search style 'eq|<season>|<year>'
+# (season 1 = Sommer-, 2 = Wintersemester) or a raw campo option id (e.g. 590).
+# The current-semester timetable.md and the --lecture-sync cache are left untouched.
+python studon_client.py --timetable --term 'eq|2|2026'
+
 # Scan campo studyPlanner front page (deterministic, no Pre-Click) → Modulplan.md
 # Lists every module in the Studienplan with Status / Semester / Versuch / ECTS-erreicht / ECTS-Soll,
 # Studienfortschritt-Header (Bestanden/180 ECTS) + 3 status-grouped tables.
@@ -208,7 +214,8 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--discover-from-timetable` | For each Unmapped campo entry, follow the JSF "Detailansicht" button → final StudOn URL and offer to register it as a tracked course |
 | `--clip` | Read clipboard, preview, confirm, download |
 | `--dry-run` | Discover files without downloading |
-| `--timetable` | Export personal campo timetable |
+| `--timetable` | Export personal campo timetable → `timetable.md` + `.timetable_entries.json` cache (current semester). |
+| `--timetable --term '<TERMID>'` | Export a **non-current** semester's timetable → `timetable_<label>.md` (e.g. `timetable_WS2627.md`). `<TERMID>` is the campo-search style `eq\|<season>\|<year>` (season 1 = Sommer-, 2 = Wintersemester; e.g. `eq\|2\|2026` = WiSe 2026/27) or a raw campo option id (e.g. `590`). Resolves season+year against the changeTerm select's option labels (no hardcoded IDs), then switches to the Vorlesungszeitansicht via two full-form POSTs. Leaves the current-semester `timetable.md` and the `--lecture-sync` cache untouched. |
 | `--modulplan` | Scan studyPlanner-flow front page (deterministic, no Pre-Click) → `Modulplan.md`: every module in the Studienplan with Nr / Titel / Status / Semester / Versuch / ECTS-erreicht/-Soll, Studienfortschritt-Header (Bestanden gegen 180 ECTS-Soll), und drei Status-gruppierte Tabellen (Bestanden / Angemeldet / Offen). ECTS comes from the `X/Y`-suffix on each `modulePlanItem` div — no extra HTTP request. |
 | `--belegungen` | Scan searchOwnEnrollmentInfo-flow front page (deterministic, no Pre-Click) → `Belegungen.md` + `Belegungen.json`: angemeldete Prüfungen (Nr / Titel / Termin / Form / Prüfer/-in / Status) + Veranstaltungen (Typ / Titel / Termin+Raum / Dozent/-in) für das aktuell ausgewählte Semester. Multi-Termin-Vorlesungen werden mit `<br>` getrennt. **Pure data fetch** — Change-Detection + `notify-send` ist in das Schwester-Tool `~/Synced/repos/AutomatedAlchemy/belegungen-watcher/main.py` ausgelagert, das die JSON konsumiert. |
 | `--reconcile` | Cross-Check Modulplan ↔ Belegungen → `Reconciliation.md` + `Reconciliation.json` (gleicher Inhalt maschinen-lesbar) mit (1) Belegungen-Prüfungen → Modulplan-Modul-Match (Title-Normalize + Jaccard ≥ 0.6), (2) Modulplan-Angemeldet ohne Belegungs-Eintrag, (3) Bestanden-Module ohne `X/Y`-Suffix (= ECTS-Undercount-Quelle). Wenn eine `Notenübersicht*Module*.pdf` unter `Bescheinigungen/` existiert (Auto-Detection via `pdftotext -layout`), wird sie als **kanonische ECTS-Quelle** integriert (Prüfungsamt-Berechnung, BAföG-/Kindergeld-relevant) — Diskrepanz zum Modulplan-Front-Page wird automatisch sichtbar gemacht. Der `--install`-Cron pflegt die PDF wöchentlich (Mo 06:30) via `--campo-bescheinigungen`. |
@@ -257,7 +264,8 @@ studon_downloads/
 ├── .studon_updater_state.json     # daily-sync state (cloud-sync safe)
 ├── .studon_sync.lock              # PID-file shared by --daily-sync and --lecture-sync
 ├── .timetable_entries.json        # structured campo cache consumed by --lecture-sync
-├── timetable.md                   # human-readable campo timetable
+├── timetable.md                   # human-readable campo timetable (current semester)
+├── timetable_<label>.md           # non-current semester (--timetable --term), e.g. timetable_WS2627.md
 ├── pruefungen.md                  # Prüfungs-Anmeldefristen aus campo studyPlanner Detailansichten
 ├── RECENT_UPDATES.md              # last-run download log
 ├── <Course Name>/
