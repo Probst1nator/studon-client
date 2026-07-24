@@ -47,6 +47,7 @@ import re
 import email.utils
 import shutil
 import subprocess
+import atexit
 import time
 import requests
 import pyperclip
@@ -2501,9 +2502,10 @@ def _notify_login_required(login_url: str, refire_after_seconds: float = 600.0) 
     try:
         proc = subprocess.Popen(
             ["notify-send", "--app-name=StudOn Scraper", "--icon=dialog-password",
-             "--urgency=critical", "--action=login=In Firefox einloggen",
+             "--expire-time=120000", "--action=login=In Firefox einloggen",
              "StudOn-Login abgelaufen",
-             "Sync pausiert. Klicken zum Einloggen — danach holt der Sync automatisch nach."],
+             "Sync pausiert. Klicken zum Einloggen — verschwindet nach 2 Min "
+             "(oder das StudOn-Tray-Icon nutzen); der Sync holt danach automatisch nach."],
             env=_notify_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
     except Exception as e:
@@ -2512,16 +2514,18 @@ def _notify_login_required(login_url: str, refire_after_seconds: float = 600.0) 
     _login_prompt["proc"] = proc
 
     def _wait_for_click() -> None:
+        # Block until notify-send exits on its own — either the user clicked the
+        # action (stdout carries the key) or the notification auto-expired after
+        # its --expire-time (2 min). Deliberately NO kill-timeout: killing the
+        # process early would leave a dead, unclickable notification on screen
+        # (the old timeout=3600 bug — clicking it silently did nothing). This
+        # popup is only a transient nudge; the durable login path is the
+        # persistent StudOn tray icon.
         try:
-            out, _ = proc.communicate(timeout=3600)
+            out, _ = proc.communicate()
             if out and "login" in out:
                 logger.info("Login notification clicked — opening StudOn login in browser.")
                 _open_url_in_browser(login_url)
-        except subprocess.TimeoutExpired:
-            try:
-                proc.kill()
-            except Exception:
-                pass
         except Exception as e:
             logger.debug(f"Login notification click-wait failed: {e}")
 
@@ -2537,6 +2541,268 @@ def _dismiss_login_prompt() -> None:
         except Exception:
             pass
     _login_prompt["proc"] = None
+
+
+# ── Persistent system-tray icon (AppIndicator / StatusNotifierItem) ─────────
+# KDE Plasma renders pystray's XEmbed icon as an invisible ghost slot, so the
+# always-on tray runs as a tiny helper under the SYSTEM python3 (which has
+# gi/AppIndicator; the Py3EnvShare venv hides it). The helper is driven by a
+# per-host JSON status file — kept OUT of the synced download folder so it never
+# creates Syncthing churn — and performs login / sync-now / open-downloads on
+# its own. Best-effort throughout: no display or no AppIndicator ⇒ silently skip
+# and fall back to the notify-send login prompt.
+_SYSTEM_PYTHON = "/usr/bin/python3"
+_TRAY_SCRIPT_PATH = os.path.join(_SCRIPT_DIR, "_studon_tray.py")
+_TRAY_STATE_DIR = os.path.expanduser("~/.local/state/studon-client")
+_TRAY_STATUS_PATH = os.path.join(_TRAY_STATE_DIR, "tray_status.json")
+_tray_proc: Optional[subprocess.Popen] = None
+_appindicator_ok: Optional[bool] = None
+
+_STUDON_TRAY_PY = r'''#!/usr/bin/python3
+"""Standalone AppIndicator system-tray for studon-client (generated file).
+
+Runs under the SYSTEM python3, NOT the Py3EnvShare venv: it needs gi/AppIndicator
+(a system dist-package the venv hides) and imports ONLY gi + stdlib so it never
+pulls in the heavy studon_client module. The --lecture-sync daemon writes a small
+JSON status file; this tray polls it and acts on its own.
+
+Usage:  /usr/bin/python3 _studon_tray.py <status_json_path>
+"""
+import json
+import os
+import subprocess
+import sys
+
+import gi
+gi.require_version("Gtk", "3.0")
+try:
+    gi.require_version("AyatanaAppIndicator3", "0.1")
+    from gi.repository import AyatanaAppIndicator3 as AppIndicator3
+except (ValueError, ImportError):
+    gi.require_version("AppIndicator3", "0.1")
+    from gi.repository import AppIndicator3
+from gi.repository import GLib, Gtk
+
+STATUS_FILE = sys.argv[1] if len(sys.argv) > 1 else ""
+ICON_ACTIVE = "applications-education"
+ICON_ATTENTION = "dialog-password"
+
+
+def _read_status():
+    try:
+        with open(STATUS_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+
+def _spawn(argv, **kw):
+    try:
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True, **kw)
+    except Exception:
+        pass
+
+
+class StudonTray:
+    def __init__(self):
+        self.ind = AppIndicator3.Indicator.new(
+            "studon-client", ICON_ACTIVE,
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
+        self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
+        self.ind.set_attention_icon_full(ICON_ATTENTION, "StudOn-Login erforderlich")
+        self.ind.set_title("StudOn client")
+
+        self.menu = Gtk.Menu()
+        self.status_item = Gtk.MenuItem(label="StudOn: ...")
+        self.status_item.set_sensitive(False)
+        self.login_item = Gtk.MenuItem(label="In StudOn einloggen")
+        self.login_item.connect("activate", self.on_login)
+        self.sync_item = Gtk.MenuItem(label="Jetzt synchronisieren")
+        self.sync_item.connect("activate", self.on_sync)
+        self.dl_item = Gtk.MenuItem(label="Download-Ordner oeffnen")
+        self.dl_item.connect("activate", self.on_downloads)
+        self.quit_item = Gtk.MenuItem(label="Tray schliessen")
+        self.quit_item.connect("activate", lambda _w: Gtk.main_quit())
+
+        for it in (self.status_item, self.login_item, self.sync_item,
+                   self.dl_item, Gtk.SeparatorMenuItem(), self.quit_item):
+            it.show()
+            self.menu.append(it)
+        self.menu.show_all()
+        self.ind.set_menu(self.menu)
+
+        self._refresh()
+        GLib.timeout_add_seconds(5, self._refresh)
+
+    def _refresh(self):
+        st = _read_status()
+        state = st.get("state", "idle")
+        nf = st.get("next_fire_human")
+        if state == "waiting_login":
+            label = "StudOn: Login erforderlich"
+        elif state == "syncing":
+            label = "StudOn: synchronisiert ..."
+        elif nf:
+            label = "StudOn: naechster Sync " + str(nf)
+        else:
+            label = "StudOn: bereit"
+        self.status_item.set_label(label)
+        self.login_item.set_sensitive(bool(st.get("login_url")))
+        self.sync_item.set_sensitive(bool(st.get("venv_python") and st.get("script_path")))
+        self.dl_item.set_sensitive(bool(st.get("downloads_path")))
+        try:
+            self.ind.set_status(
+                AppIndicator3.IndicatorStatus.ATTENTION if state == "waiting_login"
+                else AppIndicator3.IndicatorStatus.ACTIVE)
+        except Exception:
+            pass
+        return True  # keep the GLib timer alive
+
+    def on_login(self, _w):
+        url = _read_status().get("login_url")
+        if url:
+            _spawn(["xdg-open", url])
+
+    def on_downloads(self, _w):
+        path = _read_status().get("downloads_path")
+        if path:
+            _spawn(["xdg-open", path])
+
+    def on_sync(self, _w):
+        st = _read_status()
+        py, script = st.get("venv_python"), st.get("script_path")
+        if not (py and script):
+            return
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)  # do not leak the system path into the venv run
+        _spawn([py, script, "--update-all"],
+               cwd=os.path.dirname(script) or None, env=env)
+
+
+def main():
+    if not STATUS_FILE:
+        print("usage: _studon_tray.py <status_json_path>", file=sys.stderr)
+        return 2
+    StudonTray()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def _system_python_has_appindicator() -> bool:
+    """True if /usr/bin/python3 can import gi + AppIndicator (probed once)."""
+    global _appindicator_ok
+    if _appindicator_ok is not None:
+        return _appindicator_ok
+    _appindicator_ok = False
+    if not os.path.exists(_SYSTEM_PYTHON):
+        return False
+    probe = (
+        "import gi; gi.require_version('Gtk','3.0')\n"
+        "try:\n"
+        "    gi.require_version('AyatanaAppIndicator3','0.1')\n"
+        "    from gi.repository import AyatanaAppIndicator3\n"
+        "except Exception:\n"
+        "    gi.require_version('AppIndicator3','0.1')\n"
+        "    from gi.repository import AppIndicator3\n"
+    )
+    try:
+        env = os.environ.copy()
+        env.pop("PYTHONPATH", None)
+        result = subprocess.run([_SYSTEM_PYTHON, "-c", probe],
+                                capture_output=True, timeout=15, env=env)
+        _appindicator_ok = result.returncode == 0
+    except Exception:
+        _appindicator_ok = False
+    return _appindicator_ok
+
+
+def _write_tray_status(**fields) -> None:
+    """Merge-write the per-host tray status JSON atomically. Silent on failure."""
+    try:
+        os.makedirs(_TRAY_STATE_DIR, exist_ok=True)
+        data: dict = {}
+        try:
+            with open(_TRAY_STATUS_PATH, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            data = {}
+        data.update(fields)
+        tmp = _TRAY_STATUS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, _TRAY_STATUS_PATH)
+    except Exception as e:
+        logger.debug(f"Tray status write failed: {e}")
+
+
+def _ensure_tray_script() -> bool:
+    """Materialize the embedded tray helper to disk if missing/outdated."""
+    try:
+        current = ""
+        if os.path.exists(_TRAY_SCRIPT_PATH):
+            with open(_TRAY_SCRIPT_PATH, encoding="utf-8") as fh:
+                current = fh.read()
+        if current != _STUDON_TRAY_PY:
+            with open(_TRAY_SCRIPT_PATH, "w", encoding="utf-8") as fh:
+                fh.write(_STUDON_TRAY_PY)
+        return True
+    except Exception as e:
+        logger.debug(f"Tray script write failed: {e}")
+        return False
+
+
+def _stop_tray() -> None:
+    """Terminate the tray helper (called on daemon exit via atexit)."""
+    global _tray_proc
+    if _tray_proc is not None and _tray_proc.poll() is None:
+        try:
+            _tray_proc.terminate()
+        except Exception:
+            pass
+    _tray_proc = None
+
+
+def _launch_tray(login_url: Optional[str] = None) -> None:
+    """Start (or restart) the persistent AppIndicator tray helper — idempotent.
+
+    No-op when a helper is already alive, there's no display, or the system
+    python lacks AppIndicator; the daemon then relies on the notify-send login
+    prompt alone.
+    """
+    global _tray_proc
+    if _tray_proc is not None and _tray_proc.poll() is None:
+        return  # already running
+    if not _has_display() or not _system_python_has_appindicator():
+        return
+    if not _ensure_tray_script():
+        return
+    _write_tray_status(
+        state="idle",
+        downloads_path=DOWNLOAD_FOLDER,
+        venv_python=sys.executable,
+        script_path=os.path.abspath(__file__),
+        login_url=login_url or "",
+    )
+    try:
+        env = _notify_env()
+        env.pop("PYTHONPATH", None)
+        env.pop("VIRTUAL_ENV", None)
+        _tray_proc = subprocess.Popen(
+            [_SYSTEM_PYTHON, _TRAY_SCRIPT_PATH, _TRAY_STATUS_PATH],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, env=env,
+        )
+        atexit.register(_stop_tray)
+        logger.info("StudOn tray icon started.")
+    except Exception as e:
+        logger.debug(f"Tray launch failed: {e}")
+        _tray_proc = None
 
 
 def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = None,
@@ -3010,9 +3276,18 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
             print(f"  {fire_time.strftime('%a %Y-%m-%d %H:%M')}  → {course_name}")
         return
 
+    # Persistent system-tray icon (login / sync-now / open-downloads) — best
+    # effort; silently skipped without a display or AppIndicator.
+    try:
+        _tray_login_url = _get_first_course_url()
+    except Exception:
+        _tray_login_url = f"https://{STUDON_DOMAIN}"
+    _launch_tray(login_url=_tray_login_url)
+
     while True:
         try:
             now = datetime.now()
+            _launch_tray()  # idempotent: restart the tray helper if it died
             # Reload schedule daily, or if file changed.
             if time.time() - last_timetable_load > 6 * 3600:
                 reload_schedule()
@@ -3038,6 +3313,9 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
                 course_name = lecture.course.course_title if lecture.course else '?'
                 logger.info(f"Lecture sync: next fire {fire_time.isoformat()} for '{course_name}' "
                             f"(sleeping {int(wait)}s)")
+                _write_tray_status(
+                    state="idle",
+                    next_fire_human=f"{fire_time.strftime('%a %H:%M')} · {course_name}")
                 time.sleep(min(wait, 1800))  # cap sleep at 30 min so we recheck schedule
                 if time.time() - last_timetable_load > 6 * 3600:
                     reload_schedule()
@@ -3076,6 +3354,7 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
 
             if not can_access_studon():
                 login_url = course.source_url or f"https://{STUDON_DOMAIN}"
+                _write_tray_status(state="waiting_login", login_url=login_url)
                 logger.info(
                     f"Lecture sync: not logged in at fire {fire_time.isoformat()}; "
                     + (f"opening tray (max {tray_wait_seconds}s)." if _has_display()
@@ -3102,6 +3381,7 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
                     )
                     continue
                 logger.info(f"Lecture sync: fetching '{course.course_title}'")
+                _write_tray_status(state="syncing")
                 try:
                     downloaded, extracted, downloaded_paths = _lecture_fetch_one(course)
                     # Claim the window so the other host (and our own later

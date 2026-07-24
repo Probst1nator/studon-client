@@ -17,6 +17,7 @@ RECENT_UPDATES.md
 .studon_feedback_state.json
 config.json
 lecture_mapping.json
+_studon_tray.py           # generated at runtime from the embedded _STUDON_TRAY_PY constant
 
 # ===== Python =====
 __pycache__/
