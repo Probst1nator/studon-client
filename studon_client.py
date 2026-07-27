@@ -3962,6 +3962,7 @@ cron daemons don't already do automatically.
 
 ## When to use
 
+- "Fetch new uploads for THIS course" (cwd is inside a tracked course folder) → run the scraper **bare, no args** — it detects the course from the folder's `METADATA.md` and refreshes only that one. Non-interactive shells auto-fetch; a TTY gets it pre-selected as the first TUI option. Pass `--dry-run` to preview only. Prefer this over `<URL>` when you're already sitting in the course folder.
 - "Download this StudOn course" → has a URL → `<URL>` mode below.
 - "Update all my courses now" → `--update-all`.
 - "Was kommt diese Woche an Vorlesungen?" → `--timetable` → reads `timetable.md`.
@@ -3999,6 +4000,7 @@ already has `browser-cookie3`, `beautifulsoup4`, `requests`, `questionary`.)
 | Intent | Command |
 |---|---|
 | (Re-)login Firefox & wait until authenticated | `$PY $SCRAPER --login campo` (or `studon` / `both`; bare `--login` == studon) |
+| Refresh just the course whose folder you're in (bare, no args) | `cd "<course folder>" && $PY $SCRAPER` (add `--dry-run` to preview) |
 | Download one course by URL | `$PY $SCRAPER <studon_course_url>` |
 | Preview without downloading | `$PY $SCRAPER <url> --dry-run` |
 | Refresh every tracked course | `$PY $SCRAPER --update-all` |
@@ -7664,8 +7666,68 @@ def _fetch_one_enrollment_pdf(
     return _download_enrollment_pdf(s, poll_url, download_href, label, idx, output_dir)
 
 
-def _run_tui_menu(debug: bool = False) -> None:
-    """Interactive arrow-key menu — shown when no URL/flag is provided and stdin is a TTY."""
+def _detect_current_course(base_folder: str) -> Optional[Tuple[str, str, str]]:
+    """If the current working directory is inside a tracked course folder, return
+    ``(course_title, source_url, course_folder)`` for that course; otherwise None.
+
+    Walks up from CWD toward the download root, returning the first ancestor that
+    carries a METADATA.md with a valid StudOn source_url. The download root itself
+    is skipped (its METADATA.md would be a stray — see find_all_metadata_files).
+    Returns None when CWD is not under the download tree, so a bare invocation from
+    an unrelated directory keeps the old clipboard/TUI behaviour.
+    """
+    try:
+        cwd = os.path.abspath(os.getcwd())
+    except Exception:
+        return None
+    base_abs = os.path.abspath(base_folder)
+    try:
+        # CWD must live inside the download tree (or be the root itself).
+        if os.path.commonpath([cwd, base_abs]) != base_abs:
+            return None
+    except ValueError:
+        # Different mount/drive → not comparable → not inside the tree.
+        return None
+
+    d = cwd
+    while os.path.abspath(d) != base_abs:
+        meta_path = os.path.join(d, "METADATA.md")
+        if os.path.isfile(meta_path):
+            cm = CourseMetadata.from_yaml_markdown(meta_path)
+            if cm and cm.source_url and _is_studon_url(cm.source_url):
+                return (cm.course_title, cm.source_url, d)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def _fetch_single_course(title: str, source_url: str, course_folder: str,
+                         *, dry_run: bool = False, debug: bool = False) -> None:
+    """Download (or dry-run preview) just one course, resolving into its base folder."""
+    base = os.path.dirname(course_folder)
+    session = _make_session()
+    if session is None:
+        return
+    print(f"📁 Course folder detected: {title}")
+    if dry_run:
+        _print_discovery_preview(source_url, session, base, debug=debug)
+        return
+    downloaded, extracted, files_list = process_single_url(source_url, session, base, debug=debug)
+    print(f"\n🎉 Done. Downloaded {downloaded} new file(s), extracted {extracted} archive(s).")
+    if files_list:
+        for filepath in files_list:
+            print(f"   • {os.path.relpath(filepath, base)}")
+
+
+def _run_tui_menu(debug: bool = False, current_course: Optional[Tuple[str, str, str]] = None) -> None:
+    """Interactive arrow-key menu — shown when no URL/flag is provided and stdin is a TTY.
+
+    When ``current_course`` is set (CWD sits inside a tracked course folder), an
+    "Update this course" action is prepended and pre-selected as the default, so a
+    bare invocation from a course folder needs only a single Enter to refresh it.
+    """
     global DOWNLOAD_FOLDER
 
     if not sys.stdin.isatty():
@@ -7684,7 +7746,16 @@ def _run_tui_menu(debug: bool = False) -> None:
                   "❗ Install feedback-mail checker (FAUmail)")
     imap_value = "uninstall_imap" if imap_installed else "install_imap"
 
-    choices = [
+    current_label = None
+    if current_course:
+        current_label = f"Update this course: {current_course[0]}"
+
+    choices = []
+    if current_course:
+        choices.append(
+            questionary.Choice(current_label, value="current_course") if questionary else current_label
+        )
+    choices += [
         questionary.Choice("Register & download a course URL", value="url") if questionary else "Register & download a course URL",
         questionary.Choice("Dry-run all registered courses (preview new files)", value="dry_run") if questionary else "Dry-run all registered courses (preview new files)",
         questionary.Choice("Update all tracked courses", value="update_all") if questionary else "Update all tracked courses",
@@ -7699,7 +7770,11 @@ def _run_tui_menu(debug: bool = False) -> None:
     ]
 
     if questionary:
-        action = questionary.select("What would you like to do?", choices=choices).ask()
+        action = questionary.select(
+            "What would you like to do?",
+            choices=choices,
+            default="current_course" if current_course else None,
+        ).ask()
     else:
         labels = ["Register & download a course URL", "Dry-run all registered courses (preview new files)",
                   "Update all tracked courses", "Check FAUmail for feedback files now",
@@ -7709,6 +7784,9 @@ def _run_tui_menu(debug: bool = False) -> None:
         values = ["url", "dry_run", "update_all", "check_feedback", "timetable", "map_lectures",
                   "discover_timetable",
                   "set_path", install_value, imap_value, "exit"]
+        if current_course:
+            labels.insert(0, current_label)
+            values.insert(0, "current_course")
         for i, label in enumerate(labels, 1):
             print(f"  {i}. {label}")
         try:
@@ -7718,6 +7796,11 @@ def _run_tui_menu(debug: bool = False) -> None:
             action = "exit"
 
     if action is None or action == "exit":
+        return
+
+    if action == "current_course" and current_course:
+        title, source_url, course_folder = current_course
+        _fetch_single_course(title, source_url, course_folder, debug=debug)
         return
 
     if action == "install":
@@ -8076,7 +8159,17 @@ def main() -> None:
                 print(f"   • {os.path.relpath(filepath, DOWNLOAD_FOLDER)}")
         return
 
-    # No explicit URL/flag: check clipboard, then TUI
+    # No explicit URL/flag. If we're sitting inside a tracked course folder, that
+    # course is the obvious target: auto-fetch it when headless, or pre-select it
+    # in the TUI so a single Enter refreshes just this course.
+    current_course = _detect_current_course(DOWNLOAD_FOLDER)
+    if current_course and not sys.stdin.isatty():
+        title, source_url, course_folder = current_course
+        _fetch_single_course(title, source_url, course_folder,
+                             dry_run=args.dry_run, debug=args.debug)
+        return
+
+    # Otherwise: check clipboard, then TUI
     try:
         clip = pyperclip.paste().strip()
     except Exception:
@@ -8085,7 +8178,7 @@ def main() -> None:
         _run_clip_mode(debug=args.debug)
         return
 
-    _run_tui_menu(debug=args.debug)
+    _run_tui_menu(debug=args.debug, current_course=current_course)
 
 
 if __name__ == "__main__":
