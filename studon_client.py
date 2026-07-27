@@ -2572,6 +2572,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -2596,12 +2597,41 @@ def _read_status():
         return {}
 
 
+def _humanize_age(epoch):
+    """Relative age of a unix timestamp, German short form ('' if unusable)."""
+    try:
+        delta = int(time.time() - float(epoch))
+    except Exception:
+        return ""
+    if delta < 0:
+        delta = 0
+    if delta < 60:
+        return "gerade eben"
+    if delta < 3600:
+        return "vor " + str(delta // 60) + " Min"
+    if delta < 86400:
+        return "vor " + str(delta // 3600) + " Std"
+    return "vor " + str(delta // 86400) + " Tg"
+
+
 def _spawn(argv, **kw):
     try:
         subprocess.Popen(argv, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True, **kw)
     except Exception:
         pass
+
+
+def _last_sync_label(st):
+    """'Letzter Sync: <wallclock> (<relative age>)' from the status dict."""
+    human = st.get("last_sync_human")
+    age = _humanize_age(st.get("last_sync_epoch")) if st.get("last_sync_epoch") else ""
+    if not human and not age:
+        return "Letzter Sync: noch keiner"
+    text = str(human) if human else ""
+    if age:
+        text = (text + " (" + age + ")") if text else age
+    return "Letzter Sync: " + text
 
 
 class StudonTray:
@@ -2616,6 +2646,8 @@ class StudonTray:
         self.menu = Gtk.Menu()
         self.status_item = Gtk.MenuItem(label="StudOn: ...")
         self.status_item.set_sensitive(False)
+        self.last_item = Gtk.MenuItem(label="Letzter Sync: ...")
+        self.last_item.set_sensitive(False)
         self.login_item = Gtk.MenuItem(label="In StudOn einloggen")
         self.login_item.connect("activate", self.on_login)
         self.sync_item = Gtk.MenuItem(label="Jetzt synchronisieren")
@@ -2625,7 +2657,7 @@ class StudonTray:
         self.quit_item = Gtk.MenuItem(label="Tray schliessen")
         self.quit_item.connect("activate", lambda _w: Gtk.main_quit())
 
-        for it in (self.status_item, self.login_item, self.sync_item,
+        for it in (self.status_item, self.last_item, self.login_item, self.sync_item,
                    self.dl_item, Gtk.SeparatorMenuItem(), self.quit_item):
             it.show()
             self.menu.append(it)
@@ -2648,6 +2680,7 @@ class StudonTray:
         else:
             label = "StudOn: bereit"
         self.status_item.set_label(label)
+        self.last_item.set_label(_last_sync_label(st))
         self.login_item.set_sensitive(bool(st.get("login_url")))
         self.sync_item.set_sensitive(bool(st.get("venv_python") and st.get("script_path")))
         self.dl_item.set_sensitive(bool(st.get("downloads_path")))
@@ -2739,6 +2772,21 @@ def _write_tray_status(**fields) -> None:
         os.replace(tmp, _TRAY_STATUS_PATH)
     except Exception as e:
         logger.debug(f"Tray status write failed: {e}")
+
+
+def _record_tray_sync(detail: str = "") -> None:
+    """Stamp the tray status with the moment this host last finished a sync.
+
+    Written by every completion path (lecture fire, daily sync, --update-all),
+    including the tray's own "Jetzt synchronisieren" — that runs as a separate
+    process, and _write_tray_status merges, so it can't clobber the daemon's
+    state/next_fire fields.
+    """
+    _write_tray_status(
+        last_sync_epoch=time.time(),
+        last_sync_human=datetime.now().strftime('%a %H:%M')
+        + (f" · {detail}" if detail else ""),
+    )
 
 
 def _ensure_tray_script() -> bool:
@@ -3020,6 +3068,7 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                     except Exception as e:
                         logger.warning(f"Feedback check failed (non-fatal): {e}")
                     logger.info("Daily sync complete.")
+                    _record_tray_sync("Daily sync")
                     _send_desktop_notification(n_downloaded, n_extracted, downloaded_files)
                     return
             finally:
@@ -3388,6 +3437,7 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
                     # fires) skip — write the marker even when nothing new was
                     # downloaded, because the scrape itself is what conflicts.
                     _mark_lecture_synced(course, lecture_start)
+                    _record_tray_sync(course.course_title)
                     if downloaded:
                         _send_desktop_notification(downloaded, extracted, downloaded_paths)
                         logger.info(f"Lecture sync: {downloaded} new, {extracted} extracted.")
@@ -7705,11 +7755,14 @@ def _run_tui_menu(debug: bool = False) -> None:
 
     if action == "update_all":
         success, n_downloaded, n_extracted, session_expired, _ = update_all_courses(debug=debug)
+        if success:
+            _record_tray_sync("Alle Kurse")
         if session_expired:
             recovered_session = _interactive_login_recovery()
             if recovered_session is not None:
                 print("\n🔄 Retrying update with new session...\n")
-                update_all_courses(debug=debug, session=recovered_session)
+                if update_all_courses(debug=debug, session=recovered_session)[0]:
+                    _record_tray_sync("Alle Kurse")
             else:
                 print("\n⏭️  Update skipped — no valid session available.")
         return
@@ -7995,11 +8048,14 @@ def main() -> None:
         if args.download_path:
             DOWNLOAD_FOLDER = args.download_path
         success, n_downloaded, n_extracted, session_expired, _ = update_all_courses(debug=args.debug)
+        if success:
+            _record_tray_sync("Alle Kurse")
         if session_expired and sys.stdin.isatty():
             recovered_session = _interactive_login_recovery()
             if recovered_session is not None:
                 print("\n🔄 Retrying update with new session...\n")
-                update_all_courses(debug=args.debug, session=recovered_session)
+                if update_all_courses(debug=args.debug, session=recovered_session)[0]:
+                    _record_tray_sync("Alle Kurse")
             else:
                 print("\n⏭️  Update skipped — no valid session available.")
         return
