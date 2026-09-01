@@ -2853,6 +2853,26 @@ def _launch_tray(login_url: Optional[str] = None) -> None:
         _tray_proc = None
 
 
+def _poll_until_login(access_check: Callable[[], bool], max_wait_seconds: float,
+                      interval: float = 5.0) -> bool:
+    """Poll access_check until it passes or the wall-clock budget runs out.
+
+    The fallback for hosts where no login tray is shown (AppIndicator hosts, no
+    display, missing pystray). Cheap: each call is a cookie read plus one GET.
+    """
+    deadline = time.time() + max_wait_seconds
+    while True:
+        try:
+            if access_check():
+                return True
+        except Exception as e:
+            logger.debug(f"Login poll failed: {e}")
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        time.sleep(min(interval, remaining))
+
+
 def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = None,
                              access_check: Callable[[], bool] = can_access_studon) -> bool:
     """Show a tray icon while polling for a valid login.
@@ -2873,6 +2893,14 @@ def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = N
     avoid blocking a fire window indefinitely.
     """
     if not _has_display():
+        return False
+    # On KDE (StatusNotifierItem) the pystray XEmbed icon shows up as a second,
+    # invisible tray slot whose only trace is the "StudOn: waiting for login"
+    # tooltip next to the real "StudOn client" icon. Wherever AppIndicator is
+    # available the persistent tray already shows the login state and carries the
+    # "In StudOn einloggen" item, so skip the ghost and let the caller poll.
+    if _system_python_has_appindicator():
+        logger.debug("AppIndicator tray present; skipping the pystray login icon.")
         return False
     try:
         import threading
@@ -3012,6 +3040,7 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                 # Visible, one-click login prompt (DBUS-only, works headless);
                 # de-duped internally so it doesn't re-nag every poll cycle.
                 _notify_login_required(login_url)
+                _write_tray_status(state="waiting_login", login_url=login_url)
                 tray_ok = _wait_for_login_via_tray(login_url)
                 if not tray_ok:
                     # Tray unavailable, user quit, or icon errored — poll silently.
@@ -3037,6 +3066,7 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
             # and dismiss any still-open "login required" notification.
             headless_wait_started = None
             _dismiss_login_prompt()
+            _write_tray_status(state="idle")
 
             # First-boot-wins guard: another fleet host (Workstation/Ideapad)
             # may have completed today's sync while this daemon was waiting
@@ -3412,6 +3442,10 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
                 # Visible, one-click login prompt (works headless via DBUS).
                 _notify_login_required(login_url)
                 tray_ok = _wait_for_login_via_tray(login_url, max_wait_seconds=tray_wait_seconds)
+                if not tray_ok:
+                    # No tray shown (AppIndicator host, headless, or pystray
+                    # missing) — keep the same fire window open by polling.
+                    tray_ok = _poll_until_login(can_access_studon, tray_wait_seconds)
                 if not tray_ok or not can_access_studon():
                     logger.info("Lecture sync: still not logged in after tray/notification window; skipping this fire.")
                     continue
@@ -7996,9 +8030,9 @@ def main() -> None:
             ok = _wait_for_login_via_tray(login_url, access_check=access_check)
             if not ok:
                 # Tray unavailable — fall back to silent polling
-                print(f"Waiting for {label} login (checking every 10 s)…")
+                print(f"Waiting for {label} login (checking every 5 s)…")
                 while not access_check():
-                    time.sleep(10)
+                    time.sleep(5)
             print(f"✅ {label} session is active.")
         return
 
