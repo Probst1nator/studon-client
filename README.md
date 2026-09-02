@@ -229,6 +229,7 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--check-feedback` | Scan inbox now and download any reachable feedback PDFs |
 | `--reset-feedback-state` | Clear `.studon_feedback_state.json` to reprocess all matching mails |
 | `--set-download-path PATH` | Persist download path to `config.json` |
+| `--tray` | Show the StudOn tray icon again after "Tray schliessen" and exit. Closing the tray sets `tray_closed` in `~/.local/state/studon-client/tray_status.json`, which stops both daemons from relaunching it and silences the login popups until the next successful StudOn login. |
 | `--debug` | Verbose logging, save discovery HTML |
 
 ### Interactive TUI

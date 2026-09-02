@@ -34,8 +34,8 @@ if "--advertise" in sys.argv:
         # so --install / .desktop launches don't pick up --clip.
         "alias_args": ["--clip"],
         # Skill support: --install-skill / --uninstall-skill write
-        # ~/.claude/skills/search-studon/SKILL.md from inline SKILL_MD_CONTENT.
-        "skill_name": "search-studon",
+        # ~/.claude/skills/studon-client/SKILL.md from inline SKILL_MD_CONTENT.
+        "skill_name": "studon-client",
         # Digest connection: advertise WHERE course PDFs land, but NO digest_run —
         # this client keeps its own download folder fresh via its @reboot
         # --daily-sync / --lecture-sync crons, so the digest must only OBSERVE the
@@ -59,7 +59,7 @@ import browser_cookie3
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from bs4.element import Tag
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
 import zipfile
 import tarfile
@@ -2707,34 +2707,40 @@ def _notify_env() -> dict:
 
 
 # One-click login prompt state. Holds the live notify-send process so a later
-# successful login can dismiss the still-open notification, and the last-fire
-# epoch so repeated poll cycles don't stack a notification per cycle.
-_login_prompt: dict = {"proc": None, "last_fire": 0.0}
+# successful login can dismiss the still-open notification, and the key of the
+# fetch attempt the last notification belonged to.
+_login_prompt: dict = {"proc": None, "last_key": None}
 
 
-def _notify_login_required(login_url: str, refire_after_seconds: float = 600.0) -> None:
+def _notify_login_required(login_url: str, attempt_key: str) -> None:
     """Fire a clickable desktop notification asking the user to log into StudOn.
 
     Visible, one-click: clicking the "In Firefox einloggen" action opens the
     login URL in the browser. The caller's existing poll loop then picks up the
     refreshed Firefox cookie on its next cycle (no extra wiring needed — polling
     already happens). The (blocking, --action implies --wait) notify-send call
-    runs in a daemon thread so the poll loop is never blocked, and is
-    de-duplicated so repeated polls don't spam one notification per cycle.
+    runs in a daemon thread so the poll loop is never blocked.
+
+    attempt_key identifies the fetch attempt that is blocked by the missing
+    login: one popup per attempt, not one per poll cycle. The daily sync passes
+    the date, the lecture sync passes course + lecture-window start so all three
+    fires of one window share a single popup. A successful login (or a manual
+    dismissal) clears the key so the next expiry can notify again.
 
     Unlike the tray icon, this needs only DBUS (not DISPLAY), so it works even
     from the headless @reboot cron context.
     """
     if not shutil.which("notify-send"):
         return
+    if _tray_closed():
+        return  # the user closed the tray — stay quiet until the next login
     import threading
-    now = time.time()
     proc = _login_prompt.get("proc")
     if proc is not None and proc.poll() is None:
         return  # a prompt is already on screen
-    if now - _login_prompt.get("last_fire", 0.0) < refire_after_seconds:
-        return  # fired recently — don't re-nag every poll cycle
-    _login_prompt["last_fire"] = now
+    if attempt_key == _login_prompt.get("last_key"):
+        return  # already notified for this fetch attempt
+    _login_prompt["last_key"] = attempt_key
     try:
         proc = subprocess.Popen(
             ["notify-send", "--app-name=StudOn Scraper", "--icon=dialog-password",
@@ -2769,7 +2775,11 @@ def _notify_login_required(login_url: str, refire_after_seconds: float = 600.0) 
 
 
 def _dismiss_login_prompt() -> None:
-    """Close any still-open 'login required' notification after a successful login."""
+    """Close any still-open 'login required' notification after a successful login.
+
+    Also clears the attempt latch, so the next blocked fetch attempt notifies
+    again.
+    """
     proc = _login_prompt.get("proc")
     if proc is not None and proc.poll() is None:
         try:
@@ -2777,6 +2787,8 @@ def _dismiss_login_prompt() -> None:
         except Exception:
             pass
     _login_prompt["proc"] = None
+    _login_prompt["last_key"] = None
+    _clear_tray_closed()
 
 
 # ── Persistent system-tray icon (AppIndicator / StatusNotifierItem) ─────────
@@ -2828,15 +2840,38 @@ STATUS_FILE = sys.argv[1] if len(sys.argv) > 1 else ""
 ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 ICON_ACTIVE = ("studon-client" if os.path.exists(os.path.join(ICON_DIR, "studon-client.png"))
                else "applications-education")
-ICON_ATTENTION = "dialog-password"
+# Bundled red-badged variant of the same logo. Breeze-dark on KDE does not
+# reliably swap icons on IndicatorStatus.ATTENTION, so the icon itself has to
+# change; fall back to the theme name if the PNG was never generated.
+ICON_ATTENTION = ("studon-client-attention"
+                  if os.path.exists(os.path.join(ICON_DIR, "studon-client-attention.png"))
+                  else "dialog-password")
 
 
 def _read_status():
     try:
         with open(STATUS_FILE, encoding="utf-8") as fh:
-            return json.load(fh)
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def _merge_status(**fields):
+    """Merge fields into the status JSON, atomically. Silent on failure.
+
+    Same tmp-file + os.replace pattern the parent process uses, so a concurrent
+    daemon write never sees a half-written file.
+    """
+    try:
+        data = _read_status()
+        data.update(fields)
+        tmp = STATUS_FILE + ".tray.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, STATUS_FILE)
+    except Exception:
+        pass
 
 
 def _humanize_age(epoch):
@@ -2896,8 +2931,8 @@ class StudonTray:
         self.sync_item.connect("activate", self.on_sync)
         self.dl_item = Gtk.MenuItem(label="Download-Ordner oeffnen")
         self.dl_item.connect("activate", self.on_downloads)
-        self.quit_item = Gtk.MenuItem(label="Tray schliessen")
-        self.quit_item.connect("activate", lambda _w: Gtk.main_quit())
+        self.quit_item = Gtk.MenuItem(label="Tray schliessen (bis zum naechsten Login)")
+        self.quit_item.connect("activate", self.on_quit)
 
         for it in (self.status_item, self.last_item, self.login_item, self.sync_item,
                    self.dl_item, Gtk.SeparatorMenuItem(), self.quit_item):
@@ -2952,7 +2987,26 @@ class StudonTray:
                 else AppIndicator3.IndicatorStatus.ACTIVE)
         except Exception:
             pass
+        # Swap the main icon too: hosts that ignore NeedsAttention (KDE Plasma
+        # with breeze-dark) otherwise show no visible change at all.
+        try:
+            if state == "waiting_login":
+                self.ind.set_icon_full(ICON_ATTENTION, "StudOn-Login erforderlich")
+            else:
+                self.ind.set_icon_full(ICON_ACTIVE, "StudOn client")
+        except Exception:
+            pass
         return True  # keep the GLib timer alive
+
+    def on_quit(self, _w):
+        """Close the tray and keep it closed until the next successful login.
+
+        tray_closed also silences the login popups — that is what the flag is
+        for. The daemons clear it after a login, and `--tray` clears it on
+        demand.
+        """
+        _merge_status(tray_closed=True, tray_closed_epoch=time.time())
+        Gtk.main_quit()
 
     def on_login(self, _w):
         url = _read_status().get("login_url")
@@ -3017,16 +3071,64 @@ def _system_python_has_appindicator() -> bool:
     return _appindicator_ok
 
 
+def _read_tray_status() -> dict:
+    """The tray status JSON as a dict, {} if missing or unreadable."""
+    try:
+        with open(_TRAY_STATUS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pid_alive(pid) -> bool:
+    """True if a process with this pid exists (same probe the tray uses)."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def _tray_closed() -> bool:
+    """True while the user has closed the tray via its 'Tray schliessen' item.
+
+    `tray_closed` in the status JSON means: do not relaunch the tray and do not
+    fire login popups. It is cleared by the next successful login and by
+    `--tray`.
+    """
+    return bool(_read_tray_status().get("tray_closed"))
+
+
+def _clear_tray_closed() -> None:
+    """Lift the user's tray-closed flag so the tray and its popups return."""
+    if _tray_closed():
+        _write_tray_status(tray_closed=False, tray_closed_epoch=0)
+
+
 def _write_tray_status(**fields) -> None:
-    """Merge-write the per-host tray status JSON atomically. Silent on failure."""
+    """Merge-write the per-host tray status JSON atomically. Silent on failure.
+
+    A live `waiting_login` written by another running process is never
+    overwritten: both daemons write this file, and the lecture sync's routine
+    `state="idle"` used to wipe the daily sync's login request. Own-pid writes
+    always go through, so a process is never blocked by its own state entry.
+    """
     try:
         os.makedirs(_TRAY_STATE_DIR, exist_ok=True)
-        data: dict = {}
-        try:
-            with open(_TRAY_STATUS_PATH, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            data = {}
+        data: dict = _read_tray_status()
+        if "state" in fields or "login_url" in fields:
+            try:
+                other_pid = int(data.get("state_pid"))
+            except (TypeError, ValueError):
+                other_pid = os.getpid()  # unusable pid: treat as our own
+            if (data.get("state") == "waiting_login"
+                    and other_pid != os.getpid()
+                    and _pid_alive(other_pid)):
+                # Another live process is waiting for the login. Merge the
+                # descriptive fields but leave its request standing.
+                fields = {k: v for k, v in fields.items()
+                          if k not in ("state", "state_pid", "login_url")}
         data.update(fields)
         if "state" in fields:
             # Lets the tray tell a live waiting_login from one left by a process
@@ -3086,24 +3188,33 @@ def _stop_tray() -> None:
 def _launch_tray(login_url: Optional[str] = None) -> None:
     """Start (or restart) the persistent AppIndicator tray helper — idempotent.
 
-    No-op when a helper is already alive, there's no display, or the system
-    python lacks AppIndicator; the daemon then relies on the notify-send login
-    prompt alone.
+    No-op when a helper is already alive, the user closed the tray, there's no
+    display, or the system python lacks AppIndicator; the daemon then relies on
+    the notify-send login prompt alone.
     """
     global _tray_proc
     if _tray_proc is not None and _tray_proc.poll() is None:
         return  # already running
+    if _tray_closed():
+        return  # the user closed it — do not bring it back
     if not _has_display() or not _system_python_has_appindicator():
         return
     if not _ensure_tray_script():
         return
-    _write_tray_status(
-        state="idle",
+    # Descriptive fields only: forcing state="idle" here would wipe a live
+    # waiting_login written by the other daemon.
+    fields = dict(
         downloads_path=DOWNLOAD_FOLDER,
         venv_python=sys.executable,
         script_path=os.path.abspath(__file__),
-        login_url=login_url or "",
     )
+    if login_url:
+        fields["login_url"] = login_url
+    elif not _read_tray_status().get("login_url"):
+        fields["login_url"] = ""
+    if not _read_tray_status().get("state"):
+        fields["state"] = "idle"
+    _write_tray_status(**fields)
     try:
         env = _notify_env()
         env.pop("PYTHONPATH", None)
@@ -3308,9 +3419,10 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                         else "no display — desktop notification only",
                     )
                     waiting_logged = True
-                # Visible, one-click login prompt (DBUS-only, works headless);
-                # de-duped internally so it doesn't re-nag every poll cycle.
-                _notify_login_required(login_url)
+                    # One popup per blocked sync attempt: the daily sync is one
+                    # attempt per day, so the poll loop below stays silent.
+                    _notify_login_required(
+                        login_url, attempt_key=f"daily:{date.today().isoformat()}")
                 _write_tray_status(state="waiting_login", login_url=login_url)
                 tray_ok = _wait_for_login_via_tray(login_url)
                 if not tray_ok:
@@ -3330,7 +3442,8 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                             )
                             return
                     time.sleep(check_interval_seconds)
-                waiting_logged = False
+                # waiting_logged stays set: the wait log line and the login
+                # popup belong to the attempt, not to each poll cycle.
                 continue
             # Session is accessible again — reset the headless give-up timer so a
             # later mid-run expiry starts its own bounded wait, not a stale one,
@@ -3714,7 +3827,12 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
                        else "firing desktop notification (no display for tray).")
                 )
                 # Visible, one-click login prompt (works headless via DBUS).
-                _notify_login_required(login_url)
+                # Keyed by course + lecture-window start, so all three fires of
+                # one window (−5m / start / +5m) share a single popup.
+                _notify_login_required(
+                    login_url,
+                    attempt_key=(f"lecture:{os.path.basename(course.course_folder)}:"
+                                 f"{lecture_start.isoformat()}"))
                 tray_ok = _wait_for_login_via_tray(login_url, max_wait_seconds=tray_wait_seconds)
                 if not tray_ok:
                     # No tray shown (AppIndicator host, headless, or pystray
@@ -4248,22 +4366,24 @@ def _run_uninstall() -> None:
 
 
 # --- Claude Code skill registration ---------------------------------------
-# Single source of truth for ~/.claude/skills/search-studon/SKILL.md. Update
+# Single source of truth for ~/.claude/skills/studon-client/SKILL.md. Update
 # this when CLI flags change so `python3 studon_client.py --install-skill` re-
 # registers a fresh manifest. Kept inline so the script stays self-contained.
-# (Renamed from `studon` → `search-studon` 2026-06-07 for legibility + to group
-# with sibling source-fetcher skills like `search-youtube`.)
-SKILL_DIR  = Path.home() / '.claude' / 'skills' / 'search-studon'
+# Renamed twice: `studon` → `search-studon` on 2026-06-07 (legibility, grouping
+# with sibling source-fetcher skills like `search-youtube`), then
+# `search-studon` → `studon-client` on 2026-09-02 to satisfy the one-identity
+# naming rule (repo name = bash alias = skill name).
+SKILL_DIR  = Path.home() / '.claude' / 'skills' / 'studon-client'
 SKILL_FILE = SKILL_DIR / 'SKILL.md'
-# Pre-rename installs left a `studon` skill dir; prune it on (un)install so
-# other fleet hosts converge when they next run --install / --install-skill.
-LEGACY_SKILL_DIRS = ('studon',)
+# Both earlier names left a skill dir behind; prune them on (un)install so other
+# fleet hosts converge when they next run --install / --install-skill.
+LEGACY_SKILL_DIRS = ('studon', 'search-studon')
 SKILL_MD_CONTENT = '''---
-name: search-studon
+name: studon-client
 description: Drive the StudOn / Campo scraper at ~/Synced/repos/AutomatedAlchemy/studon-client/. Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, dump prüfungs-Anmeldefristen, export the studyPlanner Modulplan (status/ECTS/Versuch per module), list current Belegungen (angemeldete Prüfungen + Veranstaltungen mit Termin/Raum/Prüfer), reconcile Modulplan ↔ Belegungen for an honest ECTS-Bilanz, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studienfortschritt", "modulplan", "wieviele ects hab ich", "belegungen", "wo bin ich angemeldet", "klausurtermin", "reconcile", "ects bilanz", "stimmt meine ects", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
 ---
 
-# search-studon
+# studon-client
 
 Wrapper for the StudOn / Campo scraper at
 `~/Synced/repos/AutomatedAlchemy/studon-client/studon_client.py`.
@@ -4334,6 +4454,7 @@ already has `browser-cookie3`, `beautifulsoup4`, `requests`, `questionary`.)
 | Download all Notenübersicht/Bescheinigungen PDFs | `$PY $SCRAPER --campo-bescheinigungen` |
 | Show next 5 lecture-sync fires (debug) | `$PY $SCRAPER --lecture-sync-once` |
 | Set default download path | `$PY $SCRAPER --set-download-path ~/path` |
+| Bring the tray icon back after "Tray schliessen" | `$PY $SCRAPER --tray` |
 | (Re)install this Claude skill | `$PY $SCRAPER --install-skill` |
 
 Full architecture & dataclasses: `~/Synced/repos/AutomatedAlchemy/studon-client/CLAUDE.md`.
@@ -4427,20 +4548,28 @@ def _is_skill_installed() -> bool:
 
 
 def _prune_legacy_skill_dirs() -> None:
-    """Remove a pre-rename ~/.claude/skills/studon/ that older installs created."""
+    """Remove the skill dirs left by the two earlier skill names.
+
+    2026-06-07 renamed `studon` → `search-studon`, 2026-09-02 renamed
+    `search-studon` → `studon-client` so repo, bash alias and skill share one
+    name. Only a dir that holds our SKILL.md is touched; anything else with the
+    same name is left alone.
+    """
     for legacy in LEGACY_SKILL_DIRS:
-        legacy_file = Path.home() / '.claude' / 'skills' / legacy / 'SKILL.md'
-        if legacy_file.exists():
-            legacy_file.unlink()
-            print(f"  ✅ Removed legacy skill {legacy_file}")
+        legacy_dir = Path.home() / '.claude' / 'skills' / legacy
+        legacy_file = legacy_dir / 'SKILL.md'
+        if not legacy_file.is_file():
+            continue  # not ours — never remove it
+        legacy_file.unlink()
+        print(f"  ✅ Removed legacy skill {legacy_file}")
         try:
-            legacy_file.parent.rmdir()  # only if now empty
+            legacy_dir.rmdir()  # only if now empty
         except OSError:
             pass
 
 
 def _run_install_skill() -> None:
-    """Write (or refresh) ~/.claude/skills/search-studon/SKILL.md from the inline source."""
+    """Write (or refresh) ~/.claude/skills/studon-client/SKILL.md from the inline source."""
     _prune_legacy_skill_dirs()
     SKILL_DIR.mkdir(parents=True, exist_ok=True)
     pre_existed = SKILL_FILE.exists()
@@ -4454,7 +4583,7 @@ def _run_install_skill() -> None:
 
 
 def _run_uninstall_skill() -> None:
-    """Remove ~/.claude/skills/search-studon/SKILL.md (and the empty dir, plus any legacy `studon` dir)."""
+    """Remove ~/.claude/skills/studon-client/SKILL.md (and the empty dir, plus the legacy `studon` / `search-studon` dirs)."""
     _prune_legacy_skill_dirs()
     if SKILL_FILE.exists():
         SKILL_FILE.unlink()
@@ -8254,9 +8383,11 @@ def main() -> None:
     parser.add_argument('--install', action='store_true',
                        help='Install cron job and shell function (replaces setup_daily_sync.sh)')
     parser.add_argument('--install-skill', action='store_true',
-                       help='(Re)write ~/.claude/skills/search-studon/SKILL.md from the inline source so Claude Code surfaces this scraper as a skill')
+                       help='(Re)write ~/.claude/skills/studon-client/SKILL.md from the inline source so Claude Code surfaces this scraper as a skill')
     parser.add_argument('--uninstall-skill', action='store_true',
-                       help='Remove ~/.claude/skills/search-studon/SKILL.md')
+                       help='Remove ~/.claude/skills/studon-client/SKILL.md')
+    parser.add_argument('--tray', action='store_true',
+                       help='Show the StudOn tray icon again after "Tray schliessen" and exit')
     parser.add_argument('--timetable', action='store_true',
                        help='Fetch personal campo timetable and write to timetable.md')
     parser.add_argument('--modulplan', action='store_true',
@@ -8370,6 +8501,21 @@ def main() -> None:
 
     if args.uninstall_skill:
         _run_uninstall_skill()
+        return
+
+    # --- Bring the tray back after the user closed it ---
+    if args.tray:
+        global _tray_proc
+        _clear_tray_closed()
+        _launch_tray()
+        if _tray_proc is not None:
+            # The tray must outlive this short-lived process, so drop the
+            # atexit terminate hook _launch_tray registered.
+            atexit.unregister(_stop_tray)
+            _tray_proc = None
+            print("✅ StudOn tray icon started.")
+        else:
+            print("Tray not started: no display, or the system python lacks AppIndicator.")
         return
 
     # --- IMAP setup ---
