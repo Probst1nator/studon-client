@@ -19,7 +19,10 @@ if "--advertise" in sys.argv:
     print(json.dumps([{
         "name": "StudOn Client",
         "desktop_file": "studon_client.desktop",
-        "icon": "applications-internet",
+        # Bundled StudOn logo (assets/studon-client.png); absolute so the
+        # .desktop Icon= key resolves without installing a theme icon.
+        "icon": os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "assets", "studon-client.png"),
         "desc": "FAU StudOn / campo scraper — course downloads, timetable, Notenübersicht-PDFs",
         "terminal": True,
         "args": [],
@@ -384,6 +387,8 @@ class UpdateState:
 
 # --- CONFIGURATION ---
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ASSET_DIR = os.path.join(_SCRIPT_DIR, "assets")
+_ICON_PATH = os.path.join(_ASSET_DIR, "studon-client.png")
 CONFIG_FILE = os.path.join(_SCRIPT_DIR, "config.json")
 
 def load_config() -> dict:
@@ -2391,6 +2396,31 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
         logger.error(f"Error during update: {e}")
         return False, 0, 0, False, []
 
+def _course_for_path(filepath: str) -> str:
+    """Course a downloaded file belongs to: its top folder under DOWNLOAD_FOLDER.
+
+    Falls back to the parent directory name when the file sits outside the
+    download root (e.g. a custom --download-path run).
+    """
+    path = Path(filepath)
+    try:
+        rel = path.relative_to(Path(DOWNLOAD_FOLDER))
+        if len(rel.parts) > 1:
+            return rel.parts[0]
+    except ValueError:
+        pass
+    parent = path.parent.name
+    return parent or "StudOn"
+
+
+def _group_files_by_course(files: List[str]) -> List[Tuple[str, List[str]]]:
+    """Group file paths by course, keeping first-seen order of both."""
+    grouped: Dict[str, List[str]] = {}
+    for f in files:
+        grouped.setdefault(_course_for_path(f), []).append(f)
+    return list(grouped.items())
+
+
 def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optional[List[str]] = None) -> None:
     """Send a desktop notification via notify-send (Linux).
 
@@ -2406,10 +2436,19 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optio
         body = ", ".join(parts) + "."
         if files:
             max_list = 10
-            shown = files[:max_list]
-            lines = [f"• {os.path.basename(p)}" for p in shown]
-            if len(files) > max_list:
-                lines.append(f"… and {len(files) - max_list} more")
+            listed = 0
+            lines: List[str] = []
+            for course, course_files in _group_files_by_course(files):
+                if listed >= max_list:
+                    break
+                lines.append(f"{course}:")
+                for f in course_files:
+                    if listed >= max_list:
+                        break
+                    lines.append(f"  • {os.path.basename(f)}")
+                    listed += 1
+            if listed < len(files):
+                lines.append(f"… and {len(files) - listed} more")
             body = body + "\n" + "\n".join(lines)
     else:
         body = "Everything already up to date."
@@ -2585,7 +2624,13 @@ except (ValueError, ImportError):
 from gi.repository import GLib, Gtk
 
 STATUS_FILE = sys.argv[1] if len(sys.argv) > 1 else ""
-ICON_ACTIVE = "applications-education"
+
+# The StudOn logo ships next to this script in assets/. Indicator.new_with_path
+# prepends that folder to the icon search path, so ICON_ACTIVE resolves to the
+# bundled PNG by basename while ICON_ATTENTION still comes from the system theme.
+ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+ICON_ACTIVE = ("studon-client" if os.path.exists(os.path.join(ICON_DIR, "studon-client.png"))
+               else "applications-education")
 ICON_ATTENTION = "dialog-password"
 
 
@@ -2636,9 +2681,9 @@ def _last_sync_label(st):
 
 class StudonTray:
     def __init__(self):
-        self.ind = AppIndicator3.Indicator.new(
+        self.ind = AppIndicator3.Indicator.new_with_path(
             "studon-client", ICON_ACTIVE,
-            AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
+            AppIndicator3.IndicatorCategory.APPLICATION_STATUS, ICON_DIR)
         self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
         self.ind.set_attention_icon_full(ICON_ATTENTION, "StudOn-Login erforderlich")
         self.ind.set_title("StudOn client")
@@ -2667,9 +2712,29 @@ class StudonTray:
         self._refresh()
         GLib.timeout_add_seconds(5, self._refresh)
 
+    @staticmethod
+    def _live_state(st):
+        """The status state, with a stale waiting_login demoted to idle.
+
+        waiting_login is latched into the file by whichever sync process is
+        blocked on the login; only that process clears it. When it exits (the
+        daily sync finishes its run, or is killed) the flag would otherwise
+        stick and the tray would demand a login forever — the 2026-09-01 bug.
+        Trust the flag only while its writer is still alive.
+        """
+        state = st.get("state", "idle")
+        if state != "waiting_login":
+            return state
+        pid = st.get("state_pid")
+        try:
+            os.kill(int(pid), 0)
+            return state
+        except Exception:
+            return "idle"
+
     def _refresh(self):
         st = _read_status()
-        state = st.get("state", "idle")
+        state = self._live_state(st)
         nf = st.get("next_fire_human")
         if state == "waiting_login":
             label = "StudOn: Login erforderlich"
@@ -2766,6 +2831,11 @@ def _write_tray_status(**fields) -> None:
         except Exception:
             data = {}
         data.update(fields)
+        if "state" in fields:
+            # Lets the tray tell a live waiting_login from one left by a process
+            # that has since exited (see StudonTray._live_state).
+            data["state_pid"] = os.getpid()
+            data["state_epoch"] = time.time()
         tmp = _TRAY_STATUS_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
@@ -2910,10 +2980,14 @@ def _wait_for_login_via_tray(login_url: str, max_wait_seconds: Optional[int] = N
         logger.info(f"Tray icon unavailable ({e}); falling back to silent polling.")
         return False
 
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    d.ellipse((4, 4, 60, 60), fill=(30, 110, 200, 255), outline=(255, 255, 255, 255), width=3)
-    d.text((20, 18), "S", fill=(255, 255, 255, 255))
+    try:
+        img = Image.open(_ICON_PATH).convert("RGBA")
+    except Exception as e:
+        logger.debug(f"Tray logo {_ICON_PATH} unusable ({e}); drawing a placeholder.")
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((4, 4, 60, 60), fill=(30, 110, 200, 255), outline=(255, 255, 255, 255), width=3)
+        d.text((20, 18), "S", fill=(255, 255, 255, 255))
 
     state = {
         "fast_until": 0.0,    # epoch until which to poll every 5s
@@ -3098,6 +3172,9 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                     except Exception as e:
                         logger.warning(f"Feedback check failed (non-fatal): {e}")
                     logger.info("Daily sync complete.")
+                    # Clear any latched login flag before this run exits — the
+                    # tray must not keep asking for a login we no longer need.
+                    _write_tray_status(state="idle")
                     _record_tray_sync("Daily sync")
                     _send_desktop_notification(n_downloaded, n_extracted, downloaded_files)
                     return
