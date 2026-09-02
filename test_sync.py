@@ -95,3 +95,229 @@ def test_intact_metadata_is_read_from_the_file_not_the_link(tmp_path):
     found = s.find_all_metadata_files(str(tmp_path))
     assert [url for _, url, _ in found] == [other]
     assert found[0][2] == str(folder)
+
+
+# --- Two StudOn items must not overwrite each other locally -----------------
+
+def _claim(*paths):
+    return {os.path.abspath(p): "some-other-url" for p in paths}
+
+
+def test_ref_id_is_read_from_a_studon_link():
+    assert s._ref_id_from_url(COURSE_URL) == "6732198"
+    assert s._ref_id_from_url("https://x/y?a=1") is None
+    assert s._ref_id_from_url("") is None
+
+
+def test_collision_prefers_the_studon_item_title(tmp_path):
+    taken = str(tmp_path / "final_exam.pdf")
+    alt = s._disambiguate_filepath(taken, "Exam_SS21", COURSE_URL, _claim(taken))
+    assert alt == str(tmp_path / "Exam_SS21.pdf")
+
+
+def test_collision_falls_back_to_the_ref_id_when_the_title_matches(tmp_path):
+    """A title equal to the download name cannot tell the two items apart."""
+    taken = str(tmp_path / "final_exam.pdf")
+    alt = s._disambiguate_filepath(taken, "final_exam.pdf", COURSE_URL, _claim(taken))
+    assert alt == str(tmp_path / "final_exam_ref6732198.pdf")
+
+
+def test_collision_never_lands_on_an_existing_file(tmp_path):
+    """An existing file is neither overwritten nor renamed — the newcomer moves."""
+    taken = tmp_path / "final_exam.pdf"
+    taken.write_bytes(b"x")
+    (tmp_path / "Exam_SS21.pdf").write_bytes(b"y")
+    alt = s._disambiguate_filepath(str(taken), "Exam_SS21", COURSE_URL, _claim(str(taken)))
+    assert alt == str(tmp_path / "final_exam_ref6732198.pdf")
+
+
+def test_collision_is_deterministic(tmp_path):
+    taken = str(tmp_path / "final_exam.pdf")
+    first = s._disambiguate_filepath(taken, "Exam_SS21", COURSE_URL, _claim(taken))
+    second = s._disambiguate_filepath(taken, "Exam_SS21", COURSE_URL, _claim(taken))
+    assert first == second
+
+
+def test_no_collision_leaves_the_download_name_alone(tmp_path):
+    """The first claimant of a name keeps it; only later ones are renamed."""
+    path = str(tmp_path / "final_exam.pdf")
+    # download_all_files only calls the helper on a real clash, but the helper
+    # itself must still hand back a usable path when the name is free.
+    assert s._disambiguate_filepath(path, "Exam_SS21", COURSE_URL, {}) == str(
+        tmp_path / "Exam_SS21.pdf")
+
+
+class _FakeDownloadSession:
+    """Serves each URL a body under a fixed Content-Disposition filename."""
+
+    def __init__(self, bodies):
+        self._bodies = bodies  # url -> (filename, bytes)
+
+    def get(self, url, stream=False, timeout=None):
+        filename, body = self._bodies[url]
+        return _FakeDownload(filename, body)
+
+
+class _FakeDownload:
+    def __init__(self, filename, body):
+        self.headers = {"Content-Disposition": f'filename="{filename}"'}
+        self._body = body
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=8192):
+        yield self._body
+
+
+def _two_colliding_items(course):
+    """Two StudOn items with distinct titles, both served as final_exam.pdf."""
+    base = "https://www.studon.fau.de/studon/ilias.php?cmd=sendfile&ref_id="
+    urls = [base + "6891449", base + "6891450"]
+    files = [
+        {"url": urls[0], "path": str(course / "Old Exams"), "name": "Exam_ws2021",
+         "course_title": "IML"},
+        {"url": urls[1], "path": str(course / "Old Exams"), "name": "Exam_SS21",
+         "course_title": "IML"},
+    ]
+    session = _FakeDownloadSession({
+        urls[0]: ("final_exam.pdf", b"a" * 10),
+        urls[1]: ("final_exam.pdf", b"b" * 20),
+    })
+    return urls, files, session
+
+
+def test_colliding_items_get_separate_files_and_metadata_entries(tmp_path, monkeypatch):
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    course = tmp_path / "IML"
+    course.mkdir()
+    urls, files, session = _two_colliding_items(course)
+
+    count, downloaded = s.download_all_files(
+        COURSE_URL, files, session, course_title="IML", base_path=str(course))
+
+    assert count == 2
+    assert sorted(os.path.basename(p) for p in downloaded) == [
+        "Exam_SS21.pdf", "final_exam.pdf"]
+    # Both survive: the second no longer overwrites the first.
+    assert (course / "Old Exams" / "final_exam.pdf").read_bytes() == b"a" * 10
+    assert (course / "Old Exams" / "Exam_SS21.pdf").read_bytes() == b"b" * 20
+
+    meta = s.CourseMetadata.from_yaml_markdown(str(course / "METADATA.md"))
+    by_url = {r.download_url: r.filepath.name for r in meta.file_history}
+    assert by_url == {urls[0]: "final_exam.pdf", urls[1]: "Exam_SS21.pdf"}
+
+
+def test_a_second_sync_downloads_nothing_and_renames_nothing(tmp_path, monkeypatch):
+    """The recurring re-download: both items are recognised on disk next run."""
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    course = tmp_path / "IML"
+    course.mkdir()
+    _, files, session = _two_colliding_items(course)
+    s.download_all_files(COURSE_URL, files, session, course_title="IML",
+                         base_path=str(course))
+    before = sorted(p.name for p in (course / "Old Exams").iterdir())
+
+    count, downloaded = s.download_all_files(
+        COURSE_URL, files, session, course_title="IML", base_path=str(course))
+
+    assert (count, downloaded) == (0, [])
+    assert sorted(p.name for p in (course / "Old Exams").iterdir()) == before
+
+
+def test_an_unknown_local_file_is_left_alone(tmp_path, monkeypatch):
+    """A file the user placed by hand is neither deleted nor overwritten."""
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    course = tmp_path / "IML"
+    (course / "Old Exams").mkdir(parents=True)
+    manual = course / "Old Exams" / "final_exam_SS21_ref6891450.pdf"
+    manual.write_bytes(b"mine")
+    _, files, session = _two_colliding_items(course)
+
+    s.download_all_files(COURSE_URL, files, session, course_title="IML",
+                         base_path=str(course))
+
+    assert manual.read_bytes() == b"mine"
+
+
+def test_metadata_recording_two_items_at_one_path_is_repaired(tmp_path, monkeypatch):
+    """The state a past collision left behind: both items recorded at one path.
+
+    The shared path must not count as "already downloaded" for both, or the
+    second item would stay missing forever.
+    """
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    course = tmp_path / "IML"
+    (course / "Old Exams").mkdir(parents=True)
+    (course / "Old Exams" / "final_exam.pdf").write_bytes(b"a" * 10)
+    urls, files, session = _two_colliding_items(course)
+    (course / "METADATA.md").write_text(
+        "---\n"
+        "course_title: IML\n"
+        f"source_url: {COURSE_URL}\n"
+        "last_fetched: '2026-08-31T19:05:08'\n"
+        "file_history:\n"
+        + "".join(
+            f"- filepath: Old Exams/final_exam.pdf\n"
+            f"  timestamp: '2026-08-31T19:05:08'\n"
+            f"  course_name: IML\n"
+            f"  size_bytes: 10\n"
+            f"  download_url: {u}\n"
+            for u in urls
+        )
+        + "---\n\n# IML\n",
+        encoding="utf-8",
+    )
+
+    count, downloaded = s.download_all_files(
+        COURSE_URL, files, session, course_title="IML", base_path=str(course))
+
+    assert count == 1
+    assert [os.path.basename(p) for p in downloaded] == ["Exam_SS21.pdf"]
+    assert (course / "Old Exams" / "final_exam.pdf").read_bytes() == b"a" * 10
+    assert (course / "Old Exams" / "Exam_SS21.pdf").read_bytes() == b"b" * 20
+
+
+def test_the_recorded_size_decides_who_owns_a_contested_path(tmp_path, monkeypatch):
+    """The item processed first must not claim a file that is not its own.
+
+    Both items are recorded at Old Exams/final_exam.pdf, but only one of the
+    two recorded sizes matches what is on disk.
+    """
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    course = tmp_path / "IML"
+    (course / "Old Exams").mkdir(parents=True)
+    (course / "Old Exams" / "final_exam.pdf").write_bytes(b"a" * 10)
+    urls, files, session = _two_colliding_items(course)
+    # Process the item that does NOT own the file first.
+    files = [files[1], files[0]]
+    sizes = {urls[0]: 10, urls[1]: 20}
+    (course / "METADATA.md").write_text(
+        "---\ncourse_title: IML\n"
+        f"source_url: {COURSE_URL}\n"
+        "last_fetched: '2026-08-31T19:05:08'\n"
+        "file_history:\n"
+        + "".join(
+            "- filepath: Old Exams/final_exam.pdf\n"
+            "  timestamp: '2026-08-31T19:05:08'\n"
+            "  course_name: IML\n"
+            f"  size_bytes: {sizes[u]}\n"
+            f"  download_url: {u}\n"
+            for u in urls
+        )
+        + "---\n\n# IML\n",
+        encoding="utf-8",
+    )
+
+    count, downloaded = s.download_all_files(
+        COURSE_URL, files, session, course_title="IML", base_path=str(course))
+
+    assert count == 1
+    assert [os.path.basename(p) for p in downloaded] == ["Exam_SS21.pdf"]
+    # final_exam.pdf stays the ws2021 file it always was.
+    assert (course / "Old Exams" / "final_exam.pdf").read_bytes() == b"a" * 10
+    meta = s.CourseMetadata.from_yaml_markdown(str(course / "METADATA.md"))
+    newest = {}
+    for r in meta.file_history:
+        newest.setdefault(r.download_url, r.filepath.name)
+    assert newest[urls[1]] == "Exam_SS21.pdf"

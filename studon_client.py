@@ -1508,6 +1508,43 @@ def discover_items_recursive(page_url: str, current_path: str, session: requests
             # `target=crs_` deliberately excluded: it links to another course.
             _enter_folder(item_url, item_name)
 
+def _ref_id_from_url(url: str) -> Optional[str]:
+    """The StudOn ref_id in a link, which is unique per item within a course."""
+    match = re.search(r'[?&]ref_id=(\d+)', url or '')
+    return match.group(1) if match else None
+
+
+def _disambiguate_filepath(filepath: str, item_title: str, file_url: str,
+                           claimed: Dict[str, str]) -> str:
+    """A free local path for a download whose filename is already taken.
+
+    StudOn happily serves two different items of one course under the same
+    download filename (two exam PDFs both sent as final_exam.pdf). Writing both
+    to one path makes each run overwrite the other and re-fetch both forever.
+    Prefer the item's own StudOn title — that is what tells them apart on the
+    course page — then the ref_id, which is unique per item, then a counter.
+    Candidates that already exist on disk are skipped so nothing is clobbered
+    or renamed; only a new collision gets a new name.
+    """
+    folder, name = os.path.split(filepath)
+    stem, ext = os.path.splitext(name)
+
+    candidates: List[str] = []
+    title_stem = clean_filename(os.path.splitext(item_title or '')[0]).strip()
+    if title_stem and title_stem != stem:
+        candidates.append(title_stem + ext)
+    ref_id = _ref_id_from_url(file_url)
+    if ref_id:
+        candidates.append(f"{stem}_ref{ref_id}{ext}")
+    candidates.extend(f"{stem}_{n}{ext}" for n in range(2, 100))
+
+    for candidate in candidates:
+        alt = os.path.join(folder, candidate)
+        if os.path.abspath(alt) not in claimed and not os.path.exists(alt):
+            return alt
+    return filepath
+
+
 def download_all_files(source: str, files_to_download: List[Dict[str, str]], session: requests.Session, course_title: Optional[str] = None, base_path: str = None) -> Tuple[int, List[str]]:
     """Downloads all files from the provided list.
 
@@ -1531,6 +1568,43 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
     last_fetched = existing_metadata.last_fetched if existing_metadata else None
     tracked_urls: set = {r.download_url for r in (existing_metadata.file_history if existing_metadata else []) if r.download_url}
 
+    # Where each already-downloaded item landed, newest record first. The item
+    # title and the download filename often differ, so without this an item
+    # whose file is on disk under the download name looks missing every run.
+    history_path_by_url: Dict[str, str] = {}
+    history_size_by_url: Dict[str, int] = {}
+    for record in (existing_metadata.file_history if existing_metadata else []):
+        if record.download_url and record.download_url not in history_path_by_url:
+            history_path_by_url[record.download_url] = str(record.filepath)
+            history_size_by_url[record.download_url] = record.size_bytes or 0
+
+    # Paths a past collision recorded for more than one item. Only one of them
+    # is really on disk, so for these the recorded size decides whose it is;
+    # everywhere else the path alone is trusted, which keeps the .new flow for
+    # files that legitimately changed size upstream.
+    contested_paths = {
+        os.path.abspath(path)
+        for path in history_path_by_url.values()
+        if list(history_path_by_url.values()).count(path) > 1
+    }
+
+    # Local paths already spoken for in this run, by the item that claimed them.
+    claimed_paths: Dict[str, str] = {}
+
+    # Reserve every contested path for its rightful owner up front, so the
+    # outcome does not depend on which of the two items the crawler happens to
+    # reach first.
+    for url, path in history_path_by_url.items():
+        abs_path = os.path.abspath(path)
+        if abs_path not in contested_paths:
+            continue
+        recorded_size = history_size_by_url.get(url) or 0
+        try:
+            if recorded_size and os.path.getsize(path) == recorded_size:
+                claimed_paths.setdefault(abs_path, url)
+        except OSError:
+            pass
+
     for i, file_info in enumerate(files_to_download):
         file_url: str = file_info['url']
         save_path: str = file_info['path']
@@ -1544,13 +1618,29 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
 
             # Check if file already exists (before downloading)
             # Try with the expected name and also with .pdf extension if no extension
-            filepath_candidates = [os.path.join(save_path, expected_name)]
+            filepath_candidates = []
+            recorded = history_path_by_url.get(file_url)
+            if recorded and os.path.abspath(recorded) in contested_paths:
+                recorded_size = history_size_by_url.get(file_url) or 0
+                try:
+                    if recorded_size and os.path.getsize(recorded) != recorded_size:
+                        recorded = None  # that file belongs to the other item
+                except OSError:
+                    pass
+            if recorded:
+                filepath_candidates.append(recorded)
+            filepath_candidates.append(os.path.join(save_path, expected_name))
             if '.' not in expected_name:
                 filepath_candidates.append(os.path.join(save_path, expected_name + '.pdf'))
 
             file_exists = False
             existing_path = None
             for candidate in filepath_candidates:
+                # A path another item already claimed in this run is not proof
+                # that THIS item is on disk — that is exactly the state a past
+                # filename collision left behind in METADATA.md.
+                if claimed_paths.get(os.path.abspath(candidate), file_url) != file_url:
+                    continue
                 if os.path.exists(candidate):
                     file_exists = True
                     existing_path = candidate
@@ -1585,6 +1675,9 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
                             ))
                         except Exception as e:
                             logger.warning(f"Could not log .new file metadata: {e}")
+                # Claim it, so a later item served under the same download
+                # filename gets a name of its own instead of overwriting this.
+                claimed_paths.setdefault(os.path.abspath(existing_path), file_url)
                 logger.debug(f"   ⏭️  Skipped (already exists): {existing_path}")
                 continue
 
@@ -1610,6 +1703,16 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
                 filename += '.pdf'  # Most StudOn files are PDFs
 
             filepath: str = os.path.join(save_path, filename)
+            owner = claimed_paths.get(os.path.abspath(filepath))
+            if owner and owner != file_url:
+                collided = filename
+                filepath = _disambiguate_filepath(filepath, expected_name, file_url, claimed_paths)
+                filename = os.path.basename(filepath)
+                logger.warning(
+                    f"Two StudOn items in {save_path} are both served as {collided!r}; "
+                    f"saving {expected_name!r} as {filename!r} instead."
+                )
+            claimed_paths.setdefault(os.path.abspath(filepath), file_url)
 
             with open(filepath, 'wb') as f:
                 for chunk in file_response.iter_content(chunk_size=8192):
