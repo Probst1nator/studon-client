@@ -48,6 +48,7 @@ if "--advertise" in sys.argv:
 import webbrowser
 import re
 import email.utils
+import tempfile
 import shutil
 import subprocess
 import atexit
@@ -69,7 +70,7 @@ from pathlib import Path
 import logging
 import yaml
 import platform as platform_module
-from html import escape as _html_escape
+from html import escape as _html_escape, unescape as _html_unescape
 
 try:
     import py7zr
@@ -732,15 +733,84 @@ def _is_studon_url(url: str) -> bool:
     """
     return is_valid_url(url) and _url_host_matches(url, STUDON_DOMAIN)
 
+# The link file create_course_link_file() writes next to every METADATA.md.
+_COURSE_LINK_FILENAME = "Link to StudOn.html"
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    """Replace `path` with `text` in one step.
+
+    A plain open(path, 'w') truncates first and writes second; a crash, a kill
+    or a serialisation error in between leaves a 0-byte file. For METADATA.md
+    that is silent data loss — the course carries its source_url nowhere else
+    and drops out of every scan that keys on it. Writing a sibling temp file
+    and os.replace()ing it keeps the old content until the new one is complete.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".METADATA-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        # mkstemp creates 0600. Keep the mode the file already had, else the
+        # umask default, so a replaced file does not quietly become private.
+        try:
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        except OSError:
+            umask = os.umask(0o022)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def recover_course_from_link_file(course_folder: str) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort ``(course_title, source_url)`` from a folder's link file.
+
+    "Link to StudOn.html" is written beside METADATA.md by
+    create_course_link_file() and carries the same two facts, which makes it
+    the repair source when METADATA.md itself is empty or unparsable.
+    Returns ``(None, None)`` when nothing trustworthy can be read; the URL is
+    only returned once it passes the StudOn host check.
+    """
+    link_path = os.path.join(course_folder, _COURSE_LINK_FILENAME)
+    try:
+        with open(link_path, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except OSError:
+        return None, None
+
+    source_url = None
+    match = (re.search(r'refresh"\s+content="[^"]*?url=([^"]+)"', content)
+             or re.search(r'href="([^"]+)"', content))
+    if match:
+        candidate = _html_unescape(match.group(1)).strip()
+        if _is_studon_url(candidate):
+            source_url = candidate
+
+    course_title = None
+    title_match = re.search(r'<p>Course:\s*(.*?)</p>', content, re.DOTALL)
+    if title_match:
+        course_title = _html_unescape(title_match.group(1)).strip() or None
+
+    return course_title, source_url
 def find_all_metadata_files(base_folder: str) -> List[Tuple[str, str, str]]:
     """
     Finds all METADATA.md files in the download folder.
     Returns a list of tuples: (metadata_file_path, source_url, course_folder_path)
 
     Skips a METADATA.md that sits directly at base_folder (the download root) — a
-    tracked course always lives inside its own subfolder. Also skips entries whose
-    source URL fails is_valid_url() (defensive guard against historical garbage
-    like `source_url: h`).
+    tracked course always lives inside its own subfolder. Entries whose source URL
+    fails is_valid_url() (defensive guard against historical garbage like
+    `source_url: h`) and empty or unparsable files fall back to the sibling
+    "Link to StudOn.html"; a course is only dropped when that fails too, and then
+    loudly.
     """
     metadata_files = []
     base_folder_abs = os.path.abspath(base_folder)
@@ -755,21 +825,44 @@ def find_all_metadata_files(base_folder: str) -> List[Tuple[str, str, str]]:
                 "A tracked course must live in its own subfolder."
             )
             continue
+        source_url = None
         try:
-            with open(metadata_path, 'r') as f:
+            with open(metadata_path, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-                match = re.search(r'^Source:\s*(.+)$', content, re.MULTILINE)
-                if not match:
-                    continue
-                source_url = match.group(1).strip()
-                if not is_valid_url(source_url):
-                    logger.warning(
-                        f"Skipping {metadata_path}: invalid source_url {source_url!r}."
-                    )
-                    continue
-                metadata_files.append((metadata_path, source_url, root))
+            # The markdown body carries "Source:"; the YAML frontmatter the same
+            # fact as "source_url:". Accept either so a half-written file still parses.
+            match = (re.search(r'^Source:\s*(.+)$', content, re.MULTILINE)
+                     or re.search(r'^source_url:\s*(.+)$', content, re.MULTILINE))
+            if match:
+                candidate = match.group(1).strip().strip('"\'')
+                if is_valid_url(candidate):
+                    source_url = candidate
+                else:
+                    logger.warning(f"{metadata_path}: invalid source_url {candidate!r}.")
         except Exception as e:
             logger.warning(f"Could not read {metadata_path}: {e}")
+
+        if source_url is None:
+            # An empty or unparsable METADATA.md used to drop its course out of
+            # every scan without a word, so --update-all silently stopped
+            # refreshing it. The sibling link file holds the same source URL;
+            # recover from it and let the next fetch rewrite the metadata.
+            _, recovered_url = recover_course_from_link_file(root)
+            if recovered_url:
+                logger.warning(
+                    f"{metadata_path} is empty or unparsable — recovered source_url from "
+                    f"{_COURSE_LINK_FILENAME}. The next fetch rewrites the metadata."
+                )
+                source_url = recovered_url
+            else:
+                logger.warning(
+                    f"Skipping {metadata_path}: no usable source_url, and no "
+                    f"{_COURSE_LINK_FILENAME} beside it to recover one from. "
+                    f"Re-add this course by running the scraper on its StudOn URL."
+                )
+                continue
+
+        metadata_files.append((metadata_path, source_url, root))
 
     return metadata_files
 
@@ -1248,8 +1341,9 @@ def update_course_metadata(metadata_path: str, course_title: Optional[str], sour
     )
 
     try:
-        with open(metadata_path, 'w', encoding='utf-8') as f:
-            f.write(metadata.to_yaml_markdown(course_folder))
+        # Atomic: a failed serialisation or a killed process must not leave a
+        # truncated METADATA.md behind (see _atomic_write_text).
+        _atomic_write_text(metadata_path, metadata.to_yaml_markdown(course_folder))
     except Exception as e:
         logger.error(f"Could not write metadata file: {e}")
 
@@ -3916,13 +4010,24 @@ def show_startup_overview(download_folder: str) -> None:
             if not os.path.exists(meta_path):
                 continue
             meta = CourseMetadata.from_yaml_markdown(meta_path)
+            # An empty or unparsable METADATA.md parses into a nameless record
+            # with no source_url and a last_fetched of "now", which reads in the
+            # table as a healthy course called "Unknown Course". Name it after
+            # its folder and mark it repairable instead.
+            broken = not (meta and meta.source_url)
+            name = entry.name
+            if meta and meta.source_url:
+                name = meta.course_title or entry.name
+            elif broken:
+                recovered_title, _ = recover_course_from_link_file(entry.path)
+                name = f"{recovered_title or entry.name}  (METADATA.md unreadable)"
             folder_exists = os.path.isdir(entry.path)
             file_count, total_bytes = _course_folder_stats(entry.path) if folder_exists else (0, 0)
             courses.append({
-                'name':    meta.course_title if meta else entry.name,
+                'name':    name,
                 'folder':  entry.path,
                 'exists':  folder_exists,
-                'synced':  meta.last_fetched_formatted[:10] if meta else '—',
+                'synced':  meta.last_fetched_formatted[:10] if (meta and not broken) else '—',
                 'files':   file_count,
                 'size':    format_file_size(total_bytes) if total_bytes else '—',
             })
