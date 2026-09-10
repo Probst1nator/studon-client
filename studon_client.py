@@ -88,7 +88,7 @@ except ImportError:
     keyring = None
 
 try:
-    from cli_tool_kit import ToolInstaller, ToolMetadata, CronInstaller
+    from cli_tools_kit import ToolInstaller, ToolMetadata, CronInstaller
     _HAS_INSTALLER = True
 except ImportError:
     ToolInstaller = None  # type: ignore[assignment,misc]
