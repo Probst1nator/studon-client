@@ -44,13 +44,13 @@ pip install py7zr
 cd ~/Studium
 git clone <repository-url> .
 
-# 2. Install cron job + shell function
+# 2. Install cron jobs + shell alias
 python3 studon_client.py --install
 ```
 
 `--install` registers both `@reboot` cron entries (`--daily-sync` and
-`--lecture-sync`), adds a `studon-client` shell function to `~/.bashrc`
-(clipboard quick-fetch), optionally persists a download path, and runs the
+`--lecture-sync`) plus the weekly `--campo-bescheinigungen` job, adds a
+`studon-client` shell alias (clipboard quick-fetch, via cli-tools-kit), optionally persists a download path, and runs the
 interactive `--map-lectures` wizard so every campo timetable entry is paired
 with a tracked course (or explicitly marked "no StudOn course") before the
 lecture-sync daemon starts. Re-run any time you move the directory or
@@ -224,7 +224,7 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--campo-bescheinigungen` | Download all 12 exam-side PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/` |
 | `--campo-bescheinigungen --with-enrollment` | 12 + 7 = 19 PDFs (combo with the enrollment-side) |
 | `--campo-enrollment-bescheinigungen` | Download all 7 enrollment-side PDFs via `studyservice-flow` into `<downloads>/Bescheinigungen/Enrollment/`: Benutzerinfobrief, Bescheinigung §9 BAföG, Datenkontrollblatt, Quittung (einzelnes Semester), Beitragskonto, Immatrikulationsbescheinigung, Studienverlaufsbescheinigung. Parameterized reports default to the current semester. |
-| `--install` / `--uninstall` | Install / remove cron entries + bashrc function |
+| `--install` / `--remove` | Install / remove cron entries + shell alias (also cleans up the `~/.bashrc` function and untagged cron lines older versions wrote) |
 | `--install-imap` / `--uninstall-imap` | Configure / remove FAUmail feedback checker |
 | `--check-feedback` | Scan inbox now and download any reachable feedback PDFs |
 | `--reset-feedback-state` | Clear `.studon_feedback_state.json` to reprocess all matching mails |

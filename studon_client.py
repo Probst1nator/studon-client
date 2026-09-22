@@ -8,7 +8,9 @@ import json
 # probes each candidate script with `--advertise` and a 5s timeout. The
 # heavy imports below (requests, BeautifulSoup, browser_cookie3, …) would
 # blow the budget, so short-circuit here.
-if "--advertise" in sys.argv:
+def _advertise_entry() -> dict:
+    """The --advertise record. `--install` builds its ToolMetadata from it too,
+    so the alias name and alias_args live in one place."""
     # Resolve the configured download folder inline (config.json is loaded much
     # later, after heavy imports) so the digest tool can read course files.
     _cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -16,7 +18,7 @@ if "--advertise" in sys.argv:
         _dl = os.path.expanduser(json.load(open(_cfg)).get("downloads_path", "studon_downloads"))
     except Exception:
         _dl = "studon_downloads"
-    print(json.dumps([{
+    return {
         "name": "StudOn Client",
         "desktop_file": "studon_client.desktop",
         # Bundled StudOn logo (assets/studon-client.png); absolute so the
@@ -42,7 +44,11 @@ if "--advertise" in sys.argv:
         # directory (its ledger detects new/changed files) and never drive a fetch.
         # (--update-all is interactive/slow and would block an unattended digest run.)
         "digest_output": os.path.join(_dl, "**", "*.pdf"),
-    }]))
+    }
+
+
+if "--advertise" in sys.argv:
+    print(json.dumps([_advertise_entry()]))
     sys.exit(0)
 
 import webbrowser
@@ -4319,50 +4325,152 @@ def show_startup_overview(download_folder: str) -> None:
     print()
 
 
-def _is_installed() -> bool:
-    """Return True if a cron job for this script is already registered."""
+# --- Install / remove: cron via CronInstaller, shell alias via ToolInstaller ---
+# Contract: ../cli-tools-kit/PROTOCOL.md. Versions before this change wrote the
+# cron lines with a raw `crontab -` and a studon-client() function straight
+# into ~/.bashrc. Both --install and --remove strip those legacy entries, so a
+# host converges on the kit-managed ones without duplicates.
+
+_CRON = CronInstaller("studon-client") if CronInstaller else None
+
+# Flags of the cron lines --install writes.
+_CRON_FLAGS = ('--daily-sync', '--lecture-sync', '--campo-bescheinigungen')
+_LEGACY_BASHRC_MARKER = '# studon-client quick-fetch'
+
+
+def _cron_lines(check_interval: int = 5) -> List[str]:
+    """The cron lines --install registers (without the kit's marker tag)."""
     script_path = os.path.abspath(__file__)
+    script_dir = os.path.dirname(script_path)
+    python = sys.executable
+    daily_cmd = f"@reboot cd {script_dir} && {python} {script_path} --daily-sync"
+    if check_interval != 5:
+        daily_cmd += f" --interval {check_interval}"
+    lecture_cmd = f"@reboot cd {script_dir} && {python} {script_path} --lecture-sync"
+    # Weekly Prüfungsamt-PDFs (Mondays 06:30) — keeps Notenübersicht.pdf fresh so
+    # --reconcile always has a canonical ECTS source.
+    bescheinigungen_cmd = (
+        f"30 6 * * 1 cd {script_dir} && {python} {script_path} --campo-bescheinigungen "
+        f">> {os.path.join(DOWNLOAD_FOLDER, 'studon_bescheinigungen.log')} 2>&1"
+    )
+    return [daily_cmd, lecture_cmd, bescheinigungen_cmd]
+
+
+def _is_legacy_cron_line(line: str) -> bool:
+    """A hand-written studon-client cron line from before CronInstaller: active
+    (not commented out), no cli-tool-kit tag, one of our flags. Matches on the
+    script name rather than the full path so lines from a moved checkout go too."""
+    s = line.strip()
+    return (bool(s) and not s.startswith('#')
+            and '# cli-tool-kit:' not in s
+            and 'studon_client.py' in s
+            and any(flag in s for flag in _CRON_FLAGS))
+
+
+def _remove_legacy_cron_lines() -> int:
+    """Strip legacy untagged cron lines. Returns how many were removed.
+
+    Goes through the kit's own crontab read/write so a failing `crontab -l`
+    raises instead of being read as an empty crontab (which would wipe it)."""
+    if _CRON is None:
+        return 0
+    lines = _CRON._read().splitlines()
+    kept = [l for l in lines if not _is_legacy_cron_line(l)]
+    if len(kept) == len(lines):
+        return 0
+    _CRON._write('\n'.join(kept))
+    return len(lines) - len(kept)
+
+
+def _remove_legacy_bashrc_function() -> bool:
+    """Remove the studon-client() function older --install versions wrote into
+    ~/.bashrc. Returns True if ~/.bashrc changed.
+
+    It has to go before the alias takes over: bash expands an alias in a
+    function definition's name, so `studon-client() {...}` after the alias is
+    sourced becomes a syntax error at shell start."""
+    bashrc = Path.home() / '.bashrc'
+    if not bashrc.exists():
+        return False
+    lines = bashrc.read_text().splitlines(keepends=True)
+    out: List[str] = []
+    for l in lines:
+        if l.strip() == _LEGACY_BASHRC_MARKER:
+            # The old installer put a blank line in front of the marker.
+            if out and not out[-1].strip():
+                out.pop()
+            continue
+        if l.lstrip().startswith('studon-client()'):
+            continue
+        out.append(l)
+    if len(out) == len(lines):
+        return False
+    bashrc.write_text(''.join(out))
+    return True
+
+
+def _alias_installer():
+    """ToolInstaller for the `studon-client` alias, built from the advertise record."""
+    import dataclasses
+    known = {f.name for f in dataclasses.fields(ToolMetadata)}
+    entry = {k: v for k, v in _advertise_entry().items() if k in known}
+    return ToolInstaller(script_path=os.path.abspath(__file__),
+                         metadata=ToolMetadata(**entry))
+
+
+def _install_alias() -> None:
+    """Write the alias through the kit, without the kit's pip step.
+
+    _run_install checks dependencies itself, and a parent installer provisions
+    the venv before calling --install. ToolInstaller.install() would otherwise
+    pip-install requirements.txt, whose kit pin can replace a newer kit already
+    installed in a shared interpreter."""
+    prev = os.environ.get("TOOLS_INSTALLER_SKIP_DEPS")
+    os.environ["TOOLS_INSTALLER_SKIP_DEPS"] = "1"
     try:
-        proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
-        if proc.returncode != 0:
-            return False
-        return any(
-            script_path in line and ('--daily-sync' in line or '--lecture-sync' in line)
-            for line in proc.stdout.splitlines()
-        )
-    except FileNotFoundError:
+        _alias_installer().install()
+    finally:
+        if prev is None:
+            os.environ.pop("TOOLS_INSTALLER_SKIP_DEPS", None)
+        else:
+            os.environ["TOOLS_INSTALLER_SKIP_DEPS"] = prev
+
+
+def _is_installed() -> bool:
+    """Return True if the kit-managed cron lines for this tool are registered.
+
+    Legacy hand-written lines do not count, so the TUI offers Install on such a
+    host, which migrates them."""
+    if _CRON is None:
+        return False
+    try:
+        return _CRON.is_installed()
+    except RuntimeError:
         return False
 
 
 def _run_uninstall() -> None:
-    """Remove the cron jobs and bashrc function installed by --install."""
-    script_path = os.path.abspath(__file__)
+    """Remove the cron jobs and the shell alias installed by --install, plus the
+    hand-written entries of older versions."""
     # --- Cron ---
-    try:
-        proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
-        existing = proc.stdout if proc.returncode == 0 else ''
-        clean = [l for l in existing.splitlines()
-                 if not (script_path in l and ('--daily-sync' in l or '--lecture-sync' in l or '--campo-bescheinigungen' in l))]
-        if len(clean) < len(existing.splitlines()):
-            subprocess.run(['crontab', '-'], input='\n'.join(clean) + '\n',
-                           capture_output=True, text=True)
-            print("  ✅ Cron jobs removed.")
-        else:
-            print("  No matching cron entries found.")
-    except FileNotFoundError:
-        print("  crontab not available — skipping.")
+    if _CRON is None:
+        print("  cli-tools-kit not importable — cannot edit the crontab.")
+    else:
+        try:
+            n = _remove_legacy_cron_lines()
+            if n:
+                print(f"  Removed {n} hand-written cron line(s) from an older --install.")
+            _CRON.remove()
+        except (RuntimeError, subprocess.CalledProcessError) as e:
+            print(f"  Cron cleanup failed: {e}")
 
-    # --- Bashrc ---
-    bashrc = Path.home() / '.bashrc'
-    marker = '# studon-client quick-fetch'
-    if bashrc.exists():
-        lines = bashrc.read_text().splitlines(keepends=True)
-        filtered = [l for l in lines if marker not in l and 'studon-client()' not in l]
-        if len(filtered) < len(lines):
-            bashrc.write_text(''.join(filtered))
-            print("  ✅ Shell function removed from ~/.bashrc.")
-        else:
-            print("  No shell function found in ~/.bashrc.")
+    # --- Shell alias (and the old bashrc function) ---
+    if _remove_legacy_bashrc_function():
+        print("  Removed the old studon-client() function from ~/.bashrc.")
+    if _HAS_INSTALLER:
+        _alias_installer().remove()
+    else:
+        print("  cli-tools-kit not importable — alias left in place.")
 
 
 # --- Claude Code skill registration ---------------------------------------
@@ -4600,13 +4708,10 @@ def _run_uninstall_skill() -> None:
 def _run_install(check_interval: int = 5) -> None:
     """
     Unified installer: replaces setup_daily_sync.sh.
-    Installs the @reboot cron job and the 'studon-client' bashrc function.
+    Registers the cron jobs (CronInstaller) and the 'studon-client' shell alias
+    (ToolInstaller), and removes the hand-written entries of older versions.
     """
     import importlib.util
-
-    script_path = os.path.abspath(__file__)
-    script_dir  = os.path.dirname(script_path)
-    python      = sys.executable
 
     print("╔════════════════════════════════════════════════════════════╗")
     print("║          StudOn Daily Sync Setup                          ║")
@@ -4681,18 +4786,8 @@ def _run_install(check_interval: int = 5) -> None:
             print(f"  Saved: {expanded}")
     print()
 
-    # --- Cron jobs ---
-    daily_cmd = f"@reboot cd {script_dir} && {python} {script_path} --daily-sync"
-    if check_interval != 5:
-        daily_cmd += f" --interval {check_interval}"
-    lecture_cmd = f"@reboot cd {script_dir} && {python} {script_path} --lecture-sync"
-    # Weekly Prüfungsamt-PDFs (Mondays 06:30) — keeps Notenübersicht.pdf fresh so
-    # --reconcile always has a canonical ECTS source.
-    bescheinigungen_cmd = (
-        f"30 6 * * 1 cd {script_dir} && {python} {script_path} --campo-bescheinigungen "
-        f">> {os.path.join(DOWNLOAD_FOLDER, 'studon_bescheinigungen.log')} 2>&1"
-    )
-    desired_cmds = [daily_cmd, lecture_cmd, bescheinigungen_cmd]
+    # --- Cron jobs (cli-tools-kit CronInstaller) ---
+    desired_cmds = _cron_lines(check_interval)
 
     print("Cron entries:")
     for c in desired_cmds:
@@ -4700,69 +4795,27 @@ def _run_install(check_interval: int = 5) -> None:
     print()
 
     cron_ok = False
-    try:
-        proc = subprocess.run(['crontab', '-l'], capture_output=True, text=True)
-        existing_tab = proc.stdout if proc.returncode == 0 else ''
-    except FileNotFoundError:
-        print("  ERROR: crontab not found — install it manually.")
-        existing_tab = None
-
-    def _is_studon_line(l: str) -> bool:
-        return 'studon' in l and ('--daily-sync' in l or '--lecture-sync' in l or '--campo-bescheinigungen' in l)
-
-    if existing_tab is not None:
-        existing_lines = existing_tab.splitlines()
-        studon_lines = [l for l in existing_lines if _is_studon_line(l)]
-        already_ok = sorted(studon_lines) == sorted(desired_cmds)
-        if already_ok:
-            print("  Cron entries already up to date.")
+    if _CRON is None:
+        print("  ERROR: cli-tools-kit not importable — pip install -r requirements.txt")
+    else:
+        try:
+            n = _remove_legacy_cron_lines()
+            if n:
+                print(f"  Replaced {n} hand-written cron line(s) from an older --install.")
+            _CRON.install(desired_cmds)
             cron_ok = True
-        else:
-            if studon_lines:
-                print(f"  Replacing existing entries:")
-                for l in studon_lines:
-                    print(f"    {l}")
-                if input("  Replace? [Y/n]: ").strip().lower() == 'n':
-                    print("  Keeping existing cron entries.")
-                    cron_ok = True
-                else:
-                    studon_lines = []  # signal rewrite
-            if not cron_ok:
-                clean = [l for l in existing_lines if not _is_studon_line(l)]
-                clean.extend(desired_cmds)
-                new_tab = '\n'.join(clean) + '\n'
-                result = subprocess.run(['crontab', '-'], input=new_tab,
-                                        capture_output=True, text=True)
-                cron_ok = result.returncode == 0
-                if cron_ok:
-                    print("  Cron entries installed.")
-                else:
-                    print(f"  Failed: {result.stderr.strip()}")
+        except (RuntimeError, subprocess.CalledProcessError) as e:
+            print(f"  Failed: {e}")
     print()
 
-    # --- Bashrc function ---
-    print("Installing 'studon-client' shell function...")
-    bashrc   = Path.home() / '.bashrc'
-    marker   = '# studon-client quick-fetch'
-    func_line = f'studon-client() {{ {python} {script_path} --clip "$@"; }}'
-
-    if bashrc.exists():
-        content = bashrc.read_text()
+    # --- Shell alias (cli-tools-kit ToolInstaller) ---
+    print("Installing 'studon-client' shell alias...")
+    if _remove_legacy_bashrc_function():
+        print("  Removed the old studon-client() function from ~/.bashrc.")
+    if _HAS_INSTALLER:
+        _install_alias()
     else:
-        content = ''
-
-    if marker in content:
-        lines     = content.splitlines()
-        new_lines = [func_line if l.startswith('studon-client()') else l for l in lines]
-        new_content = '\n'.join(new_lines) + '\n'
-        if new_content == content:
-            print("  Already up to date in ~/.bashrc")
-        else:
-            bashrc.write_text(new_content)
-            print("  Updated in ~/.bashrc")
-    else:
-        bashrc.write_text(content.rstrip('\n') + f'\n\n{marker}\n{func_line}\n')
-        print("  Added to ~/.bashrc")
+        print("  ERROR: cli-tools-kit not importable — alias not installed.")
     print()
 
     # --- Summary ---
@@ -8183,9 +8236,9 @@ def _run_tui_menu(debug: bool = False, current_course: Optional[Tuple[str, str, 
         return
 
     installed = _is_installed()
-    install_label = ("✅ Uninstall cron job & shell function"
+    install_label = ("✅ Uninstall cron jobs & shell alias"
                      if installed else
-                     "❗ Install cron job & shell function")
+                     "❗ Install cron jobs & shell alias")
     install_value = "uninstall" if installed else "install"
 
     imap_installed = _is_imap_installed()
@@ -8381,7 +8434,9 @@ def main() -> None:
     parser.add_argument('--dry-run', action='store_true',
                        help='Discover files without downloading (preview mode)')
     parser.add_argument('--install', action='store_true',
-                       help='Install cron job and shell function (replaces setup_daily_sync.sh)')
+                       help='Install the cron jobs and the studon-client shell alias (replaces setup_daily_sync.sh)')
+    parser.add_argument('--remove', action='store_true',
+                       help='Remove the cron jobs and the shell alias, including entries written by older versions')
     parser.add_argument('--install-skill', action='store_true',
                        help='(Re)write ~/.claude/skills/studon-client/SKILL.md from the inline source so Claude Code surfaces this scraper as a skill')
     parser.add_argument('--uninstall-skill', action='store_true',
@@ -8541,9 +8596,13 @@ def main() -> None:
         print(f"Feedback: processed {n_processed} exercise(s), downloaded {n_files} file(s).")
         return
 
-    # --- Install cron + bashrc ---
+    # --- Install / remove cron + shell alias ---
     if args.install:
         _run_install(check_interval=args.interval)
+        return
+
+    if args.remove:
+        _run_uninstall()
         return
 
     # --- Persist download path to config.json and exit ---
