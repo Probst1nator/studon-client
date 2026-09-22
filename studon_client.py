@@ -422,6 +422,7 @@ def save_config(config: dict) -> None:
 _config = load_config()
 DOWNLOAD_FOLDER = str(Path(_config.get("downloads_path", "studon_downloads")).expanduser())
 STUDON_DOMAIN = 'studon.fau.de'
+CAMPO_DOMAIN = 'campo.fau.de'
 CAMPO_TIMETABLE_URL = 'https://www.campo.fau.de/qisserver/pages/plan/individualTimetable.xhtml?_flowId=individualTimetableSchedule-flow'
 CAMPO_STUDY_PLANNER_URL = 'https://www.campo.fau.de/qisserver/pages/startFlow.xhtml?_flowId=studyPlanner-flow'
 CAMPO_EXAMS_OVERVIEW_URL = 'https://www.campo.fau.de/qisserver/pages/sul/examAssessment/personExamsReadonly.xhtml?_flowId=examsOverviewForPerson-flow'
@@ -2159,7 +2160,7 @@ def can_access_campo() -> bool:
     we are not bounced to the IdP login. Returns True if campo content serves.
     """
     try:
-        cj = browser_cookie3.firefox(domain_name='campo.fau.de')
+        cj = browser_cookie3.firefox(domain_name=CAMPO_DOMAIN)
         session = requests.Session()
         session.cookies.update(cj)
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
@@ -4053,7 +4054,7 @@ def run_discover_from_timetable(debug: bool = False) -> None:
     try:
         campo_session = requests.Session()
         campo_session.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
-        campo_session.cookies.update(browser_cookie3.firefox(domain_name='campo.fau.de'))
+        campo_session.cookies.update(browser_cookie3.firefox(domain_name=CAMPO_DOMAIN))
         campo_session.headers.update({'User-Agent': 'Mozilla/5.0'})
     except Exception as e:
         print(f"❌ Could not load Firefox cookies for campo: {e}")
@@ -5918,7 +5919,7 @@ def _fetch_timetable_entries() -> Optional[Tuple[str, List[Dict]]]:
     try:
         s = requests.Session()
         s.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
-        s.cookies.update(browser_cookie3.firefox(domain_name='campo.fau.de'))
+        s.cookies.update(browser_cookie3.firefox(domain_name=CAMPO_DOMAIN))
         s.headers.update({'User-Agent': 'Mozilla/5.0'})
         r = s.get(CAMPO_TIMETABLE_URL)
         if r.status_code != 200:
@@ -6537,7 +6538,7 @@ def fetch_campo_pruefungen_markdown(output_path: Optional[str] = None) -> Option
     try:
         session = requests.Session()
         session.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
-        session.cookies.update(browser_cookie3.firefox(domain_name='campo.fau.de'))
+        session.cookies.update(browser_cookie3.firefox(domain_name=CAMPO_DOMAIN))
         session.headers.update({'User-Agent': 'Mozilla/5.0'})
     except Exception as e:
         print(f"❌ Could not load Firefox cookies: {e}")
@@ -7564,7 +7565,7 @@ def _campo_session() -> Optional[requests.Session]:
     try:
         s = requests.Session()
         s.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
-        s.cookies.update(browser_cookie3.firefox(domain_name='campo.fau.de'))
+        s.cookies.update(browser_cookie3.firefox(domain_name=CAMPO_DOMAIN))
         s.headers.update({'User-Agent': 'Mozilla/5.0'})
         return s
     except Exception as e:
@@ -7887,7 +7888,7 @@ def _download_enrollment_pdf(s: requests.Session, poll_url: str, download_href: 
     cookies. Mirrors the _url_host_matches gates used on the StudOn side.
     """
     full_href = urljoin(poll_url, download_href)
-    if not _url_host_matches(full_href, 'campo.fau.de'):
+    if not _url_host_matches(full_href, CAMPO_DOMAIN):
         print(f"   ✗ [{idx}] {label}: refusing off-campo download host: {full_href}")
         return None
     try:
