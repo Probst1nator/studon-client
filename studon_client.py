@@ -74,6 +74,7 @@ from dataclasses import dataclass, field
 from tabulate import tabulate
 from pathlib import Path
 import logging
+import logging.handlers
 import yaml
 import platform as platform_module
 from html import escape as _html_escape, unescape as _html_unescape
@@ -108,11 +109,15 @@ from email.header import decode_header
 import getpass
 
 # --- LOGGING SETUP ---
+# The log sits in CWD, inside the Syncthing tree, so every append is replicated.
+# Rotate at 2 MB and keep 3 backups (at most ~8 MB on disk).
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('studon_sync.log', encoding='utf-8'),
+        logging.handlers.RotatingFileHandler(
+            'studon_sync.log', maxBytes=2 * 1024 * 1024, backupCount=3,
+            encoding='utf-8'),
     ]
 )
 logger = logging.getLogger(__name__)
