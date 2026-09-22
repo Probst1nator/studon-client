@@ -321,3 +321,29 @@ def test_the_recorded_size_decides_who_owns_a_contested_path(tmp_path, monkeypat
     for r in meta.file_history:
         newest.setdefault(r.download_url, r.filepath.name)
     assert newest[urls[1]] == "Exam_SS21.pdf"
+
+
+# --- '<name> .sec' downloads get their real extension back -----------------
+
+def test_sec_downloads_are_renamed_by_their_magic_bytes(tmp_path, monkeypatch):
+    """PDF and zip content is renamed; unknown content keeps its .sec name."""
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    course = tmp_path / "IML"
+    course.mkdir()
+    base = "https://www.studon.fau.de/studon/ilias.php?cmd=sendfile&ref_id="
+    bodies = {
+        base + "1": ("Blatt 1 .sec", b"%PDF-1.7 ..."),
+        base + "2": ("Code .sec", b"PK\x03\x04 ..."),
+        base + "3": ("Notes .sec", b"plain text"),
+    }
+    files = [{"url": u, "path": str(course), "name": name, "course_title": "IML"}
+             for u, (name, _) in bodies.items()]
+
+    count, downloaded = s.download_all_files(
+        COURSE_URL, files, _FakeDownloadSession(bodies), course_title="IML",
+        base_path=str(course))
+
+    assert count == 3
+    assert sorted(os.path.basename(p) for p in downloaded) == [
+        "Blatt 1.pdf", "Code.zip", "Notes .sec"]
+    assert (course / "Blatt 1.pdf").read_bytes() == b"%PDF-1.7 ..."

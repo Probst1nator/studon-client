@@ -1556,6 +1556,25 @@ def _disambiguate_filepath(filepath: str, item_title: str, file_url: str,
     return filepath
 
 
+_SEC_MAGIC_EXTENSIONS = ((b'%PDF', '.pdf'), (b'PK\x03\x04', '.zip'))
+
+
+def _restore_sec_extension(filename: str, head: bytes) -> str:
+    """The real extension for a download StudOn served as '<name> .sec'.
+
+    When an upload's extension is not on the ILIAS whitelist (often because the
+    uploader dropped it), StudOn serves it as '<name> .sec'. Sniff the first
+    bytes and restore .pdf or .zip. Unknown content keeps its .sec name.
+    """
+    stem, ext = os.path.splitext(filename)
+    if ext.lower() != '.sec' or not stem.strip():
+        return filename
+    for magic, real_ext in _SEC_MAGIC_EXTENSIONS:
+        if head.startswith(magic):
+            return stem.rstrip() + real_ext
+    return filename
+
+
 def download_all_files(source: str, files_to_download: List[Dict[str, str]], session: requests.Session, course_title: Optional[str] = None, base_path: str = None) -> Tuple[int, List[str]]:
     """Downloads all files from the provided list.
 
@@ -1713,6 +1732,12 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
             if '.' not in filename:
                 filename += '.pdf'  # Most StudOn files are PDFs
 
+            chunks = file_response.iter_content(chunk_size=8192)
+            head = b''
+            if filename.lower().endswith('.sec'):
+                head = next(chunks, b'')
+                filename = _restore_sec_extension(filename, head)
+
             filepath: str = os.path.join(save_path, filename)
             owner = claimed_paths.get(os.path.abspath(filepath))
             if owner and owner != file_url:
@@ -1726,7 +1751,8 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
             claimed_paths.setdefault(os.path.abspath(filepath), file_url)
 
             with open(filepath, 'wb') as f:
-                for chunk in file_response.iter_content(chunk_size=8192):
+                f.write(head)
+                for chunk in chunks:
                     f.write(chunk)
 
             print(f" → {filename}" if filename != expected_name else "  ✓")
