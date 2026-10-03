@@ -4534,16 +4534,16 @@ SKILL_FILE = SKILL_DIR / 'SKILL.md'
 LEGACY_SKILL_DIRS = ('studon', 'search-studon')
 SKILL_MD_CONTENT = '''---
 name: studon-client
-description: Drive the StudOn / Campo scraper at ~/Synced/repos/AutomatedAlchemy/studon-client/. Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, dump prüfungs-Anmeldefristen, export the studyPlanner Modulplan (status/ECTS/Versuch per module), list current Belegungen (angemeldete Prüfungen + Veranstaltungen mit Termin/Raum/Prüfer), reconcile Modulplan ↔ Belegungen for an honest ECTS-Bilanz, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studienfortschritt", "modulplan", "wieviele ects hab ich", "belegungen", "wo bin ich angemeldet", "klausurtermin", "reconcile", "ects bilanz", "stimmt meine ects", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
+description: Drive the StudOn / Campo scraper at __SCRIPT_DIR__/. Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, dump prüfungs-Anmeldefristen, export the studyPlanner Modulplan (status/ECTS/Versuch per module), list current Belegungen (angemeldete Prüfungen + Veranstaltungen mit Termin/Raum/Prüfer), reconcile Modulplan ↔ Belegungen for an honest ECTS-Bilanz, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studienfortschritt", "modulplan", "wieviele ects hab ich", "belegungen", "wo bin ich angemeldet", "klausurtermin", "reconcile", "ects bilanz", "stimmt meine ects", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
 ---
 
 # studon-client
 
 Wrapper for the StudOn / Campo scraper at
-`~/Synced/repos/AutomatedAlchemy/studon-client/studon_client.py`.
+`__SCRIPT_DIR__/studon_client.py`.
 Authenticates to FAU StudOn + campo via Firefox cookies (`browser-cookie3`),
 crawls course pages, and downloads materials into the configured downloads
-folder (`~/Synced/OneDrive/Studium/KIM4/` on this fleet).
+folder (`config.json` → `downloads_path`).
 
 The scraper is already installed and self-running:
 - `@reboot studon_client.py --daily-sync` — once-per-day full sync of all tracked courses
@@ -4579,14 +4579,14 @@ Claude's non-interactive Bash** (alias expansion is disabled). Use the direct
 script path:
 
 ```bash
-PY=/home/prob/Synced/repos/prob_ubuntu_environment/Py3EnvShare/bin/python3
-SCRAPER=/home/prob/Synced/repos/AutomatedAlchemy/studon-client/studon_client.py
+PY=__PYTHON__
+SCRAPER=__SCRIPT_DIR__/studon_client.py
 
 $PY $SCRAPER --help
 ```
 
-(Plain `python3` also works on this host — the fleet venv at `Py3EnvShare`
-already has `browser-cookie3`, `beautifulsoup4`, `requests`, `questionary`.)
+(`PY` is the interpreter that ran `--install-skill`; it has the packages from
+`requirements.txt`.)
 
 ## Cheat-sheet (subset of `--help`)
 
@@ -4611,7 +4611,7 @@ already has `browser-cookie3`, `beautifulsoup4`, `requests`, `questionary`.)
 | Bring the tray icon back after "Tray schliessen" | `$PY $SCRAPER --tray` |
 | (Re)install this Claude skill | `$PY $SCRAPER --install-skill` |
 
-Full architecture & dataclasses: `~/Synced/repos/AutomatedAlchemy/studon-client/CLAUDE.md`.
+Full usage guide: `__SCRIPT_DIR__/README.md`.
 
 ## Preconditions
 
@@ -4661,7 +4661,7 @@ Full architecture & dataclasses: `~/Synced/repos/AutomatedAlchemy/studon-client/
 ## Output layout
 
 ```
-~/Synced/OneDrive/Studium/KIM4/         # configured downloads_path
+<downloads_path>/                       # configured downloads_path
 ├── timetable.md                        # --timetable
 ├── .timetable_entries.json             # cache consumed by --lecture-sync
 ├── Modulplan.md                        # --modulplan (Studienplan + Status + ECTS)
@@ -4727,10 +4727,12 @@ def _run_install_skill() -> None:
     _prune_legacy_skill_dirs()
     SKILL_DIR.mkdir(parents=True, exist_ok=True)
     pre_existed = SKILL_FILE.exists()
-    if pre_existed and SKILL_FILE.read_text(encoding='utf-8') == SKILL_MD_CONTENT:
+    content = (SKILL_MD_CONTENT.replace('__SCRIPT_DIR__', _SCRIPT_DIR)
+               .replace('__PYTHON__', sys.executable))
+    if pre_existed and SKILL_FILE.read_text(encoding='utf-8') == content:
         print(f"  • Skill already up-to-date: {SKILL_FILE}")
         return
-    SKILL_FILE.write_text(SKILL_MD_CONTENT, encoding='utf-8')
+    SKILL_FILE.write_text(content, encoding='utf-8')
     verb = "Refreshed" if pre_existed else "Installed"
     print(f"  ✅ {verb} Claude skill at {SKILL_FILE}")
     print(f"     Claude Code picks this up live — no restart needed.")
@@ -5458,7 +5460,7 @@ def _run_install_imap() -> None:
         print("✅ keyring installed.\n")
 
     cfg = load_config()
-    default_email = cfg.get("imap_email", "steffen.probst@fau.de")
+    default_email = cfg.get("imap_email", "vorname.nachname@fau.de")
     print("╔════════════════════════════════════════════════════════════╗")
     print("║          FAUmail IMAP Setup (feedback checker)            ║")
     print("╚════════════════════════════════════════════════════════════╝")
@@ -8475,7 +8477,10 @@ def main() -> None:
     global DOWNLOAD_FOLDER
 
     # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='StudOn Recursive File Downloader & Auto-Updater')
+    parser = argparse.ArgumentParser(
+        description='StudOn Recursive File Downloader & Auto-Updater',
+        epilog='Not an official FAU tool. Provided as is, without any warranty that it '
+               'works or suits your purpose; use it at your own risk (see LICENSE).')
     parser.add_argument('url', nargs='?', help='StudOn URL to download from')
     parser.add_argument('download_path', nargs='?', help='Custom download path (one-time override)')
     parser.add_argument('--update-all', '-u', action='store_true',

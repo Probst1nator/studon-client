@@ -2,6 +2,12 @@
 
 Authenticates to FAU's StudOn LMS via Firefox cookies, crawls course pages, and downloads/organises all subscribed course materials.
 
+> **Disclaimer.** This is a private hobby project, not an official tool of FAU,
+> StudOn or campo, and not endorsed by them. It is provided as is, without any
+> warranty that it works, stays working when StudOn or campo change, or suits
+> your purpose. You use it at your own risk and are responsible for staying
+> within the StudOn and campo terms of use. See [LICENSE](LICENSE) (MIT).
+
 Runs two background agents via `@reboot` cron:
 - **Daily sync** — waits for Firefox login, refreshes *all* tracked courses once per day.
 - **Lecture sync** — long-running daemon that fetches *only* the course relevant to each lecture at start − 5 min, start, and start + 5 min, driven by your personal campo timetable. Force-opens Firefox via a tray icon if cookies are missing. Avoids rate-limiting by never touching more than the one course you're about to walk into.
