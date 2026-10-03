@@ -50,7 +50,9 @@ python3 studon_client.py --install
 
 `--install` registers both `@reboot` cron entries (`--daily-sync` and
 `--lecture-sync`) plus the weekly `--campo-bescheinigungen` job, adds a
-`studon-client` shell alias (clipboard quick-fetch, via cli-tools-kit), optionally persists a download path, and runs the
+`studon-client` shell alias (clipboard quick-fetch, via cli-tools-kit) and a
+"StudOn Client" entry in the application menu that opens the dashboard window,
+optionally persists a download path, and runs the
 interactive `--map-lectures` wizard so every campo timetable entry is paired
 with a tracked course (or explicitly marked "no StudOn course") before the
 lecture-sync daemon starts. Re-run any time you move the directory or
@@ -224,7 +226,9 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--campo-bescheinigungen` | Download all 12 exam-side PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/` |
 | `--campo-bescheinigungen --with-enrollment` | 12 + 7 = 19 PDFs (combo with the enrollment-side) |
 | `--campo-enrollment-bescheinigungen` | Download all 7 enrollment-side PDFs via `studyservice-flow` into `<downloads>/Bescheinigungen/Enrollment/`: Benutzerinfobrief, Bescheinigung §9 BAföG, Datenkontrollblatt, Quittung (einzelnes Semester), Beitragskonto, Immatrikulationsbescheinigung, Studienverlaufsbescheinigung. Parameterized reports default to the current semester. |
-| `--install` / `--remove` | Install / remove cron entries + shell alias (also cleans up the `~/.bashrc` function and untagged cron lines older versions wrote) |
+| `--gui` | Open the dashboard window (see [Dashboard window](#dashboard-window)) |
+| `--tui` | On a bare invocation, show the terminal menu even when a display is present |
+| `--install` / `--remove` | Install / remove cron entries, shell alias and the application-menu entry (also cleans up the `~/.bashrc` function and untagged cron lines older versions wrote) |
 | `--install-imap` / `--uninstall-imap` | Configure / remove FAUmail feedback checker |
 | `--check-feedback` | Scan inbox now and download any reachable feedback PDFs |
 | `--reset-feedback-state` | Clear `.studon_feedback_state.json` to reprocess all matching mails |
@@ -232,9 +236,35 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--tray` | Show the StudOn tray icon again after "Tray schliessen" and exit. Closing the tray sets `tray_closed` in `~/.local/state/studon-client/tray_status.json`, which stops both daemons from relaunching it and silences the login popups until the next successful StudOn login. |
 | `--debug` | Verbose logging, save discovery HTML |
 
+### Dashboard window
+
+`python studon_client.py --gui` opens a tkinter window (`studon_gui.py`). It is
+also what a bare `python studon_client.py` opens when a display is present,
+what the application-menu entry starts, and what the tray's
+"Fenster oeffnen" item starts.
+
+- The course table lists every tracked course with its last fetch, file count,
+  files added in the last 7 days and the mapped campo timetable titles. Click a
+  column heading to sort. Double-click opens the course folder.
+- The lower half shows the selected course's files (double-click opens one) and
+  a Log tab with the output of the running job.
+- Buttons: update all, preview all, add a course (URL prefilled from the
+  clipboard), check FAUmail feedback, fetch the timetable, change the download
+  folder, remove cron jobs/alias/launcher. Per course: update, preview, open
+  folder, open in StudOn.
+- Downloads take the same sync lock as the daemons, so the window refuses to
+  start one while a background sync runs.
+- `--map-lectures`, `--discover-from-timetable`, `--install` and
+  `--install-imap` ask questions on stdin, so the window opens them in a
+  terminal (konsole, else `x-terminal-emulator` or `xterm`).
+
+Needs `python3-tk` (`sudo apt install python3-tk`).
+
 ### Interactive TUI
 
-Run `python studon_client.py` with no arguments to get an arrow-key menu for all common operations (register course, update all, check feedback, install/uninstall, etc.).
+Run `python studon_client.py --tui`, or a bare `python studon_client.py`
+without a display, to get an arrow-key menu for all common operations
+(register course, update all, check feedback, install/uninstall, etc.).
 
 ---
 

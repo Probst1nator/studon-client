@@ -26,14 +26,16 @@ def _advertise_entry() -> dict:
         "icon": os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "assets", "studon-client.png"),
         "desc": "FAU StudOn / campo scraper — course downloads, timetable, Notenübersicht-PDFs",
-        "terminal": True,
-        "args": [],
-        "tags": ["CLI"],
+        # The Icon tag makes --install write studon_client.desktop, which opens
+        # the dashboard window (studon_gui.py) through `args`.
+        "terminal": False,
+        "args": ["--gui"],
+        "tags": ["CLI", "GUI", "Icon"],
         "alias": "studon-client",
         # alias_args auto-injects --clip when the shell alias is invoked
         # (so `studon-client URL` → `python studon_client.py --clip URL`,
-        # the preview+confirm quick-fetch flow). The plain `args` stays []
-        # so --install / .desktop launches don't pick up --clip.
+        # the preview+confirm quick-fetch flow) instead of `args`, so the
+        # alias never opens the window.
         "alias_args": ["--clip"],
         # Skill support: --install-skill / --uninstall-skill write
         # ~/.claude/skills/studon-client/SKILL.md from inline SKILL_MD_CONTENT.
@@ -2963,6 +2965,8 @@ class StudonTray:
         self.status_item.set_sensitive(False)
         self.last_item = Gtk.MenuItem(label="Letzter Sync: ...")
         self.last_item.set_sensitive(False)
+        self.gui_item = Gtk.MenuItem(label="Fenster oeffnen")
+        self.gui_item.connect("activate", self.on_gui)
         self.login_item = Gtk.MenuItem(label="In StudOn einloggen")
         self.login_item.connect("activate", self.on_login)
         self.sync_item = Gtk.MenuItem(label="Jetzt synchronisieren")
@@ -2972,8 +2976,8 @@ class StudonTray:
         self.quit_item = Gtk.MenuItem(label="Tray schliessen (bis zum naechsten Login)")
         self.quit_item.connect("activate", self.on_quit)
 
-        for it in (self.status_item, self.last_item, self.login_item, self.sync_item,
-                   self.dl_item, Gtk.SeparatorMenuItem(), self.quit_item):
+        for it in (self.status_item, self.last_item, self.gui_item, self.login_item,
+                   self.sync_item, self.dl_item, Gtk.SeparatorMenuItem(), self.quit_item):
             it.show()
             self.menu.append(it)
         self.menu.show_all()
@@ -3017,7 +3021,9 @@ class StudonTray:
         self.status_item.set_label(label)
         self.last_item.set_label(_last_sync_label(st))
         self.login_item.set_sensitive(bool(st.get("login_url")))
-        self.sync_item.set_sensitive(bool(st.get("venv_python") and st.get("script_path")))
+        can_spawn = bool(st.get("venv_python") and st.get("script_path"))
+        self.gui_item.set_sensitive(can_spawn)
+        self.sync_item.set_sensitive(can_spawn)
         self.dl_item.set_sensitive(bool(st.get("downloads_path")))
         try:
             self.ind.set_status(
@@ -3057,13 +3063,21 @@ class StudonTray:
             _spawn(["xdg-open", path])
 
     def on_sync(self, _w):
+        self._spawn_client("--update-all")
+
+    def on_gui(self, _w):
+        self._spawn_client("--gui")
+
+    @staticmethod
+    def _spawn_client(flag):
+        """Run studon_client.py with one flag under the daemon's venv python."""
         st = _read_status()
         py, script = st.get("venv_python"), st.get("script_path")
         if not (py and script):
             return
         env = os.environ.copy()
         env.pop("PYTHONPATH", None)  # do not leak the system path into the venv run
-        _spawn([py, script, "--update-all"],
+        _spawn([py, script, flag],
                cwd=os.path.dirname(script) or None, env=env)
 
 
@@ -8254,6 +8268,27 @@ def _fetch_single_course(title: str, source_url: str, course_folder: str,
             print(f"   • {os.path.relpath(filepath, base)}")
 
 
+def _gui_available() -> bool:
+    """True when a display is present and tkinter imports (python3-tk installed)."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return False
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _run_gui(preselect: Optional[Tuple[str, str, str]] = None) -> None:
+    """Open the dashboard window. studon_gui gets this module object passed in,
+    because importing studon_client there would load this script a second time."""
+    if not _gui_available():
+        print("❌ No display, or tkinter is missing (apt install python3-tk).")
+        return
+    import studon_gui
+    studon_gui.run(sys.modules[__name__], preselect=preselect)
+
+
 def _run_tui_menu(debug: bool = False, current_course: Optional[Tuple[str, str, str]] = None) -> None:
     """Interactive arrow-key menu — shown when no URL/flag is provided and stdin is a TTY.
 
@@ -8463,6 +8498,10 @@ def main() -> None:
                        help='Persist a default download path to config.json and exit')
     parser.add_argument('--clip', action='store_true',
                        help='Read clipboard, detect StudOn URL, preview files, and confirm before downloading')
+    parser.add_argument('--gui', action='store_true',
+                        help='Open the course dashboard window (studon_gui.py)')
+    parser.add_argument('--tui', action='store_true',
+                        help='On a bare invocation, show the terminal menu even when a display is present')
     parser.add_argument('--dry-run', action='store_true',
                        help='Discover files without downloading (preview mode)')
     parser.add_argument('--install', action='store_true',
@@ -8514,6 +8553,10 @@ def main() -> None:
                             "--campo-bescheinigungen), or 'both'. Bare --login == --login studon.")
 
     args = parser.parse_args()
+
+    if args.gui:
+        _run_gui()
+        return
 
     # --- Open Firefox for (re-)login and wait ---
     if args.login:
@@ -8734,6 +8777,9 @@ def main() -> None:
         _run_clip_mode(debug=args.debug)
         return
 
+    if not args.tui and _gui_available():
+        _run_gui(preselect=current_course)
+        return
     _run_tui_menu(debug=args.debug, current_course=current_course)
 
 
