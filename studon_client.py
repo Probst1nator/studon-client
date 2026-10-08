@@ -54,6 +54,7 @@ if "--advertise" in sys.argv:
     sys.exit(0)
 
 import webbrowser
+import campo_auth
 import re
 import email.utils
 import tempfile
@@ -2179,6 +2180,24 @@ def can_access_campo() -> bool:
         logger.debug(f"Cannot access campo: {e}")
         return False
 
+
+def _handle_campo_auth_failure(context: str) -> bool:
+    """A campo call hit an expired/missing login (HTTP 401/403, IdP redirect, no cookies).
+
+    Opens the campo login page in the default browser and prints what happened and
+    what to do next. Interactive commands wrapped in @_campo_login_retry then wait
+    for the login and run once more. Opens no browser from --daily-sync /
+    --lecture-sync or when STUDON_NO_BROWSER=1; at most one open per 2 minutes.
+    All logic lives in campo_auth.py (shared with campo_search.py).
+    """
+    return campo_auth.auth_failure(context, login_url=CAMPO_STUDY_PLANNER_URL,
+                                   open_url=_open_url_in_browser)
+
+
+# Decorator for interactive campo commands: after a flagged auth failure, wait for
+# the login (can_access_campo polling, max 10 min) and retry the call once.
+_campo_login_retry = campo_auth.retry_after_login(can_access_campo)
+
 def load_state() -> UpdateState:
     """Load the last update timestamp from RECENT_UPDATES.md."""
     recent_updates_path = os.path.join(DOWNLOAD_FOLDER, "RECENT_UPDATES.md")
@@ -3442,6 +3461,7 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
     Args:
         check_interval_seconds: How often to check for StudOn access (default: 5 minutes)
     """
+    campo_auth.set_unattended()  # daemon: a campo auth failure must not open a browser
     # Check platform compatibility and log warnings
     check_platform_compatibility()
 
@@ -3751,6 +3771,8 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
         tray_wait_seconds: Hard cap on the tray-icon wait per fire.
     """
     check_platform_compatibility()
+    if not once:
+        campo_auth.set_unattended()  # daemon: a campo auth failure must not open a browser
     logger.info(f"Lecture sync starting (once={once}, tray_wait={tray_wait_seconds}s)")
 
     warned_unmapped: set = set()
@@ -4396,7 +4418,7 @@ def _cron_lines(check_interval: int = 5) -> List[str]:
     # Weekly Prüfungsamt-PDFs (Mondays 06:30) — keeps Notenübersicht.pdf fresh so
     # --reconcile always has a canonical ECTS source.
     bescheinigungen_cmd = (
-        f"30 6 * * 1 cd {script_dir} && {python} {script_path} --campo-bescheinigungen "
+        f"30 6 * * 1 cd {script_dir} && STUDON_NO_BROWSER=1 {python} {script_path} --campo-bescheinigungen "
         f">> {os.path.join(DOWNLOAD_FOLDER, 'studon_bescheinigungen.log')} 2>&1"
     )
     return [daily_cmd, lecture_cmd, bescheinigungen_cmd]
@@ -5923,6 +5945,7 @@ def _tui_prompt_download_path() -> Optional[str]:
     return str(Path(path).expanduser().resolve()) if path else None
 
 
+@_campo_login_retry
 def _fetch_timetable_entries() -> Optional[Tuple[str, List[Dict]]]:
     """Fetch and parse the personal campo timetable.
 
@@ -5938,8 +5961,11 @@ def _fetch_timetable_entries() -> Optional[Tuple[str, List[Dict]]]:
         s.cookies.update(browser_cookie3.firefox(domain_name=CAMPO_DOMAIN))
         s.headers.update({'User-Agent': 'Mozilla/5.0'})
         r = s.get(CAMPO_TIMETABLE_URL)
+        if campo_auth.is_unauthenticated(r):
+            _handle_campo_auth_failure(f"Stundenplan, HTTP {r.status_code}")
+            return None
         if r.status_code != 200:
-            print(f"❌ campo returned HTTP {r.status_code}. Make sure you are logged in via Firefox.")
+            print(f"❌ campo returned HTTP {r.status_code}.")
             return None
     except Exception as e:
         print(f"❌ Could not fetch timetable: {e}")
@@ -6166,6 +6192,7 @@ def _find_form_control_name(html: str, suffix: str) -> Optional[str]:
     return el.get('name') if el is not None else None
 
 
+@_campo_login_retry
 def _fetch_timetable_entries_for_term(term_spec: str) -> Optional[Tuple[str, List[Dict], str]]:
     """Fetch the personal campo timetable for a non-current semester.
 
@@ -6181,8 +6208,11 @@ def _fetch_timetable_entries_for_term(term_spec: str) -> Optional[Tuple[str, Lis
         return None
     try:
         r = session.get(CAMPO_TIMETABLE_URL)
+        if campo_auth.is_unauthenticated(r):
+            _handle_campo_auth_failure(f"Stundenplan, HTTP {r.status_code}")
+            return None
         if r.status_code != 200:
-            print(f"❌ campo returned HTTP {r.status_code}. Make sure you are logged in via Firefox.")
+            print(f"❌ campo returned HTTP {r.status_code}.")
             return None
     except Exception as e:
         print(f"❌ Could not fetch timetable: {e}")
@@ -6385,6 +6415,7 @@ def _read_timetable_cache() -> Optional[Tuple[datetime, str, List[Dict]]]:
         return None
 
 
+@_campo_login_retry
 def fetch_timetable_markdown(output_path: Optional[str] = None,
                              term: Optional[str] = None) -> Optional[str]:
     """Fetch campo timetable, write Markdown (+ structured JSON cache).
@@ -6546,6 +6577,7 @@ def _render_campo_pruefungen_markdown(results: List[Tuple[str, Dict]]) -> str:
     return '\n'.join(lines)
 
 
+@_campo_login_retry
 def fetch_campo_pruefungen_markdown(output_path: Optional[str] = None) -> Optional[str]:
     """Scan Campo studyPlanner Detailansichten reachable via current Firefox
     session and write Prüfungs-Anmeldefristen to `pruefungen.md`.
@@ -6561,6 +6593,9 @@ def fetch_campo_pruefungen_markdown(output_path: Optional[str] = None) -> Option
         return None
 
     probe = session.get(CAMPO_STUDY_PLANNER_URL, allow_redirects=True, timeout=15)
+    if campo_auth.is_unauthenticated(probe):
+        _handle_campo_auth_failure(f"studyPlanner, HTTP {probe.status_code}")
+        return None
     if probe.status_code != 200 or 'Studienplaner' not in probe.text:
         print("❌ Campo studyPlanner not reachable. Log into campo.fau.de in Firefox and retry.")
         return None
@@ -6768,6 +6803,9 @@ def _fetch_modulplan_data(session: requests.Session) -> Optional[Tuple[str, List
     except requests.RequestException as e:
         print(f"❌ studyPlanner not reachable: {e}")
         return None
+    if campo_auth.is_unauthenticated(r):
+        _handle_campo_auth_failure(f"studyPlanner, HTTP {r.status_code}")
+        return None
     if r.status_code != 200 or 'Studienplaner' not in r.text:
         print("❌ Campo studyPlanner not reachable. Log into campo.fau.de in Firefox and retry.")
         return None
@@ -6791,6 +6829,7 @@ def _fetch_modulplan_data(session: requests.Session) -> Optional[Tuple[str, List
     return study_program, modules
 
 
+@_campo_login_retry
 def fetch_campo_modulplan(output_path: Optional[str] = None) -> Optional[str]:
     """Scan the campo studyPlanner-flow front page and write a per-module
     Modulplan markdown with status, Versuch, Semester der Leistung, and
@@ -7016,6 +7055,9 @@ def _fetch_belegungen_data(session: requests.Session) -> Optional[Tuple[str, Lis
     except requests.RequestException as e:
         print(f"❌ Belegungen not reachable: {e}")
         return None
+    if campo_auth.is_unauthenticated(r):
+        _handle_campo_auth_failure(f"Belegungen, HTTP {r.status_code}")
+        return None
     if r.status_code != 200 or 'Belegungen' not in r.text:
         print("❌ Campo Belegungen not reachable. Log into campo.fau.de in Firefox and retry.")
         return None
@@ -7045,6 +7087,7 @@ def _fetch_belegungen_data(session: requests.Session) -> Optional[Tuple[str, Lis
     return term_label, blocks
 
 
+@_campo_login_retry
 def fetch_campo_belegungen(output_path: Optional[str] = None) -> Optional[str]:
     """Scrape the campo Belegungen page (searchOwnEnrollmentInfo-flow) and write
     a per-Belegung markdown + structured JSON of angemeldete Prüfungen +
@@ -7507,6 +7550,7 @@ def _render_reconciliation_markdown(study_program: str, term_label: str, recon: 
     return '\n'.join(lines)
 
 
+@_campo_login_retry
 def fetch_campo_reconciliation(output_path: Optional[str] = None) -> Optional[str]:
     """Fetch Modulplan + Belegungen in one go and write Reconciliation.md
     with the cross-check that resolves the lernplan ↔ Prüfungen ECTS gap."""
@@ -7583,12 +7627,16 @@ def _campo_session() -> Optional[requests.Session]:
         s.cookies.update(browser_cookie3.firefox(domain_name='fau.de'))
         s.cookies.update(browser_cookie3.firefox(domain_name=CAMPO_DOMAIN))
         s.headers.update({'User-Agent': 'Mozilla/5.0'})
+        if not len(s.cookies):
+            _handle_campo_auth_failure("keine Firefox-Cookies für fau.de/campo")
+            return None
         return s
     except Exception as e:
         print(f"❌ Could not load Firefox cookies: {e}")
         return None
 
 
+@_campo_login_retry
 def _run_campo_search(query: str, term: Optional[str] = None) -> None:
     """Search campo's Lehrveranstaltungssuche for *query* and print hits + ECTS.
 
@@ -7642,6 +7690,7 @@ def _filename_from_content_disposition(cd: str, fallback: str) -> str:
     return fallback
 
 
+@_campo_login_retry
 def fetch_campo_exam_documents(output_dir: Optional[str] = None, dry_run: bool = False) -> Optional[List[str]]:
     """Download every PDF offered on campo's `personExamsReadonly` page
     (`examsOverviewForPerson-flow`) — Notenübersicht, Bescheinigungen,
@@ -7663,6 +7712,9 @@ def fetch_campo_exam_documents(output_dir: Optional[str] = None, dry_run: bool =
         r = s.get(CAMPO_EXAMS_OVERVIEW_URL, timeout=30, allow_redirects=True)
     except requests.RequestException as e:
         print(f"❌ Campo request failed: {e}")
+        return None
+    if campo_auth.is_unauthenticated(r):
+        _handle_campo_auth_failure(f"personExamsReadonly, HTTP {r.status_code}")
         return None
     if r.status_code != 200 or 'Notenübersicht' not in r.text:
         print("❌ Campo personExamsReadonly not reachable. Log into campo.fau.de in Firefox and retry.")
@@ -7786,6 +7838,7 @@ def _parse_partial_response(xml_text: str) -> Tuple[Optional[str], Dict[str, str
     return view_state, updates
 
 
+@_campo_login_retry
 def fetch_campo_enrollment_documents(output_dir: Optional[str] = None, dry_run: bool = False) -> Optional[List[str]]:
     """Download every PDF offered on campo's enrollment-info `studyservice-flow` page.
 
@@ -7820,6 +7873,9 @@ def fetch_campo_enrollment_documents(output_dir: Optional[str] = None, dry_run: 
             r = s.get(CAMPO_ENROLLMENT_INFO_URL, timeout=30, allow_redirects=True)
         except requests.RequestException as e:
             print(f"❌ Campo request failed: {e}")
+            return None
+        if campo_auth.is_unauthenticated(r):
+            _handle_campo_auth_failure(f"studyservice, HTTP {r.status_code}")
             return None
         if r.status_code != 200:
             print(f"❌ Campo enrollment-info GET returned HTTP {r.status_code}.")

@@ -411,6 +411,10 @@ systemctl --user start studon-sync.service
 - Try logging out of StudOn and back in to refresh cookies.
 - Verify the course URL is accessible in your browser.
 
+**campo says "campo-Login abgelaufen" (HTTP 403, login redirect, no cookies)**
+- The command opens campo's login page in the default browser by itself (at most once per 2 minutes) and waits up to 10 minutes for the login, then retries once. If the call is cut off earlier, log in and run the command again. Manual alternative: `python studon_client.py --login campo`.
+- `--daily-sync`, `--lecture-sync` and the weekly `--campo-bescheinigungen` cron line never open a browser (`STUDON_NO_BROWSER=1` does the same for any command). Re-run `--install` to get that variable into an already installed cron line.
+
 **Cron job not running**
 ```bash
 crontab -l           # confirm entry exists

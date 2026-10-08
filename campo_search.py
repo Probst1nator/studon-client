@@ -33,6 +33,8 @@ import browser_cookie3
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
+import campo_auth
+
 CAMPO = "https://www.campo.fau.de"
 CAMPO_HOST = "campo.fau.de"
 SEARCH_URL = CAMPO + "/qisserver/pages/startFlow.xhtml?_flowId=searchCourseNonStaff-flow"
@@ -68,6 +70,7 @@ def _campo_session() -> requests.Session:
         except Exception:
             pass
     if not got:
+        campo_auth.auth_failure("keine Firefox-Cookies für fau.de/campo")
         raise RuntimeError("No campo/fau.de Firefox cookies — log into campo.fau.de in Firefox.")
     s = requests.Session()
     s.cookies.update(jar)
@@ -114,6 +117,7 @@ def _collect_form(form: Tag) -> Dict[str, str]:
     return data
 
 
+@campo_auth.retry_after_login()
 def search_courses(query: str, term: Optional[str] = None,
                    session: Optional[requests.Session] = None):
     """Return (term_label, [hits]). term e.g. 'eq|1|2026'(SoSe) / 'eq|2|2026'(WiSe);
@@ -123,9 +127,12 @@ def search_courses(query: str, term: Optional[str] = None,
     (e.g. studon_client._campo_session()); otherwise one is built here.
     """
     s = session or _campo_session()
-    soup = BeautifulSoup(s.get(SEARCH_URL, timeout=30).text, "html.parser")
+    resp = s.get(SEARCH_URL, timeout=30)
+    soup = BeautifulSoup(resp.text, "html.parser")
     form = soup.find("form", {"id": "genericSearchMask"})
     if not isinstance(form, Tag):
+        if campo_auth.is_unauthenticated(resp):
+            campo_auth.auth_failure(f"Lehrveranstaltungssuche, HTTP {resp.status_code}")
         raise RuntimeError("genericSearchMask form not found (session expired / not logged in?).")
     action = form.get("action")
     post_url = CAMPO + str(action)
