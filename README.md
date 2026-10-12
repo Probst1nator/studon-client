@@ -144,6 +144,30 @@ python studon_client.py --lecture-sync-once
 # Prints resolved buckets and the next 5 fires, then exits.
 ```
 
+### Courses by ref_id
+
+A course's ref_id is the number after `ref_id=` in its StudOn link. Each command
+also takes a full StudOn link or the `studon.fau.de/campo/course/…` link from campo.
+
+```bash
+# Access state of each course: member, pending (request sent), password (+ deadline),
+# request, direct (one-click join), campo (membership via campo only), blocked
+# (prerequisites not met). Also shows whether the client tracks the course.
+python studon_client.py --courses 1234567 2345678 [--json]
+
+# Title, description and info screen as text, or with --dates the weekly rules and
+# every date, with cancelled dates marked and the first and next date held.
+python studon_client.py --read 1234567 [--dates] [--json]
+
+# Track courses you are a member of: METADATA.md is written at once, the download
+# runs in a detached process (log in ~/.local/state/studon-client/). Nothing is
+# joined on StudOn; a course you are not a member of is reported and skipped.
+python studon_client.py --add 1234567 2345678 [--no-fetch]
+
+# Download member courses now, one after another (waits for a running sync).
+python studon_client.py --fetch 1234567 2345678
+```
+
 ### Manual operations
 
 ```bash

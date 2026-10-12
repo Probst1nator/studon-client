@@ -4597,10 +4597,11 @@ cron daemons don't already do automatically.
 - "Suche Kurs X in campo" / "wie viele ECTS hat …" → `--campo-search "<query>" [--term 'eq|1|2026']` (prints LV-Treffer + ECTS to stdout; default Semester = aktuelles).
 - "Lade meine Notenübersicht / BAföG-Bescheinigung / Transcript" → `--campo-bescheinigungen` (downloads all 12 PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/`).
 - "Register a new course from a campo timetable entry I don't have yet" → `--discover-from-timetable`.
+- "Welche meiner Kurse kann der Client laden, wo fehlt Beitritt/Passwort?" (new semester) → `--courses <ref_id|StudOn link|studon.fau.de/campo/course link> …` → one row per course: state (member, pending, password + deadline, request, direct, campo, blocked), tracked yes/no, join link. Prints the `--add` line for members that are not tracked yet. One GET per course; `--json` for data.
+- "Wann ist der erste Termin / was fällt aus?" → `--read <ref_id …> --dates` (Terminplan + every date with cancellations, first and next date held; `--json` for data). "Was steht auf der Kursseite / welche Hilfsmittel?" → `--read <ref_id>` prints title, description and the info screen as lines; pipe through `grep -i`.
+- "Trag diese Kurse ein" → `--add <ref_id> …` writes METADATA.md for member courses at once and downloads them in a detached `--fetch` process (log in `~/.local/state/studon-client/`). It never joins a course on StudOn; non-members are reported and left untracked. `--no-fetch` leaves the files to the next `--daily-sync`.
 
 **Do NOT use this skill for:**
-- The QuizHub daily-quiz pipeline — that's `~/Synced/repos/AutomatedAlchemy/quizhub-client/` and runs from cron.
-- The `lecture-prep` skill — that builds a *pre-lecture concept quiz*, not a course download.
 - Anything outside FAU StudOn / campo.
 
 ## How to invoke
@@ -4626,6 +4627,10 @@ $PY $SCRAPER --help
 | (Re-)login Firefox & wait until authenticated | `$PY $SCRAPER --login campo` (or `studon` / `both`; bare `--login` == studon) |
 | Refresh just the course whose folder you're in (bare, no args) | `cd "<course folder>" && $PY $SCRAPER` (add `--dry-run` to preview) |
 | Download one course by URL | `$PY $SCRAPER <studon_course_url>` |
+| Access state of many courses (member / password / request / …) | `$PY $SCRAPER --courses <ref_id or url> … [--json]` |
+| Course info screen as text, or its dates | `$PY $SCRAPER --read <ref_id> … [--dates] [--json]` |
+| Track member courses, download in the background | `$PY $SCRAPER --add <ref_id> … [--no-fetch]` |
+| Download member courses now, one after another | `$PY $SCRAPER --fetch <ref_id> …` |
 | Preview without downloading | `$PY $SCRAPER <url> --dry-run` |
 | Refresh every tracked course | `$PY $SCRAPER --update-all` |
 | Export campo timetable → `timetable.md` | `$PY $SCRAPER --timetable` |
@@ -4722,9 +4727,8 @@ Full usage guide: `__SCRIPT_DIR__/README.md`.
 - Logs land in CWD (`studon_sync.log`), not the script dir. Syncthing has been
   known to mint `studon_sync.sync-conflict-*.log` copies across hosts — those
   are noise, not errors.
-- Per-file confirmation kicks in above 50 files (`CONFIRMATION_THRESHOLD` env
-  var). For a non-interactive Claude session, prefer `--dry-run` first to
-  preview, then re-run without it.
+- Headless downloads (`<URL>`, `--fetch`, `--add`) do not ask for
+  confirmation. Use `--dry-run` with `<URL>` to preview first.
 '''
 
 
@@ -7680,6 +7684,260 @@ def _run_campo_search(query: str, term: Optional[str] = None) -> None:
             print(f"    unitId={h['unitId']} periodId={h['periodId']}")
 
 
+# --- Course status, course pages and registration by ref_id ---
+# (--courses / --read / --add / --fetch). The page parsing lives in
+# studon_courses.py so the tests can feed it synthetic HTML.
+
+def _course_target_url(target: str) -> Optional[str]:
+    """A StudOn link for a ref_id, a StudOn URL or a StudOn campo/course link; else None."""
+    from studon_courses import course_url
+    target = target.strip()
+    if target.isdigit():
+        return course_url(target)
+    if _url_host_matches(target, STUDON_DOMAIN):
+        return target
+    return None
+
+
+def _tracked_ref_ids() -> Dict[str, str]:
+    """ref_id → course folder for every course the client already tracks."""
+    from studon_courses import ref_id_of
+    tracked: Dict[str, str] = {}
+    for _metadata_path, source_url, course_folder in find_all_metadata_files(DOWNLOAD_FOLDER):
+        ref_id = ref_id_of(source_url)
+        if ref_id:
+            tracked[ref_id] = course_folder
+    return tracked
+
+
+def _probe_course(session: requests.Session, target: str) -> Dict[str, str]:
+    """GET a course link and describe what StudOn shows: ref_id, title, access state, deadline."""
+    from studon_courses import classify_course_page, course_url, page_header, ref_id_of
+    row = {'target': target, 'ref_id': '', 'title': '', 'state': 'unknown',
+           'deadline': '', 'url': '', 'error': ''}
+    url = _course_target_url(target)
+    if url is None:
+        row['error'] = 'not a ref_id or a StudOn link (campo.fau.de links need the StudOn link from the campo detail page)'
+        return row
+    try:
+        response = session.get(url, allow_redirects=True, timeout=30)
+    except requests.RequestException as e:
+        row['error'] = str(e)
+        return row
+    if not _url_host_matches(response.url, STUDON_DOMAIN):
+        row['error'] = f'redirected off StudOn: {response.url}'
+        return row
+    row.update(classify_course_page(response.text, response.url))
+    row['ref_id'] = ref_id_of(response.url) or (target if target.isdigit() else ref_id_of(url) or '')
+    row['title'] = page_header(response.text)['title']
+    if row['ref_id']:
+        row['url'] = course_url(row['ref_id'])
+    return row
+
+
+_LOGIN_HINT = "❌ Firefox is not logged into StudOn. Log in there (or run --login) and try again."
+
+
+def run_course_status(targets: List[str], as_json: bool = False) -> None:
+    """Print the StudOn access state of each course and whether the client tracks it (--courses)."""
+    session = _make_session()
+    if session is None:
+        return
+    tracked = _tracked_ref_ids()
+    rows = []
+    for target in targets:
+        row = _probe_course(session, target)
+        row['tracked'] = bool(row['ref_id']) and row['ref_id'] in tracked
+        rows.append(row)
+        if row['state'] == 'login':
+            print(_LOGIN_HINT)
+            return
+
+    if as_json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return
+
+    table = []
+    for row in rows:
+        state = row['state'] + (f" until {row['deadline']}" if row['deadline'] else '')
+        table.append([state, row['ref_id'] or '-', 'yes' if row['tracked'] else 'no',
+                      row['title'] or row['error'] or row['target']])
+    print(tabulate(table, headers=['State', 'ref_id', 'Tracked', 'Title'], tablefmt='simple'))
+
+    untracked = [row['ref_id'] for row in rows if row['state'] == 'member' and not row['tracked']]
+    if untracked:
+        print(f"\nMember, not tracked yet. Add them with:\n  python3 studon_client.py --add {' '.join(untracked)}")
+    to_join = [row for row in rows if row['state'] in ('direct', 'password', 'request')]
+    if to_join:
+        print("\nJoin on StudOn first:")
+        for row in to_join:
+            print(f"  {row['state']:<8} {row['url']}")
+
+
+def run_read_course(targets: List[str], dates: bool = False, as_json: bool = False) -> None:
+    """Print each course's title, description and info screen, or with *dates* its lecture dates (--read)."""
+    from studon_courses import (STUDON_INFO_URL, course_url, page_header, page_lines,
+                                page_text, parse_termine, ref_id_of)
+    session = _make_session()
+    if session is None:
+        return
+    results = []
+    for target in targets:
+        url = _course_target_url(target)
+        if url is None:
+            print(f"❌ {target}: not a ref_id or a StudOn link.")
+            continue
+        ref_id = ref_id_of(url)
+        try:
+            if not ref_id:
+                # A campo/course link: follow it once to learn the ref_id.
+                ref_id = ref_id_of(session.get(url, allow_redirects=True, timeout=30).url)
+            if not ref_id:
+                print(f"❌ {target}: no ref_id behind this link.")
+                continue
+            response = session.get(STUDON_INFO_URL.format(ref=ref_id), timeout=30)
+        except requests.RequestException as e:
+            print(f"❌ {target}: {e}")
+            continue
+        if 'ilstartupgui' in response.url.lower() or 'login.php' in response.url.lower():
+            print(_LOGIN_HINT)
+            return
+        result = {'ref_id': ref_id, 'url': course_url(ref_id), **page_header(response.text)}
+        if dates:
+            result['termine'] = parse_termine(page_text(response.text), date.today())
+        else:
+            result['info'] = page_lines(response.text)
+        results.append(result)
+
+    if as_json:
+        print(json.dumps(results, ensure_ascii=False, indent=1))
+        return
+
+    for result in results:
+        print(f"# {result['title']}  (ref_id {result['ref_id']})")
+        if result['description']:
+            print(result['description'])
+        print()
+        if not dates:
+            print('\n'.join(result['info']))
+            print()
+            continue
+        termine = result['termine']
+        for rule in termine['rules']:
+            print(f"{rule['rhythm']}, {rule['weekday']} {rule['start']}-{rule['end']}, "
+                  f"{rule['from']} to {rule['until']}")
+        for day in termine['dates']:
+            print(f"  {day['weekday']} {day['date']} {day['start']}-{day['end']}"
+                  + ("  cancelled" if day['cancelled'] else ""))
+        if not termine['dates']:
+            print("No dates on the info screen.")
+        for label, key in (("First date held", 'first_held'), ("Next date held", 'next_held')):
+            if termine[key]:
+                print(f"{label}: {termine[key]['weekday']} {termine[key]['date']} {termine[key]['start']}")
+        print()
+
+
+def _spawn_background_fetch(ref_ids: List[str]) -> Path:
+    """Start `--fetch <ref_ids>` as a detached process; return its log path.
+
+    The log goes to ~/.local/state/studon-client/ (per host, not synced), so two
+    hosts never append to one file.
+    """
+    state_dir = Path.home() / '.local' / 'state' / 'studon-client'
+    state_dir.mkdir(parents=True, exist_ok=True)
+    log_path = state_dir / f"fetch-{datetime.now():%Y%m%d-%H%M%S}.log"
+    with open(log_path, 'w', encoding='utf-8') as log:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), '--fetch', *ref_ids],
+                         cwd=_SCRIPT_DIR, stdin=subprocess.DEVNULL, stdout=log,
+                         stderr=subprocess.STDOUT, start_new_session=True,
+                         env={**os.environ, 'PYTHONUNBUFFERED': '1'})
+    return log_path
+
+
+def run_add_courses(targets: List[str], fetch: bool = True) -> None:
+    """Track courses you are a member of and download them in the background (--add).
+
+    Writes each course's METADATA.md right away, so the daily sync knows it.
+    It never joins a course on StudOn. A course you are not a member of is
+    reported with its state and join link and left untracked, because tracking
+    it would make the daily sync crawl its registration page every day.
+    """
+    from studon_courses import course_url
+    session = _make_session()
+    if session is None:
+        return
+    tracked = _tracked_ref_ids()
+    added = []
+    for target in targets:
+        row = _probe_course(session, target)
+        ref_id = row['ref_id']
+        if row['state'] == 'login':
+            print(_LOGIN_HINT)
+            return
+        if row['error'] or not ref_id:
+            print(f"❌ {target}: {row['error'] or 'no ref_id found'}")
+            continue
+        if ref_id in tracked:
+            print(f"• {ref_id} is already tracked: {os.path.relpath(tracked[ref_id], DOWNLOAD_FOLDER)}")
+            continue
+        if row['state'] != 'member':
+            hint = ("the request waits for the course admin" if row['state'] == 'pending'
+                    else f"join on StudOn first: {row['url']}")
+            print(f"⏭️  {ref_id} {row['title']}: {row['state']}"
+                  + (f" until {row['deadline']}" if row['deadline'] else '')
+                  + f", {hint}")
+            continue
+        source_url = course_url(ref_id)
+        # Same title source as process_single_url, so the background fetch lands in this folder.
+        course_title = extract_course_title(source_url, session)
+        if not course_title:
+            print(f"❌ {ref_id}: could not read the course title.")
+            continue
+        metadata_path = os.path.join(DOWNLOAD_FOLDER, course_title, 'METADATA.md')
+        if os.path.exists(metadata_path):
+            print(f"⚠️  {ref_id}: the folder '{course_title}' already belongs to another course. Skipped.")
+            continue
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        update_course_metadata(metadata_path, course_title, source_url, [])
+        print(f"✅ {ref_id} tracked: {course_title}")
+        added.append(ref_id)
+
+    if not added:
+        return
+    if not fetch:
+        print("\nThe next --daily-sync downloads the files.")
+        return
+    log_path = _spawn_background_fetch(added)
+    print(f"\n📥 Downloading {len(added)} course(s) in the background. Log: {log_path}")
+
+
+def run_fetch_courses(targets: List[str], debug: bool = False) -> None:
+    """Download courses you are a member of, one after another (--fetch).
+
+    Holds the sync lock, so it never runs at the same time as a daemon sync.
+    """
+    session = _make_session()
+    if session is None:
+        return
+    if not _acquire_sync_lock('fetch', wait_seconds=600):
+        print("⏳ Another sync has held the lock for 10 minutes. The next --daily-sync downloads these courses.")
+        return
+    try:
+        for target in targets:
+            row = _probe_course(session, target)
+            if row['state'] == 'login':
+                print(_LOGIN_HINT)
+                return
+            if row['state'] != 'member':
+                print(f"⏭️  {target}: {row['error'] or row['state']}. Not downloaded.")
+                continue
+            print(f"\n📥 {row['ref_id']} {row['title']}")
+            downloaded, extracted, _files = process_single_url(row['url'], session, DOWNLOAD_FOLDER, debug=debug)
+            print(f"   {downloaded} new file(s), {extracted} archive(s) extracted.")
+    finally:
+        _release_sync_lock()
+
+
 def _filename_from_content_disposition(cd: str, fallback: str) -> str:
     """Extract filename from a Content-Disposition header (prefers RFC 5987 filename*=)."""
     from urllib.parse import unquote
@@ -8601,6 +8859,22 @@ def main() -> None:
                             "'eq|2|2026' (WiSe26/27) or a raw campo option id (e.g. 590); "
                             "default = current semester. For --timetable a non-current term writes "
                             "timetable_<label>.md (e.g. timetable_WS2627.md) and leaves timetable.md untouched.")
+    parser.add_argument('--courses', nargs='+', metavar='REF',
+                       help='Show the StudOn access state of each course (member, pending, password, request, '
+                            'direct, campo, blocked) and whether the client tracks it. REF is a ref_id, '
+                            'a StudOn link or a StudOn campo/course link.')
+    parser.add_argument('--read', nargs='+', metavar='REF',
+                       help="Print each course's title, description and info screen as text")
+    parser.add_argument('--dates', action='store_true',
+                       help='With --read: print the weekly rules and every date with cancellations instead of the info text')
+    parser.add_argument('--json', action='store_true',
+                       help='With --courses or --read: print JSON')
+    parser.add_argument('--add', nargs='+', metavar='REF',
+                       help='Track courses you are a member of: write METADATA.md now, download in the background')
+    parser.add_argument('--no-fetch', action='store_true',
+                       help='With --add: skip the background download; the next --daily-sync fetches the files')
+    parser.add_argument('--fetch', nargs='+', metavar='REF',
+                       help='Download courses you are a member of, one after another, in the foreground')
     parser.add_argument('--campo-bescheinigungen', action='store_true',
                        help='Download all PDFs from campo Notenübersicht / personExamsReadonly page (Notenübersicht, BAföG-§48, ord. Studium, angemeldete Prüfungen, ...) into <downloads>/Bescheinigungen/')
     parser.add_argument('--campo-enrollment-bescheinigungen', action='store_true',
@@ -8680,6 +8954,20 @@ def main() -> None:
     # --- Campo course search (Lehrveranstaltungssuche) ---
     if args.campo_search:
         _run_campo_search(args.campo_search, term=args.term)
+        return
+
+    # --- Course status, course pages and registration by ref_id ---
+    if args.courses:
+        run_course_status(args.courses, as_json=args.json)
+        return
+    if args.read:
+        run_read_course(args.read, dates=args.dates, as_json=args.json)
+        return
+    if args.add:
+        run_add_courses(args.add, fetch=not args.no_fetch)
+        return
+    if args.fetch:
+        run_fetch_courses(args.fetch, debug=args.debug)
         return
 
     # --- Campo Notenübersicht / Bescheinigungen (PDF bulk download) ---
