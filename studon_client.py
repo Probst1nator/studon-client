@@ -946,8 +946,17 @@ def extract_course_title(page_url: str, session: requests.Session, debug: bool =
                 f.write(response.text)
             logger.debug(f"Saved debug HTML to: {debug_file}")
 
-        # Strategy 1: Try to find h1 tags (with or without classes)
-        h1_tags = soup.find_all('h1')
+        # Strategy 0: the ILIAS page header. Courses that allow uploads render a
+        # hidden upload modal whose <h1 class="modal-title">Dateien hochladen</h1>
+        # comes before the real header, so the first h1 is not the course title.
+        header = soup.find('h1', class_='il-page-content-header')
+        if header and header.get_text(strip=True):
+            return clean_filename(header.get_text(strip=True))
+
+        # Strategy 1: Try to find h1 tags (with or without classes), skipping modal titles
+        h1_tags = [h1 for h1 in soup.find_all('h1')
+                   if 'modal-title' not in (h1.get('class') or [])
+                   and not h1.find_parent(class_='modal')]
         if debug:
             logger.debug(f"Found {len(h1_tags)} h1 tags")
 

@@ -113,6 +113,16 @@ def test_extract_course_title_refuses_off_domain():
     assert sess.requested == []
 
 
+def test_extract_course_title_skips_upload_modal():
+    """The hidden upload modal's h1 ("Dateien hochladen") is not the course title."""
+    url = 'https://www.studon.fau.de/studon/ilias.php?baseClass=ilrepositorygui&ref_id=1'
+    html = ('<html><div class="modal fade"><div class="modal-header">'
+            '<h1 class="modal-title">Dateien hochladen</h1></div></div>'
+            '<h1 class="il-page-content-header media-heading ilHeader">Materialsammlung MWT/NT/KIM</h1>'
+            '</html>')
+    assert s.extract_course_title(url, _FakeSession({url: html})) == 'Materialsammlung MWTNTKIM'
+
+
 def test_resolve_studon_course_url_rejects_off_domain_final():
     """A campo->studon link that redirects off-domain resolves to None."""
     evil = 'https://studon.fau.de.attacker.com/redir'
