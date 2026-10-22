@@ -65,6 +65,7 @@ import time
 import requests
 import pyperclip
 import browser_cookie3
+from collections import Counter
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -232,6 +233,9 @@ class CourseMetadata:
     # Verbatim timetable titles (from campo) that map to this course. Used by
     # --lecture-sync to schedule per-lecture single-course fetches.
     timetable_titles: List[str] = field(default_factory=list)
+    # StudOn objects the crawler saw but cannot download (tests, exercises,
+    # forums, …), as {kind, title, folder, url}. See _interactive_kind.
+    interactive_items: List[Dict[str, str]] = field(default_factory=list)
 
     @property
     def last_fetched_formatted(self) -> str:
@@ -245,6 +249,15 @@ class CourseMetadata:
             f"Source: {self.source_url}",
             f"Last fetched: {self.last_fetched_formatted}",
         ]
+
+        if self.interactive_items:
+            lines.append("\n## On StudOn only (not downloaded)\n")
+            lines.append("Tests, exercises, forums and plugin objects. Open them on StudOn.\n")
+            lines.append(tabulate(
+                [[i['kind'], i['folder'] or '.', i['title'], i['url']] for i in self.interactive_items],
+                headers=["Kind", "Folder", "Title", "Link"],
+                tablefmt="pipe"
+            ))
 
         if self.file_history:
             lines.append("\n## File History\n")
@@ -276,6 +289,8 @@ class CourseMetadata:
         # Persist timetable_titles only when set, to keep existing files clean.
         if self.timetable_titles:
             yaml_data['timetable_titles'] = list(self.timetable_titles)
+        if self.interactive_items:
+            yaml_data['interactive_items'] = [dict(i) for i in self.interactive_items]
         yaml_data['file_history'] = [record.to_dict(course_folder) for record in self.file_history]
 
         # Generate YAML frontmatter
@@ -329,12 +344,17 @@ class CourseMetadata:
 
                         raw_titles = yaml_data.get('timetable_titles', []) or []
                         timetable_titles = [str(t) for t in raw_titles if isinstance(t, (str, int, float))]
+                        interactive_items = [
+                            {k: str(i.get(k) or '') for k in ('kind', 'title', 'folder', 'url')}
+                            for i in (yaml_data.get('interactive_items') or []) if isinstance(i, dict)
+                        ]
                         return cls(
                             course_title=yaml_data.get('course_title', 'Unknown Course'),
                             source_url=yaml_data.get('source_url', ''),
                             last_fetched=last_fetched,
                             file_history=file_history,
                             timetable_titles=timetable_titles,
+                            interactive_items=interactive_items,
                         )
                     except yaml.YAMLError as e:
                         logger.warning(f"Could not parse YAML frontmatter: {e}, falling back to markdown parsing")
@@ -1311,7 +1331,7 @@ def create_course_link_file(course_folder: Path, course_title: str, source_url: 
     except Exception as e:
         logger.warning(f"Could not create course link file: {e}")
 
-def update_course_metadata(metadata_path: str, course_title: Optional[str], source_url: str, downloaded_files_info: List[FileRecord]) -> None:
+def update_course_metadata(metadata_path: str, course_title: Optional[str], source_url: str, downloaded_files_info: List[FileRecord], interactive_items: Optional[List[Dict[str, str]]] = None) -> None:
     """
     Updates a course's METADATA.md file with file history using YAML frontmatter format.
 
@@ -1320,6 +1340,8 @@ def update_course_metadata(metadata_path: str, course_title: Optional[str], sour
         course_title: Title of the course (can be None)
         source_url: Source URL of the course
         downloaded_files_info: List of FileRecord objects
+        interactive_items: Result of a fresh crawl (replaces the recorded list);
+            None keeps the recorded list, because no crawl happened
     """
     course_folder = Path(metadata_path).parent
 
@@ -1340,9 +1362,11 @@ def update_course_metadata(metadata_path: str, course_title: Optional[str], sour
 
     existing_history: List[FileRecord] = []
     existing_titles: List[str] = []
+    existing_interactive: List[Dict[str, str]] = []
     if existing_metadata:
         existing_history = existing_metadata.file_history
         existing_titles = existing_metadata.timetable_titles
+        existing_interactive = existing_metadata.interactive_items
         # Use existing course title and source URL if not provided
         if not course_title:
             course_title = existing_metadata.course_title
@@ -1362,6 +1386,7 @@ def update_course_metadata(metadata_path: str, course_title: Optional[str], sour
         last_fetched=datetime.now(),
         file_history=all_history,
         timetable_titles=existing_titles,
+        interactive_items=existing_interactive if interactive_items is None else interactive_items,
     )
 
     try:
@@ -1376,10 +1401,56 @@ def update_course_metadata(metadata_path: str, course_title: Optional[str], sour
 
 # --- CORE LOGIC ---
 
-def discover_items_recursive(page_url: str, current_path: str, session: requests.Session, file_list: List[Dict[str, str]], course_title: Optional[str] = None, debug: bool = False, _visited: Optional[set] = None) -> None:
+# StudOn objects that have no file behind them. The crawler lists them in
+# METADATA.md so a course folder does not look complete while StudOn holds,
+# say, a practice test per lecture. Matched against the item's link, because
+# the item icons load lazily and the raw HTML only carries a placeholder.
+_INTERACTIVE_KINDS = (  # kind, ILIAS type for /go/ permalinks, link pattern
+    ('test', 'tst', re.compile(r'ilTestScreenGUI|ilObjTestGUI|/go/tst/|target=tst_', re.I)),
+    ('exercise', 'exc', re.compile(r'ilExerciseHandlerGUI|ilObjExerciseGUI|/go/exc/|target=exc_', re.I)),
+    ('survey', 'svy', re.compile(r'ilObjSurveyGUI|/go/svy/|target=svy_', re.I)),
+    ('forum', 'frm', re.compile(r'ilObjForumGUI|/go/frm/|target=frm_', re.I)),
+    ('plugin', None, re.compile(r'ilObjPluginDispatchGUI|/go/xlvo/|target=xlvo_', re.I)),
+)
+
+
+def _interactive_kind(href: str) -> Optional[str]:
+    """'test', 'exercise', 'survey', 'forum' or 'plugin' (LiveVoting, video series, …) for a StudOn item link, else None."""
+    for kind, _, pattern in _INTERACTIVE_KINDS:
+        if pattern.search(href or ''):
+            return kind
+    return None
+
+
+def _interactive_permalink(kind: str, url: str) -> str:
+    """StudOn's permanent /go/<type>/<ref_id> link for the item, or the url as it is.
+
+    Item links inside a folder carry the folder's ref_id first and the item's
+    last, plus a per-render cmdNode; the permalink keeps only the item.
+    """
+    ilias_type = next((t for k, t, _ in _INTERACTIVE_KINDS if k == kind), None)
+    ref_ids = re.findall(r'[?&]ref_id=(\d+)', url)
+    if not ilias_type or not ref_ids:
+        return url
+    return f"https://www.{STUDON_DOMAIN}/studon/go/{ilias_type}/{ref_ids[-1]}"
+
+
+def _interactive_for_metadata(found: List[Dict[str, str]], course_folder: str) -> List[Dict[str, str]]:
+    """discover_items_recursive's items as METADATA.md stores them: the folder relative to the course ('' for its top)."""
+    items = []
+    for i in found:
+        folder = os.path.relpath(i['path'], course_folder)
+        items.append({'kind': i['kind'], 'title': i['title'],
+                      'folder': '' if folder == '.' else folder, 'url': i['url']})
+    return items
+
+
+def discover_items_recursive(page_url: str, current_path: str, session: requests.Session, file_list: List[Dict[str, str]], course_title: Optional[str] = None, debug: bool = False, _visited: Optional[set] = None, interactive_list: Optional[List[Dict[str, str]]] = None) -> None:
     """
     Recursively scans StudOn pages, identifying files and folders.
     Supports classic ILIAS (il_ContainerListItem) and ILIAS 7+ (il-std-item, goto.php).
+    With interactive_list, also collects the items that cannot be downloaded
+    (see _interactive_kind) as {kind, title, path, url}.
     """
     if _visited is None:
         _visited = set()
@@ -1434,9 +1505,29 @@ def discover_items_recursive(page_url: str, current_path: str, session: requests
             new_path = os.path.join(current_path, name)
             if debug:
                 print(f"   ↳ Entering folder: {name}")
-            discover_items_recursive(url, new_path, session, file_list, course_title, debug, _visited)
+            discover_items_recursive(url, new_path, session, file_list, course_title, debug, _visited, interactive_list)
 
     NAV_TEXTS = {'home', 'back', 'up', 'zurück', 'startseite', 'zur übersicht', 'breadcrumb'}
+
+    if interactive_list is not None:
+        known = {i['url'] for i in interactive_list}
+        for link in soup.select('a.il_ContainerItemTitle, .il-std-item .il-item-title a'):
+            kind = _interactive_kind(link.get('href', ''))
+            title = link.get_text(strip=True)
+            if not kind or not title:
+                continue
+            # Relative item links resolve against the page StudOn redirected
+            # to (ilias.php?…), not against the /go/fold/ address we asked for.
+            url = urljoin(response.url, link.get('href', ''))
+            if not _url_host_matches(url, STUDON_DOMAIN):
+                continue
+            url = _interactive_permalink(kind, url)
+            if url in known:
+                continue
+            known.add(url)
+            interactive_list.append({'kind': kind, 'title': title, 'path': current_path, 'url': url})
+            if debug:
+                print(f"   ✓ Found {kind} (not downloadable): {title}")
 
     # --- Strategy 1: Classic ILIAS (il_ContainerListItem) ---
     classic_items = soup.find_all('div', class_='il_ContainerListItem')
@@ -1588,8 +1679,10 @@ def _restore_sec_extension(filename: str, head: bytes) -> str:
     return filename
 
 
-def download_all_files(source: str, files_to_download: List[Dict[str, str]], session: requests.Session, course_title: Optional[str] = None, base_path: str = None) -> Tuple[int, List[str]]:
+def download_all_files(source: str, files_to_download: List[Dict[str, str]], session: requests.Session, course_title: Optional[str] = None, base_path: str = None, interactive_items: Optional[List[Dict[str, str]]] = None) -> Tuple[int, List[str]]:
     """Downloads all files from the provided list.
+
+    interactive_items goes to METADATA.md unchanged (see update_course_metadata).
 
     Returns:
         Tuple of (download_count, list_of_downloaded_filepaths)
@@ -1792,10 +1885,10 @@ def download_all_files(source: str, files_to_download: List[Dict[str, str]], ses
     # Update the recent files log and course metadata
     if downloaded_files_info:
         update_recent_files_log(downloaded_files_info, DOWNLOAD_FOLDER)
-        update_course_metadata(metadata_path, course_title, source, downloaded_files_info)
+        update_course_metadata(metadata_path, course_title, source, downloaded_files_info, interactive_items)
     else:
         # Even if no new files, update the metadata with last fetched time
-        update_course_metadata(metadata_path, course_title, source, [])
+        update_course_metadata(metadata_path, course_title, source, [], interactive_items)
 
     return download_count, downloaded_files
 
@@ -1914,16 +2007,21 @@ def process_single_url(start_url: str, session: requests.Session, base_download_
         final_download_path = root_folder
 
     all_files_to_download: List[Dict[str, str]] = []
-    discover_items_recursive(start_url, final_download_path, session, all_files_to_download, course_title, debug=debug)
+    found_interactive: List[Dict[str, str]] = []
+    discover_items_recursive(start_url, final_download_path, session, all_files_to_download, course_title, debug=debug, interactive_list=found_interactive)
+    interactive_items = _interactive_for_metadata(found_interactive, final_download_path)
+    if interactive_items:
+        kinds = ', '.join(f"{n} {k}" for k, n in Counter(i['kind'] for i in interactive_items).items())
+        print(f"   ℹ️  On StudOn only, not downloaded: {kinds}. Listed in METADATA.md.")
 
     total_files: int = len(all_files_to_download)
 
     if total_files == 0:
         metadata_path = os.path.join(final_download_path, "METADATA.md")
-        update_course_metadata(metadata_path, course_title, start_url, [])
+        update_course_metadata(metadata_path, course_title, start_url, [], interactive_items)
         return 0, 0, []
 
-    num_downloaded, downloaded_files = download_all_files(start_url, all_files_to_download, session, course_title, final_download_path)
+    num_downloaded, downloaded_files = download_all_files(start_url, all_files_to_download, session, course_title, final_download_path, interactive_items)
 
     num_extracted = 0
 
@@ -5860,7 +5958,13 @@ def _print_discovery_preview(url: str, session: requests.Session, base_path: str
     print("🔎 Scanning course pages...")
 
     all_files: List[Dict[str, str]] = []
-    discover_items_recursive(url, dest, session, all_files, course_title, debug=debug)
+    found_interactive: List[Dict[str, str]] = []
+    discover_items_recursive(url, dest, session, all_files, course_title, debug=debug, interactive_list=found_interactive)
+
+    if found_interactive:
+        print("\n  On StudOn only, not downloaded (tests, exercises, forums, plugins):")
+        for i in _interactive_for_metadata(found_interactive, dest):
+            print(f"    • [{i['kind']}] {i['folder'] + '/' if i['folder'] else ''}{i['title']}")
 
     if not all_files:
         print("   (no downloadable files found)")

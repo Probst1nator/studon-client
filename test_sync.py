@@ -347,3 +347,91 @@ def test_sec_downloads_are_renamed_by_their_magic_bytes(tmp_path, monkeypatch):
     assert sorted(os.path.basename(p) for p in downloaded) == [
         "Blatt 1.pdf", "Code.zip", "Notes .sec"]
     assert (course / "Blatt 1.pdf").read_bytes() == b"%PDF-1.7 ..."
+
+
+# --- Tests, exercises and forums are listed, not silently skipped ----------
+
+def test_interactive_kind_reads_the_link():
+    """The kind comes from the link, since the item icons load lazily."""
+    base = "https://www.studon.fau.de/studon/"
+    assert s._interactive_kind(base + "ilias.php?baseClass=ilrepositorygui&cmdClass=ilTestScreenGUI&cmd=testScreen&ref_id=1") == "test"
+    assert s._interactive_kind(base + "go/exc/7143570") == "exercise"
+    assert s._interactive_kind(base + "go/frm/7144476") == "forum"
+    assert s._interactive_kind(base + "ilias.php?baseClass=ilObjPluginDispatchGUI&cmd=forward&ref_id=2") == "plugin"
+    assert s._interactive_kind(base + "go/fold/7154930") is None
+    assert s._interactive_kind(base + "ilias.php?cmdClass=ilObjFileGUI&cmd=sendfile&ref_id=3") is None
+
+
+def test_interactive_permalink_keeps_only_the_item():
+    """The folder's ref_id and the per-render cmdNode drop out; plugins keep their link."""
+    link = "https://www.studon.fau.de/studon/ilias.php?cmdNode=13a:wm:1a7&cmdClass=ilTestScreenGUI&ref_id=7154930&ref_id=7154932"
+    assert s._interactive_permalink("test", link) == "https://www.studon.fau.de/studon/go/tst/7154932"
+    plugin = "https://www.studon.fau.de/studon/ilias.php?baseClass=ilObjPluginDispatchGUI&ref_id=2"
+    assert s._interactive_permalink("plugin", plugin) == plugin
+
+
+class _FakePage:
+    def __init__(self, url, text):
+        self.url, self.text = url, text
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeCrawlSession:
+    """Serves fixed HTML per URL, like StudOn's classic container pages."""
+
+    def __init__(self, pages):
+        self.pages = pages
+
+    def get(self, url, **kwargs):
+        final_url, text = self.pages[url]
+        return _FakePage(final_url, text)
+
+
+def _container(*items):
+    rows = "".join(
+        f'<div class="ilContainerListItemOuter">{icon}<div class="il_ContainerListItem">'
+        f'<a class="il_ContainerItemTitle" href="{href}">{title}</a></div></div>'
+        for title, href, icon in items)
+    return f"<html><body>{rows}</body></html>"
+
+
+def test_crawl_collects_tests_in_subfolders(tmp_path):
+    """A test inside a lecture folder is reported with its folder; files still download."""
+    base = "https://www.studon.fau.de/studon/"
+    root, part2 = base + "go/crs/1", base + "go/fold/2"
+    # As StudOn renders it: relative, folder ref_id first, the test's own last.
+    test_href = "ilias.php?baseClass=ilrepositorygui&cmdNode=13a:wm:1a7&cmdClass=ilTestScreenGUI&cmd=testScreen&ref_id=2&ref_id=5"
+    file_url = base + "ilias.php?cmdClass=ilObjFileGUI&cmd=sendfile&ref_id=3"
+    pages = {
+        root: (root, _container(("Teil II", part2, '<img alt="Ordner">'))),
+        # /go/fold/2 redirects, so relative links resolve against ilias.php
+        part2: (base + "ilias.php?baseClass=ilrepositorygui&ref_id=2",
+                _container(("Folien", file_url, ""), ("02. Test zu Teil 2", test_href, ""))),
+    }
+    files, found = [], []
+    s.discover_items_recursive(root, str(tmp_path), _FakeCrawlSession(pages), files, "WWSim",
+                               interactive_list=found)
+
+    assert [f["name"] for f in files] == ["Folien"]
+    items = s._interactive_for_metadata(found, str(tmp_path))
+    assert items == [{"kind": "test", "title": "02. Test zu Teil 2", "folder": "Teil II",
+                      "url": "https://www.studon.fau.de/studon/go/tst/5"}]
+
+
+def test_metadata_keeps_interactive_items_until_the_next_crawl(tmp_path, monkeypatch):
+    """None (no crawl) keeps the list, a fresh crawl replaces it, and it is readable on disk."""
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    course = _make_course(tmp_path, "WWSim")
+    path = str(course / "METADATA.md")
+    item = {"kind": "test", "title": "Test zu Teil 1", "folder": "Teil I",
+            "url": "https://www.studon.fau.de/studon/go/tst/1"}
+
+    s.update_course_metadata(path, "WWSim", COURSE_URL, [], [item])
+    s.update_course_metadata(path, "WWSim", COURSE_URL, [])
+    assert s.CourseMetadata.from_yaml_markdown(path).interactive_items == [item]
+    assert "Test zu Teil 1" in (course / "METADATA.md").read_text(encoding="utf-8")
+
+    s.update_course_metadata(path, "WWSim", COURSE_URL, [], [])
+    assert s.CourseMetadata.from_yaml_markdown(path).interactive_items == []

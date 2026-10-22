@@ -334,7 +334,7 @@ studon_downloads/
 ├── pruefungen.md                  # Prüfungs-Anmeldefristen aus campo studyPlanner Detailansichten
 ├── RECENT_UPDATES.md              # last-run download log
 ├── <Course Name>/
-│   ├── METADATA.md                # source URL + file history + timetable_titles (YAML frontmatter)
+│   ├── METADATA.md                # source URL + file history + timetable_titles + interactive_items (YAML frontmatter)
 │   └── <lecture folders>/
 └── Feedback/                      # populated by --check-feedback
     └── <Course Name>/
@@ -346,6 +346,12 @@ studon_downloads/
 not in the download folder. It stores only the *negative* side of the
 campo↔course mapping (`no_course_titles`, `ignored_titles`) — the positive
 side is each course's `timetable_titles` inside its own `METADATA.md`.
+
+Only files are downloaded. Tests, exercise units, surveys, forums and plugin
+objects (LiveVoting, video series) stay on StudOn. Each sync lists them in the
+course's `METADATA.md` under `interactive_items` and in the table "On StudOn
+only (not downloaded)", with a permanent link each, so a practice test is not
+missed because the folder looks complete. `--dry-run` lists them too.
 
 The scraper **never deletes or overwrites** existing files. To re-download a file, remove or rename the local copy first.
 
