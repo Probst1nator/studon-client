@@ -4682,6 +4682,22 @@ The scraper is already installed and self-running:
 This skill is for **ad-hoc invocations** from a Claude session — anything the
 cron daemons don't already do automatically.
 
+## Tests and exercises stay on StudOn
+
+Only files are downloaded. Tests, exercise units, surveys, forums and plugin
+objects (LiveVoting, video series) cannot be, so a course folder can look
+complete while StudOn holds a practice test for every lecture. Each sync lists
+these objects in the course's `METADATA.md`: the YAML key `interactive_items`
+(kind, title, folder, permalink) and the table "On StudOn only (not
+downloaded)". The console says how many there are, and `--dry-run` lists them.
+
+- Before you build exercises for a lecture, read `interactive_items` for its
+  course. A test from the lecturer comes first: hand the user its link (or
+  open it in Firefox), then add your own exercises.
+- Do not start or submit a test yourself. A pass runs on the user's account.
+- The list is as old as `last_fetched`. For a fresh one, fetch the course
+  (`--fetch <ref_id>`) or run `<URL> --dry-run`.
+
 ## When to use
 
 - "Fetch new uploads for THIS course" (cwd is inside a tracked course folder) → run the scraper **bare, no args** — it detects the course from the folder's `METADATA.md` and refreshes only that one. Non-interactive shells auto-fetch; a TTY gets it pre-selected as the first TUI option. Pass `--dry-run` to preview only. Prefer this over `<URL>` when you're already sitting in the course folder.
@@ -4813,7 +4829,7 @@ Full usage guide: `__SCRIPT_DIR__/README.md`.
 │   ├── Leistungsbescheinigung nach §48 BAföG.pdf
 │   └── ... (12 total)
 └── <Course Name>/
-    ├── METADATA.md                     # course state + timetable_titles
+    ├── METADATA.md                     # course state + timetable_titles + interactive_items
     └── <lecture folders>/
 ```
 
