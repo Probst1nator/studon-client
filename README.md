@@ -1,6 +1,10 @@
 # studon-client
 
-Authenticates to FAU's StudOn LMS via Firefox cookies, crawls course pages, and downloads/organises all subscribed course materials.
+Client for FAU's StudOn LMS and campo, using your Firefox cookies (both need a login).
+StudOn: crawls course pages and downloads/organises all subscribed course materials.
+campo: exports your timetable, studyPlanner Modulplan, Belegungen and Bescheinigungen, and
+searches campo's course catalogue (Lehrveranstaltungssuche, `--campo-search` / `campo_search.py`)
+for any semester.
 
 > **Disclaimer.** This is a private hobby project, not an official tool of FAU,
 > StudOn or campo, and not endorsed by them. It is provided as is, without any
