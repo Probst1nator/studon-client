@@ -9018,6 +9018,15 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # The tools installer appends the tool's launch args (--gui) to these
+    # calls, so they must win over --gui.
+    if args.install_skill:
+        _run_install_skill()
+        return
+    if args.uninstall_skill:
+        _run_uninstall_skill()
+        return
+
     if args.gui:
         _run_gui()
         return
