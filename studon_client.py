@@ -5674,21 +5674,18 @@ def _run_uninstall_imap() -> None:
     email_addr = cfg.get("imap_email")
     removed = False
     if email_addr and keyring is not None:
-        try:
-            for svc in (_LEGACY_KEYRING_SERVICE, KEYRING_SERVICE):
-                try:
-                    keyring.delete_password(svc, email_addr)
-                    removed = True
-                except keyring.errors.PasswordDeleteError:
-                    pass
-            if removed:
-                print(f"  ✅ Password removed from keyring for {email_addr}.")
-            else:
-                print(f"  No keyring entry found for {email_addr}.")
-        except keyring.errors.PasswordDeleteError:
+        for svc in (_LEGACY_KEYRING_SERVICE, KEYRING_SERVICE):
+            try:
+                keyring.delete_password(svc, email_addr)
+                removed = True
+            except keyring.errors.PasswordDeleteError:
+                pass
+            except Exception as e:
+                print(f"  Could not remove keyring entry ({svc}): {e}")
+        if removed:
+            print(f"  ✅ Password removed from keyring for {email_addr}.")
+        else:
             print(f"  No keyring entry found for {email_addr}.")
-        except Exception as e:
-            print(f"  Could not remove keyring entry: {e}")
     if "imap_email" in cfg:
         cfg.pop("imap_email", None)
         save_config(cfg)
