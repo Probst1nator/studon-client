@@ -9018,6 +9018,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    # --- Claude Code skill registration ---
     # The tools installer appends the tool's launch args (--gui) to these
     # calls, so they must win over --gui.
     if args.install_skill:
@@ -9109,15 +9110,6 @@ def main() -> None:
     # --- Campo Bescheinigungen — enrollment side only (studyservice-flow) ---
     if args.campo_enrollment_bescheinigungen:
         fetch_campo_enrollment_documents(dry_run=args.dry_run)
-        return
-
-    # --- Claude Code skill registration ---
-    if args.install_skill:
-        _run_install_skill()
-        return
-
-    if args.uninstall_skill:
-        _run_uninstall_skill()
         return
 
     # --- Bring the tray back after the user closed it ---
