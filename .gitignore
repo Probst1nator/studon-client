@@ -10,7 +10,7 @@ CLAUDE.md
 # ===== Environment Configuration =====
 .env
 
-# ===== StudOn Scraper Generated Content =====
+# ===== StudOn Client Generated Content =====
 studon_downloads/
 RECENT_UPDATES.md
 .studon_updater_state.json

@@ -2837,7 +2837,7 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optio
             env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
     try:
         subprocess.run(
-            ["notify-send", "--app-name=StudOn Scraper", "--icon=emblem-downloads",
+            ["notify-send", "--app-name=StudOn Client", "--icon=emblem-downloads",
              "StudOn Sync Complete", body],
             env=env, timeout=5
         )
@@ -2909,7 +2909,7 @@ def _notify_login_required(login_url: str, attempt_key: str) -> None:
     _login_prompt["last_key"] = attempt_key
     try:
         proc = subprocess.Popen(
-            ["notify-send", "--app-name=StudOn Scraper", "--icon=dialog-password",
+            ["notify-send", "--app-name=StudOn Client", "--icon=dialog-password",
              "--expire-time=120000", "--action=login=In Firefox einloggen",
              "StudOn-Login abgelaufen",
              "Sync pausiert. Klicken zum Einloggen — verschwindet nach 2 Min "
@@ -3836,7 +3836,7 @@ def _warn_unmapped_once(resolved: List[ResolvedLecture], warned: set) -> None:
         env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{os.getuid()}/bus")
         try:
             subprocess.run(
-                ["notify-send", "--app-name=StudOn Scraper", "--icon=dialog-warning",
+                ["notify-send", "--app-name=StudOn Client", "--icon=dialog-warning",
                  "StudOn lecture-sync: unmapped lectures", body],
                 env=env, timeout=5,
             )
@@ -4440,8 +4440,8 @@ def show_startup_overview(download_folder: str) -> None:
     # ── Render ────────────────────────────────────────────────────────────────
     print()
     print(WIDE_TOP)
-    title = f'{B}{CY}StudOn Scraper{R}'
-    print(wide_row(f'StudOn Scraper', CY + B))
+    title = f'{B}{CY}StudOn Client{R}'
+    print(wide_row(f'StudOn Client', CY + B))
     print(WIDE_SEP)
 
     # Directory line
@@ -5054,7 +5054,8 @@ def _run_install(check_interval: int = 5) -> None:
 
 FAUMAIL_IMAP_HOST = "faumail.fau.de"
 FAUMAIL_IMAP_PORT = 993
-KEYRING_SERVICE = "studon-scraper-faumail"
+KEYRING_SERVICE = "studon-client-faumail"
+_LEGACY_KEYRING_SERVICE = "studon-scraper-faumail"
 FEEDBACK_STATE_FILE = os.path.join(_SCRIPT_DIR, ".studon_feedback_state.json")
 FEEDBACK_SUBJECT_PATTERN = re.compile(r"Es wurde eine neue Feedback-Datei", re.IGNORECASE)
 EXC_URL_PATTERN = re.compile(r"https://www\.studon\.fau\.de/studon/goto?\.php\?[^\s]+|https://www\.studon\.fau\.de/studon/go/exc/\d+/\d+")
@@ -5150,7 +5151,16 @@ def _get_imap_password(email_addr: str) -> Optional[str]:
         logger.error("'keyring' package not installed. Run: pip install keyring")
         return None
     try:
-        return keyring.get_password(KEYRING_SERVICE, email_addr)
+        pw = keyring.get_password(KEYRING_SERVICE, email_addr)
+        if pw is None:
+            pw = keyring.get_password(_LEGACY_KEYRING_SERVICE, email_addr)
+            if pw is not None:
+                keyring.set_password(KEYRING_SERVICE, email_addr, pw)
+                try:
+                    keyring.delete_password(_LEGACY_KEYRING_SERVICE, email_addr)
+                except Exception:
+                    pass
+        return pw
     except Exception as e:
         logger.error(f"Could not read password from keyring: {e}")
         return None
@@ -5653,7 +5663,7 @@ def _is_imap_installed() -> bool:
     if not email_addr or keyring is None:
         return False
     try:
-        return keyring.get_password(KEYRING_SERVICE, email_addr) is not None
+        return _get_imap_password(email_addr) is not None
     except Exception:
         return False
 
@@ -5665,6 +5675,10 @@ def _run_uninstall_imap() -> None:
     removed = False
     if email_addr and keyring is not None:
         try:
+            try:
+                keyring.delete_password(_LEGACY_KEYRING_SERVICE, email_addr)
+            except Exception:
+                pass
             keyring.delete_password(KEYRING_SERVICE, email_addr)
             print(f"  ✅ Password removed from keyring for {email_addr}.")
             removed = True

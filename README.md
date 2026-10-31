@@ -316,7 +316,7 @@ Settings live in `config.json` next to the script (auto-created, gitignored):
 | Key | Purpose |
 |-----|---------|
 | `downloads_path` | Output directory. Set via `--set-download-path` or during `--install`. |
-| `imap_email` | FAUmail address for the feedback checker. Set via `--install-imap`. The matching password lives in your system keyring under service `studon-scraper-faumail`. |
+| `imap_email` | FAUmail address for the feedback checker. Set via `--install-imap`. The matching password lives in your system keyring under service `studon-client-faumail`. |
 
 Environment variable `CONFIRMATION_THRESHOLD` (default `50`) — prompts before batch-downloading more than N files.
 
