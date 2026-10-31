@@ -5675,13 +5675,16 @@ def _run_uninstall_imap() -> None:
     removed = False
     if email_addr and keyring is not None:
         try:
-            try:
-                keyring.delete_password(_LEGACY_KEYRING_SERVICE, email_addr)
-            except Exception:
-                pass
-            keyring.delete_password(KEYRING_SERVICE, email_addr)
-            print(f"  ✅ Password removed from keyring for {email_addr}.")
-            removed = True
+            for svc in (_LEGACY_KEYRING_SERVICE, KEYRING_SERVICE):
+                try:
+                    keyring.delete_password(svc, email_addr)
+                    removed = True
+                except keyring.errors.PasswordDeleteError:
+                    pass
+            if removed:
+                print(f"  ✅ Password removed from keyring for {email_addr}.")
+            else:
+                print(f"  No keyring entry found for {email_addr}.")
         except keyring.errors.PasswordDeleteError:
             print(f"  No keyring entry found for {email_addr}.")
         except Exception as e:
