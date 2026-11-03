@@ -4663,7 +4663,7 @@ SKILL_FILE = SKILL_DIR / 'SKILL.md'
 LEGACY_SKILL_DIRS = ('studon', 'search-studon')
 SKILL_MD_CONTENT = '''---
 name: studon-client
-description: Drive the StudOn / campo client at __SCRIPT_DIR__/ (both sides need a Firefox login). Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, search campo's course catalogue for any course in any semester (title, type, lecturer, unitId, optional ECTS; `--campo-search`), dump prüfungs-Anmeldefristen, export the studyPlanner Modulplan (status/ECTS/Versuch per module), list current Belegungen (angemeldete Prüfungen + Veranstaltungen mit Termin/Raum/Prüfer), reconcile Modulplan ↔ Belegungen for an honest ECTS-Bilanz, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studienfortschritt", "modulplan", "wieviele ects hab ich", "belegungen", "wo bin ich angemeldet", "klausurtermin", "reconcile", "ects bilanz", "stimmt meine ects", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
+description: Drive the StudOn / campo client at __SCRIPT_DIR__/ (both sides need a Firefox login). Use when the user asks to download FAU StudOn course material, register a new course, refresh tracked courses, inspect the campo timetable, search campo's course catalogue for any course in any semester (title, type, lecturer, unitId, optional ECTS; `--campo-search`), list or compare the modules of degree programmes per PO version (`--modulhandbuch`, public, no login),dump prüfungs-Anmeldefristen, export the studyPlanner Modulplan (status/ECTS/Versuch per module), list current Belegungen (angemeldete Prüfungen + Veranstaltungen mit Termin/Raum/Prüfer), reconcile Modulplan ↔ Belegungen for an honest ECTS-Bilanz, or bulk-download campo Notenübersicht / Bescheinigungen PDFs (Notenübersicht, BAföG §48, ord. Studium, angemeldete Prüfungen). Triggers: "studon course holen", "alle kurse aktualisieren", "campo timetable export", "bescheinigung ziehen", "notenübersicht pdf", "studienfortschritt", "modulplan", "wieviele ects hab ich", "belegungen", "wo bin ich angemeldet", "klausurtermin", "reconcile", "ects bilanz", "stimmt meine ects", "studon scrape", "FAU course download". NOT for the QuizHub daily-quiz (that's the `quizhub-client` cron).
 ---
 
 # studon-client
@@ -4709,6 +4709,7 @@ downloaded)". The console says how many there are, and `--dry-run` lists them.
 - "Wo bin ich diesen Semester angemeldet?" / "wann ist Klausur X?" / "welche Räume hat Vorlesung Y?" → `--belegungen` (deterministic, no Pre-Click) → `Belegungen.md` + `Belegungen.json` with angemeldete Prüfungen (Nr/Form/Prüfer/Termin/Status) + Veranstaltungen (Typ/Titel/Termin+Raum/Dozent). Beleg im Streitfall. Pure data — change-detection/notification lives in the sibling **belegungen-watcher** tool (`~/Synced/repos/AutomatedAlchemy/belegungen-watcher/main.py`), which consumes `Belegungen.json` and fires `notify-send` on Termin-Konkretisierung / Status-Flip.
 - "Stimmt meine ECTS-Bilanz?" / "warum sagen `lernplan.md` und Modulplan unterschiedliche ECTS?" / "welche Modul-Anmeldungen haben keine Belegung?" / "BAföG-relevante ECTS-Zahl" → `--reconcile` → `Reconciliation.md`. Wenn `Bescheinigungen/Notenübersicht*Module*.pdf` existiert (lade einmalig via `--campo-bescheinigungen`), wird **die PDF zur kanonischen ECTS-Quelle** (Prüfungsamt-signiert, BAföG-relevant) — der Front-Page-Undercount wird automatisch sichtbar gemacht. Sections: (1) Belegungen-Prüfung → Modulplan-Modul-Match, (2) Modulplan-Angemeldet ohne Belegung, (3) Bestanden-Module ohne `X/Y`-Suffix, (4) PDF-Inhalt mit Gap-zu-Modulplan pro Modul, (5) Lücken die der Modulplan unterläuft.
 - "Suche Kurs X in campo" / "wie viele ECTS hat …" → `--campo-search "<query>" [--term 'eq|1|2026']` (prints LV-Treffer + ECTS to stdout; default Semester = aktuelles).
+- "Welche Module hat Studiengang X?" / "was hat sich mit der neuen PO geändert?" / "Vergleich KIM mit MWT" → `--modulhandbuch "<Fach>" ["<Fach>" …] [--abschluss B.Sc.] [--po 20232|latest] [--ects] [--json]` (campo's public Modulhandbuch, one table per PO version, comparison table for two or more; no login). Use it instead of a web search for curriculum questions. `--ects` takes a few minutes for three programmes.
 - "Lade meine Notenübersicht / BAföG-Bescheinigung / Transcript" → `--campo-bescheinigungen` (downloads all 12 PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/`).
 - "Register a new course from a campo timetable entry I don't have yet" → `--discover-from-timetable`.
 - "Welche meiner Kurse kann der Client laden, wo fehlt Beitritt/Passwort?" (new semester) → `--courses <ref_id|StudOn link|studon.fau.de/campo/course link> …` → one row per course: state (member, pending, password + deadline, request, direct, campo, blocked), tracked yes/no, join link. Prints the `--add` line for members that are not tracked yet. One GET per course; `--json` for data.
@@ -4755,6 +4756,7 @@ $PY $SCRAPER --help
 | Cross-Check Modulplan ↔ Belegungen → `Reconciliation.md` | `$PY $SCRAPER --reconcile` |
 | Dump Prüfungs-Anmeldefristen → `pruefungen.md` | `$PY $SCRAPER --campo-pruefungen` |
 | Search campo courses (+ECTS) | `$PY $SCRAPER --campo-search "<query>" [--term 'eq|1|2026']` |
+| Modules per programme and PO version, compare programmes | `$PY $SCRAPER --modulhandbuch "<Fach>" ["<Fach>" …] [--abschluss B.Sc.] [--po latest] [--ects]` |
 | Download all Notenübersicht/Bescheinigungen PDFs | `$PY $SCRAPER --campo-bescheinigungen` |
 | Show next 5 lecture-sync fires (debug) | `$PY $SCRAPER --lecture-sync-once` |
 | Set default download path | `$PY $SCRAPER --set-download-path ~/path` |
@@ -7818,6 +7820,37 @@ def _run_campo_search(query: str, term: Optional[str] = None) -> None:
             print(f"    unitId={h['unitId']} periodId={h['periodId']}")
 
 
+def _run_modulhandbuch(faecher: List[str], po: Optional[str] = None, abschluss: Optional[str] = None,
+                       ects: bool = False, as_json: bool = False) -> int:
+    """Print the module lists of each Fach per PO version, plus a comparison
+    table when two or more programmes are selected.
+
+    The flow lives in campo_modulhandbuch.py (imported lazily). It uses an
+    anonymous session: the Modulhandbuch is public, and a stale campo session
+    cookie from Firefox breaks the tree page. Stdout only.
+    """
+    from campo_modulhandbuch import fetch_programmes, render_programme, render_comparison
+
+    programmes: List[Dict] = []
+    for fach in faecher:
+        try:
+            _, progs = fetch_programmes(fach, po=po, abschluss=abschluss, ects=ects)
+        except (RuntimeError, ValueError, requests.RequestException) as e:
+            print(f"❌ {e}")
+            return 1
+        if not progs:
+            print(f"⚠️  Keine Prüfungsordnung für '{fach}' passt zu den Filtern.")
+        programmes += progs
+    if as_json:
+        print(json.dumps(programmes, ensure_ascii=False, indent=1))
+        return 0
+    print("\n\n".join(render_programme(p) for p in programmes))
+    if len(programmes) > 1:
+        print("\n## Vergleich\n")
+        print(render_comparison(programmes))
+    return 0
+
+
 # --- Course status, course pages and registration by ref_id ---
 # (--courses / --read / --add / --fetch). The page parsing lives in
 # studon_courses.py so the tests can feed it synthetic HTML.
@@ -8993,6 +9026,17 @@ def main() -> None:
                             "'eq|2|2026' (WiSe26/27) or a raw campo option id (e.g. 590); "
                             "default = current semester. For --timetable a non-current term writes "
                             "timetable_<label>.md (e.g. timetable_WS2627.md) and leaves timetable.md untouched.")
+    parser.add_argument('--modulhandbuch', nargs='+', metavar='FACH',
+                       help="List the modules of each Fach per PO version from campo's public Modulhandbuch "
+                            "search, e.g. 'KI-Materialtechnologie'; two or more programmes also get a "
+                            "comparison table. No login needed.")
+    parser.add_argument('--po', metavar='VERSION',
+                       help="With --modulhandbuch: one PO version (e.g. 20232) or 'latest'; default = all")
+    parser.add_argument('--abschluss', metavar='TEXT',
+                       help="With --modulhandbuch: keep programmes whose label contains TEXT, e.g. 'B.Sc.'")
+    parser.add_argument('--ects', action='store_true',
+                       help='With --modulhandbuch: add ECTS, Pflicht/Wahlpflicht and Fachsemester per module '
+                            '(two requests per module, a few minutes for three programmes)')
     parser.add_argument('--courses', nargs='+', metavar='REF',
                        help='Show the StudOn access state of each course (member, pending, password, request, '
                             'direct, campo, blocked) and whether the client tracks it. REF is a ref_id, '
@@ -9002,7 +9046,7 @@ def main() -> None:
     parser.add_argument('--dates', action='store_true',
                        help='With --read: print the weekly rules and every date with cancellations instead of the info text')
     parser.add_argument('--json', action='store_true',
-                       help='With --courses or --read: print JSON')
+                       help='With --courses, --read or --modulhandbuch: print JSON')
     parser.add_argument('--add', nargs='+', metavar='REF',
                        help='Track courses you are a member of: write METADATA.md now, download in the background')
     parser.add_argument('--no-fetch', action='store_true',
@@ -9099,6 +9143,11 @@ def main() -> None:
     if args.campo_search:
         _run_campo_search(args.campo_search, term=args.term)
         return
+
+    # --- Module lists per programme and PO version (public Modulhandbuch search) ---
+    if args.modulhandbuch:
+        sys.exit(_run_modulhandbuch(args.modulhandbuch, po=args.po, abschluss=args.abschluss,
+                                    ects=args.ects, as_json=args.json))
 
     # --- Course status, course pages and registration by ref_id ---
     if args.courses:

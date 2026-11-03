@@ -4,7 +4,8 @@ Client for FAU's StudOn LMS and campo, using your Firefox cookies (both need a l
 StudOn: crawls course pages and downloads/organises all subscribed course materials.
 campo: exports your timetable, studyPlanner Modulplan, Belegungen and Bescheinigungen, and
 searches campo's course catalogue (Lehrveranstaltungssuche, `--campo-search` / `campo_search.py`)
-for any semester.
+for any semester. It also lists and compares the modules of degree programmes per PO version from
+campo's public Modulhandbuch search (`--modulhandbuch` / `campo_modulhandbuch.py`, no login).
 
 > **Disclaimer.** This is a private hobby project, not an official tool of FAU,
 > StudOn or campo, and not endorsed by them. It is provided as is, without any
@@ -215,6 +216,11 @@ python studon_client.py --reconcile
 # Prints LV-Treffer + ECTS. Also runnable standalone: python campo_search.py "<query>" [--ects] [--json]
 python studon_client.py --campo-search "Künstliche Intelligenz" [--term 'eq|1|2026']
 
+# Modules of a degree programme per PO version (campo's public Modulhandbuch, no login) → stdout.
+# Two or more programmes also get a comparison table. --ects adds ECTS, Pflicht/Wahlpflicht and
+# Fachsemester (two requests per module). Standalone: python campo_modulhandbuch.py --list-faecher [TEXT]
+python studon_client.py --modulhandbuch "KI-Materialtechnologie" "Nanotechnologie" --abschluss B.Sc. --po latest [--ects] [--json]
+
 # Scan campo studyPlanner Prüfungs-Detailansichten (opened in Firefox) → pruefungen.md
 # Zeiträume live nur auf Prüfungs-Detail views, daher Pre-Click required.
 python studon_client.py --campo-pruefungen
@@ -256,6 +262,7 @@ Run `python studon_client.py --help` for the complete and current list. Key flag
 | `--belegungen` | Scan searchOwnEnrollmentInfo-flow front page (deterministic, no Pre-Click) → `Belegungen.md` + `Belegungen.json`: angemeldete Prüfungen (Nr / Titel / Termin / Form / Prüfer/-in / Status) + Veranstaltungen (Typ / Titel / Termin+Raum / Dozent/-in) für das aktuell ausgewählte Semester. Multi-Termin-Vorlesungen werden mit `<br>` getrennt. **Pure data fetch** — Change-Detection + `notify-send` ist in das Schwester-Tool `~/Synced/repos/AutomatedAlchemy/belegungen-watcher/main.py` ausgelagert, das die JSON konsumiert. |
 | `--reconcile` | Cross-Check Modulplan ↔ Belegungen → `Reconciliation.md` + `Reconciliation.json` (gleicher Inhalt maschinen-lesbar) mit (1) Belegungen-Prüfungen → Modulplan-Modul-Match (Title-Normalize + Jaccard ≥ 0.6), (2) Modulplan-Angemeldet ohne Belegungs-Eintrag, (3) Bestanden-Module ohne `X/Y`-Suffix (= ECTS-Undercount-Quelle). Wenn eine `Notenübersicht*Module*.pdf` unter `Bescheinigungen/` existiert (Auto-Detection via `pdftotext -layout`), wird sie als **kanonische ECTS-Quelle** integriert (Prüfungsamt-Berechnung, BAföG-/Kindergeld-relevant) — Diskrepanz zum Modulplan-Front-Page wird automatisch sichtbar gemacht. Der `--install`-Cron pflegt die PDF wöchentlich (Mo 06:30) via `--campo-bescheinigungen`. |
 | `--campo-search "<query>" [--term 'eq\|1\|2026']` | Search campo's Lehrveranstaltungssuche (searchCourseNonStaff-flow) for a term (default: current semester) and print LV-Treffer + ECTS to stdout. Flow mechanics live in the standalone, unit-runnable `campo_search.py` (`python campo_search.py "<query>" [--ects] [--json]`). |
+| `--modulhandbuch "<Fach>" […] [--abschluss B.Sc.] [--po 20232\|latest] [--ects] [--json]` | Module list of each Fach per PO version from campo's public Modulhandbuch search (searchCourseOfStudyForModuleDescription-flow), with a comparison table for two or more programmes. Anonymous session, no login. Flow mechanics in `campo_modulhandbuch.py` (`--list-faecher [TEXT]` lists the Fach names campo knows). |
 | `--campo-pruefungen` | Parse campo studyPlanner Prüfungs-Detailansichten (must be pre-opened in Firefox; flow-key scan now adaptive up to e99) → `pruefungen.md`. Zeiträume (Anmelde-/Abmelde-/Prüfungszeitraum) only render on per-Prüfung Detail views, not on the deterministic Modul-Detail views. |
 | `--campo-bescheinigungen` | Download all 12 exam-side PDFs from `personExamsReadonly.xhtml` into `<downloads>/Bescheinigungen/` |
 | `--campo-bescheinigungen --with-enrollment` | 12 + 7 = 19 PDFs (combo with the enrollment-side) |
