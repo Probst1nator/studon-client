@@ -4518,10 +4518,18 @@ def _cron_lines(check_interval: int = 5) -> List[str]:
     script_path = os.path.abspath(__file__)
     script_dir = os.path.dirname(script_path)
     python = sys.executable
-    daily_cmd = f"@reboot cd {script_dir} && {python} {script_path} --daily-sync"
+    # @reboot cron starts without the desktop session's environment. With these
+    # two the daily sync can show its login tray icon and wait for the login, as
+    # the hand-written lines before 2026-09-22 did. Without them it falls back
+    # to notify-send and gives up the wait (_has_display()).
+    session_env = ""
+    if sys.platform.startswith("linux"):
+        session_env = (f"DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="
+                       f"unix:path=/run/user/{os.getuid()}/bus ")
+    daily_cmd = f"@reboot cd {script_dir} && {session_env}{python} {script_path} --daily-sync"
     if check_interval != 5:
         daily_cmd += f" --interval {check_interval}"
-    lecture_cmd = f"@reboot cd {script_dir} && {python} {script_path} --lecture-sync"
+    lecture_cmd = f"@reboot cd {script_dir} && {session_env}{python} {script_path} --lecture-sync"
     # Weekly Prüfungsamt-PDFs (Mondays 06:30) — keeps Notenübersicht.pdf fresh so
     # --reconcile always has a canonical ECTS source.
     bescheinigungen_cmd = (
