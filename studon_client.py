@@ -2820,10 +2820,12 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optio
     try:
         if targets and os.path.exists(_SYSTEM_PYTHON):
             # The helper waits for the click and outlives this process
-            # (--daily-sync exits right after this call). It falls back to
-            # notify-send without buttons when PyGObject is missing.
+            # (--daily-sync exits right after this call).
+            actions = [[f"open{i}", label, path] for i, (label, path) in enumerate(targets)]
+            if len(targets) == 1:
+                actions.append(["default", targets[0][0], targets[0][1]])  # click on the body
             subprocess.Popen(
-                [_SYSTEM_PYTHON, "-c", _NOTIFY_OPEN_PY, title, body, json.dumps(targets)],
+                _notify_actions_argv(title, body, "emblem-downloads", -1, actions),
                 env=_notify_env(), start_new_session=True,
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
@@ -2836,42 +2838,83 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optio
         logger.debug(f"Desktop notification failed: {e}")
 
 
-# Sync notification with "Open" buttons, run under the system python3 for
-# PyGObject. notify-send 0.8.8 (Ubuntu 26.04) refuses --action on Plasma
-# ("Actions are not supported by this notifications server") although Plasma
-# lists the capability, so the helper talks to libnotify directly.
-# argv: title, body, JSON list of [label, path].
-_NOTIFY_OPEN_PY = r'''
-import json, subprocess, sys
-title, body, targets = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+# Notification with buttons, run under the system python3 for PyGObject.
+# notify-send 0.8.8 (Ubuntu 26.04) refuses --action on Plasma ("Actions are not
+# supported by this notifications server") although Plasma lists the
+# capability, so the helper talks to libnotify directly. Like notify-send it
+# prints the key of the clicked button, and SIGTERM closes the notification.
+# argv: title, body, icon, expire ms (-1 = server default), JSON list of
+# [key, label, path or null]; a path is opened with xdg-open on the click.
+_NOTIFY_ACTIONS_PY = r'''
+import json, signal, subprocess, sys
+title, body, icon = sys.argv[1], sys.argv[2], sys.argv[3]
+expire_ms, actions = int(sys.argv[4]), json.loads(sys.argv[5])
+
+def act(key):
+    for k, _, path in actions:
+        if k == key:
+            print(key, flush=True)
+            if path:
+                subprocess.Popen(["xdg-open", path], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+
 try:
     import gi
     gi.require_version("Notify", "0.7")
     from gi.repository import GLib, Notify
 except Exception:
-    subprocess.run(["notify-send", "--app-name=StudOn Client", "--icon=emblem-downloads", title, body])
+    # No PyGObject: notify-send, whose buttons work before libnotify 0.8.8.
+    cmd = ["notify-send", "--app-name=StudOn Client", "--icon=" + icon]
+    if expire_ms >= 0:
+        cmd.append(f"--expire-time={expire_ms}")
+    cmd += [f"--action={k}={label}" for k, label, _ in actions if k != "default"]
+    act(subprocess.run(cmd + [title, body], capture_output=True, text=True).stdout.strip())
     sys.exit(0)
 
 Notify.init("StudOn Client")
-n = Notify.Notification.new(title, body, "emblem-downloads")
+n = Notify.Notification.new(title, body, icon)
+n.set_timeout(expire_ms)
 loop = GLib.MainLoop()
+for key, label, _ in actions:
+    n.add_action(key, label, lambda *_, k=key: (act(k), loop.quit()))
 
-def opener(path):
-    def on_action(*_):
-        subprocess.Popen(["xdg-open", path], start_new_session=True,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        loop.quit()
-    return on_action
+def on_term():
+    try:
+        n.close()
+    except Exception:
+        pass
+    loop.quit()
+    return False
 
-for i, (label, path) in enumerate(targets):
-    n.add_action(f"open{i}", label, opener(path))
-if len(targets) == 1:
-    n.add_action("default", targets[0][0], opener(targets[0][1]))  # click on the body
+try:
+    gi.require_version("GLibUnix", "2.0")
+    from gi.repository import GLibUnix
+    GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, on_term)
+except Exception:  # PyGObject before GLibUnix
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, on_term)
 n.connect("closed", lambda *_: loop.quit())
 n.show()
 GLib.timeout_add_seconds(3600, loop.quit)
 loop.run()
 '''
+
+
+def _notify_actions_argv(title: str, body: str, icon: str, expire_ms: int,
+                         actions: List[list]) -> List[str]:
+    """argv for a notification with buttons that prints the clicked key on stdout.
+
+    actions: [key, label, path or None]. Without the system python3 this is a
+    plain notify-send call; it prints the key but opens no path.
+    """
+    if os.path.exists(_SYSTEM_PYTHON):
+        return [_SYSTEM_PYTHON, "-c", _NOTIFY_ACTIONS_PY, title, body, icon,
+                str(expire_ms), json.dumps(actions)]
+    argv = ["notify-send", "--app-name=StudOn Client", f"--icon={icon}"]
+    if expire_ms >= 0:
+        argv.append(f"--expire-time={expire_ms}")
+    argv += [f"--action={k}={label}" for k, label, _ in actions if k != "default"]
+    return argv + [title, body]
 
 
 def _notification_open_targets(files: List[str]) -> List[Tuple[str, str]]:
@@ -2921,7 +2964,7 @@ def _notify_env() -> dict:
     return env
 
 
-# One-click login prompt state. Holds the live notify-send process so a later
+# One-click login prompt state. Holds the live notification process so a later
 # successful login can dismiss the still-open notification, and the key of the
 # fetch attempt the last notification belonged to.
 _login_prompt: dict = {"proc": None, "last_key": None}
@@ -2933,7 +2976,7 @@ def _notify_login_required(login_url: str, attempt_key: str) -> None:
     Visible, one-click: clicking the "In Firefox einloggen" action opens the
     login URL in the browser. The caller's existing poll loop then picks up the
     refreshed Firefox cookie on its next cycle (no extra wiring needed — polling
-    already happens). The (blocking, --action implies --wait) notify-send call
+    already happens). The blocking notification process (_notify_actions_argv)
     runs in a daemon thread so the poll loop is never blocked.
 
     attempt_key identifies the fetch attempt that is blocked by the missing
@@ -2958,11 +3001,11 @@ def _notify_login_required(login_url: str, attempt_key: str) -> None:
     _login_prompt["last_key"] = attempt_key
     try:
         proc = subprocess.Popen(
-            ["notify-send", "--app-name=StudOn Client", "--icon=dialog-password",
-             "--expire-time=120000", "--action=login=In Firefox einloggen",
-             "StudOn-Login abgelaufen",
-             "Sync pausiert. Klicken zum Einloggen — verschwindet nach 2 Min "
-             "(oder das StudOn-Tray-Icon nutzen); der Sync holt danach automatisch nach."],
+            _notify_actions_argv(
+                "StudOn-Login abgelaufen",
+                "Sync pausiert. Klicken zum Einloggen — verschwindet nach 2 Min "
+                "(oder das StudOn-Tray-Icon nutzen); der Sync holt danach automatisch nach.",
+                "dialog-password", 120000, [["login", "In Firefox einloggen", None]]),
             env=_notify_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
     except Exception as e:
@@ -2971,7 +3014,7 @@ def _notify_login_required(login_url: str, attempt_key: str) -> None:
     _login_prompt["proc"] = proc
 
     def _wait_for_click() -> None:
-        # Block until notify-send exits on its own — either the user clicked the
+        # Block until the notification process exits on its own — either the user clicked the
         # action (stdout carries the key) or the notification auto-expired after
         # its --expire-time (2 min). Deliberately NO kill-timeout: killing the
         # process early would leave a dead, unclickable notification on screen
