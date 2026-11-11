@@ -2845,8 +2845,11 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optio
 # prints the key of the clicked button, and SIGTERM closes the notification.
 # argv: title, body, icon, expire ms (-1 = server default), JSON list of
 # [key, label, path or null]; a path is opened with xdg-open on the click.
+# xdg-open runs through systemd-run --user: the @reboot cron environment has
+# no XAUTHORITY or WAYLAND_DISPLAY, so an app started from it cannot open a
+# window, while the user manager carries the desktop session's environment.
 _NOTIFY_ACTIONS_PY = r'''
-import json, signal, subprocess, sys
+import json, shutil, signal, subprocess, sys
 title, body, icon = sys.argv[1], sys.argv[2], sys.argv[3]
 expire_ms, actions = int(sys.argv[4]), json.loads(sys.argv[5])
 
@@ -2855,7 +2858,10 @@ def act(key):
         if k == key:
             print(key, flush=True)
             if path:
-                subprocess.Popen(["xdg-open", path], start_new_session=True,
+                cmd = ["xdg-open", path]
+                if shutil.which("systemd-run"):
+                    cmd = ["systemd-run", "--user", "--collect", "--quiet"] + cmd
+                subprocess.Popen(cmd, start_new_session=True,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
 
