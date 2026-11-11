@@ -4627,10 +4627,13 @@ def _cron_lines(check_interval: int = 5) -> List[str]:
     # @reboot cron starts without the desktop session's environment. With these
     # two the daily sync can show its login tray icon and wait for the login, as
     # the hand-written lines before 2026-09-22 did. Without them it falls back
-    # to notify-send and gives up the wait (_has_display()).
+    # to notify-send and gives up the wait (_has_display()). Only when --install
+    # runs inside a desktop session: on a headless host a forced DISPLAY would
+    # make the daily sync wait for a login forever instead of giving up.
     session_env = ""
-    if sys.platform.startswith("linux"):
-        session_env = (f"DISPLAY=:0 DBUS_SESSION_BUS_ADDRESS="
+    display = os.environ.get("DISPLAY")
+    if sys.platform.startswith("linux") and display:
+        session_env = (f"DISPLAY={display} DBUS_SESSION_BUS_ADDRESS="
                        f"unix:path=/run/user/{os.getuid()}/bus ")
     daily_cmd = f"@reboot cd {script_dir} && {session_env}{python} {script_path} --daily-sync"
     if check_interval != 5:
