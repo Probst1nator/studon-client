@@ -2859,10 +2859,18 @@ def act(key):
             print(key, flush=True)
             if path:
                 cmd = ["xdg-open", path]
+                started = False
                 if shutil.which("systemd-run"):
-                    cmd = ["systemd-run", "--user", "--collect", "--quiet"] + cmd
-                subprocess.Popen(cmd, start_new_session=True,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    try:
+                        started = subprocess.run(
+                            ["systemd-run", "--user", "--collect", "--quiet"] + cmd,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            timeout=10).returncode == 0
+                    except Exception:
+                        started = False
+                if not started:  # no user manager: run it directly
+                    subprocess.Popen(cmd, start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return
 
 try:
