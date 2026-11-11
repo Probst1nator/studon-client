@@ -4631,8 +4631,9 @@ def _cron_lines(check_interval: int = 5) -> List[str]:
     # runs inside a desktop session: on a headless host a forced DISPLAY would
     # make the daily sync wait for a login forever instead of giving up.
     session_env = ""
-    display = os.environ.get("DISPLAY")
-    if sys.platform.startswith("linux") and display:
+    display = os.environ.get("DISPLAY", "")
+    # Local displays only: an SSH-forwarded one (localhost:10.0) is gone after reboot.
+    if sys.platform.startswith("linux") and re.fullmatch(r":\d+(\.\d+)?", display):
         session_env = (f"DISPLAY={display} DBUS_SESSION_BUS_ADDRESS="
                        f"unix:path=/run/user/{os.getuid()}/bus ")
     daily_cmd = f"@reboot cd {script_dir} && {session_env}{python} {script_path} --daily-sync"

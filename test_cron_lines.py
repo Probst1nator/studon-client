@@ -34,3 +34,6 @@ def test_headless_install_sets_no_display(monkeypatch):
     for line in s._cron_lines():
         assert "DISPLAY=" not in line
         assert "DBUS_SESSION_BUS_ADDRESS=" not in line
+    monkeypatch.setenv("DISPLAY", "localhost:10.0")  # ssh -X
+    for line in s._cron_lines():
+        assert "DISPLAY=" not in line
