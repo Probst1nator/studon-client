@@ -802,6 +802,7 @@ def _stub_daily_sync_preamble(monkeypatch):
     monkeypatch.setattr(s, 'was_updated_today', lambda state: False)
     monkeypatch.setattr(s, 'can_access_studon', lambda: False)   # session never returns
     monkeypatch.setattr(s, '_wait_for_login_via_tray', lambda *a, **k: False)
+    monkeypatch.setattr(s, '_notify_login_required', lambda *a, **k: None)  # no real popup
     monkeypatch.setattr(s, '_get_first_course_url', lambda: 'https://studon.fau.de/')
 
 
