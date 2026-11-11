@@ -435,3 +435,37 @@ def test_metadata_keeps_interactive_items_until_the_next_crawl(tmp_path, monkeyp
 
     s.update_course_metadata(path, "WWSim", COURSE_URL, [], [])
     assert s.CourseMetadata.from_yaml_markdown(path).interactive_items == []
+
+
+# --- Open button on the sync notification ----------------------------------
+
+def test_notification_targets_one_file_opens_the_file(tmp_path):
+    f = tmp_path / "Course" / "a.pdf"
+    f.parent.mkdir()
+    f.write_bytes(b"x")
+    assert s._notification_open_targets([str(f)]) == [("Open", str(f))]
+
+
+def test_notification_targets_one_folder_opens_the_folder(tmp_path):
+    folder = tmp_path / "Course"
+    folder.mkdir()
+    files = [folder / "a.pdf", folder / "b.pdf"]
+    for f in files:
+        f.write_bytes(b"x")
+    assert s._notification_open_targets([str(f) for f in files]) == [("Open folder", str(folder))]
+
+
+def test_notification_targets_several_folders(tmp_path):
+    folders = [tmp_path / n for n in ("A", "B", "C", "D")]
+    files = []
+    for d in folders:
+        d.mkdir()
+        files.append(d / "x.pdf")
+        files[-1].write_bytes(b"x")
+    paths = [str(f) for f in files]
+    assert s._notification_open_targets(paths[:2]) == [("Open A", str(folders[0])), ("Open B", str(folders[1]))]
+    assert s._notification_open_targets(paths) == [("Open folder", str(tmp_path))]
+
+
+def test_notification_targets_skip_missing_files(tmp_path):
+    assert s._notification_open_targets([str(tmp_path / "gone.zip")]) == []

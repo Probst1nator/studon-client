@@ -2815,34 +2815,83 @@ def _send_desktop_notification(n_downloaded: int, n_extracted: int, files: Optio
             body = body + "\n" + "\n".join(lines)
     else:
         body = "Everything already up to date."
-    # notify-send needs DBUS_SESSION_BUS_ADDRESS when run from cron.
-    # Try to inherit it from a running user session.
-    env = os.environ.copy()
-    if "DBUS_SESSION_BUS_ADDRESS" not in env:
-        try:
-            uid = os.getuid()
-            result = subprocess.run(
-                ["grep", "-z", "DBUS_SESSION_BUS_ADDRESS", f"/proc/{uid}/environ"],
-                capture_output=True, text=True
-            )
-            for line in result.stdout.replace('\x00', '\n').splitlines():
-                if line.startswith("DBUS_SESSION_BUS_ADDRESS="):
-                    env["DBUS_SESSION_BUS_ADDRESS"] = line.split("=", 1)[1]
-                    break
-        except Exception:
-            pass
-        # Fallback: common socket path
-        if "DBUS_SESSION_BUS_ADDRESS" not in env:
-            uid = os.getuid()
-            env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+    title = "StudOn Sync Complete"
+    targets = _notification_open_targets(files or []) if n_downloaded else []
     try:
+        if targets and os.path.exists(_SYSTEM_PYTHON):
+            # The helper waits for the click and outlives this process
+            # (--daily-sync exits right after this call). It falls back to
+            # notify-send without buttons when PyGObject is missing.
+            subprocess.Popen(
+                [_SYSTEM_PYTHON, "-c", _NOTIFY_OPEN_PY, title, body, json.dumps(targets)],
+                env=_notify_env(), start_new_session=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return
         subprocess.run(
-            ["notify-send", "--app-name=StudOn Client", "--icon=emblem-downloads",
-             "StudOn Sync Complete", body],
-            env=env, timeout=5
+            ["notify-send", "--app-name=StudOn Client", "--icon=emblem-downloads", title, body],
+            env=_notify_env(), timeout=5,
         )
     except Exception as e:
         logger.debug(f"Desktop notification failed: {e}")
+
+
+# Sync notification with "Open" buttons, run under the system python3 for
+# PyGObject. notify-send 0.8.8 (Ubuntu 26.04) refuses --action on Plasma
+# ("Actions are not supported by this notifications server") although Plasma
+# lists the capability, so the helper talks to libnotify directly.
+# argv: title, body, JSON list of [label, path].
+_NOTIFY_OPEN_PY = r'''
+import json, subprocess, sys
+title, body, targets = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+try:
+    import gi
+    gi.require_version("Notify", "0.7")
+    from gi.repository import GLib, Notify
+except Exception:
+    subprocess.run(["notify-send", "--app-name=StudOn Client", "--icon=emblem-downloads", title, body])
+    sys.exit(0)
+
+Notify.init("StudOn Client")
+n = Notify.Notification.new(title, body, "emblem-downloads")
+loop = GLib.MainLoop()
+
+def opener(path):
+    def on_action(*_):
+        subprocess.Popen(["xdg-open", path], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        loop.quit()
+    return on_action
+
+for i, (label, path) in enumerate(targets):
+    n.add_action(f"open{i}", label, opener(path))
+if len(targets) == 1:
+    n.add_action("default", targets[0][0], opener(targets[0][1]))  # click on the body
+n.connect("closed", lambda *_: loop.quit())
+n.show()
+GLib.timeout_add_seconds(3600, loop.quit)
+loop.run()
+'''
+
+
+def _notification_open_targets(files: List[str]) -> List[Tuple[str, str]]:
+    """Buttons for the sync notification as (label, path) pairs.
+
+    One new file: open the file. Several in one folder: open that folder.
+    Two or three folders: one button per folder. More: their common parent.
+    Files that no longer exist (an extracted archive) are skipped.
+    """
+    paths = [os.path.abspath(f) for f in files if os.path.exists(f)]
+    if not paths:
+        return []
+    if len(paths) == 1:
+        return [("Open", paths[0])]
+    folders = list(dict.fromkeys(os.path.dirname(p) for p in paths))
+    if len(folders) == 1:
+        return [("Open folder", folders[0])]
+    if len(folders) <= 3:
+        return [(f"Open {os.path.basename(d)[:30]}", d) for d in folders]
+    return [("Open folder", os.path.commonpath(folders))]
 
 
 def _notify_env() -> dict:
