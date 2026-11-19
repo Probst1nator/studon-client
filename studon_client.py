@@ -145,6 +145,15 @@ class FirefoxCookieError(StudOnError):
         )
         self.original_error = original_error
 
+class BotCheckError(StudOnError):
+    """StudOn answered with its bot-protection page instead of the requested page."""
+    def __init__(self, url: str = ""):
+        super().__init__(
+            "Bot check — StudOn served its bot-protection page instead of the course"
+            + (f": {url}" if url else "."),
+            "Open StudOn in Firefox to see whether it loads there. Nothing was downloaded or changed."
+        )
+
 class NetworkError(StudOnError):
     """Network request failed."""
     def __init__(self, url: str, original_error: Exception):
@@ -945,10 +954,39 @@ def clean_filename(name: str) -> str:
         return ''
     return cleaned
 
+_BOT_CHECK_TITLE = re.compile(r"making sure you.{1,8}re not a bot", re.IGNORECASE)
+_bot_check_state = {"seen": False, "last_warned": 0.0}
+
+
+def _is_bot_check_page(html: Optional[str]) -> bool:
+    """True when a response is StudOn's bot-protection page, not an ILIAS page.
+
+    Since 2026-11-17 a course URL can answer HTTP 200 with a page titled
+    "Making sure you're not a bot!". It has no login redirect, so the session
+    checks pass, and its <h1> was once taken for the course title. A page that
+    carries the ILIAS page header is never treated as the bot check.
+    """
+    if not html or 'il-page-content-header' in html:
+        return False
+    return bool(_BOT_CHECK_TITLE.search(html)) or '/.within.website/' in html
+
+
+def _warn_bot_check(url: str) -> None:
+    """Log the bot-protection block, at most once per hour (the sync loops poll)."""
+    _bot_check_state["seen"] = True
+    now = time.time()
+    if now - _bot_check_state["last_warned"] >= 3600:
+        _bot_check_state["last_warned"] = now
+        logger.warning(
+            "StudOn serves its bot-protection page instead of the course (%s). "
+            "No sync until StudOn answers normally; a login does not fix this.", url[:80])
+
+
 def extract_course_title(page_url: str, session: requests.Session, debug: bool = False) -> Optional[str]:
     """
     Extracts the course title from a StudOn page.
     Tries multiple common StudOn HTML patterns to find the title.
+    Raises BotCheckError when StudOn serves its bot-protection page.
     """
     if not _url_host_matches(page_url, STUDON_DOMAIN):
         logger.warning(f"Refusing to fetch off-domain URL for course title: {page_url}")
@@ -956,6 +994,8 @@ def extract_course_title(page_url: str, session: requests.Session, debug: bool =
     try:
         response = session.get(page_url)
         response.raise_for_status()
+        if _is_bot_check_page(response.text):
+            raise BotCheckError(page_url)
         soup = BeautifulSoup(response.text, "html.parser")
 
         # Save HTML for debugging if requested
@@ -1028,6 +1068,8 @@ def extract_course_title(page_url: str, session: requests.Session, debug: bool =
             logger.debug("No title found with any strategy")
 
         return None
+    except BotCheckError:
+        raise
     except Exception as e:
         logger.error(f"Could not extract course title: {e}")
         if debug:
@@ -1473,6 +1515,10 @@ def discover_items_recursive(page_url: str, current_path: str, session: requests
     # Detect redirect to ILIAS login page — session expired or not logged in
     if 'ilstartupgui' in response.url or '/login.php' in response.url:
         raise StudOnError("Session expired — redirected to login page.", "Log into StudOn in Firefox and retry.")
+
+    # The bot-protection page has no items; without this the course would look empty.
+    if _is_bot_check_page(response.text):
+        raise BotCheckError(page_url)
 
     if debug:
         debug_file = os.path.join(DOWNLOAD_FOLDER, f"debug_discovery_{abs(hash(page_url)) % 10000}.html")
@@ -2251,6 +2297,10 @@ def can_access_studon() -> bool:
                     if 'login.php' in response.url or 'ilstartupgui' in response.url:
                         logger.debug(f"Redirected to login page for {url[:50]}")
                         continue
+                    if _is_bot_check_page(response.text):
+                        _warn_bot_check(url)
+                        return False  # HTTP 200, but not a course page
+                    _bot_check_state["seen"] = False
                     logger.debug(f"✓ Successfully accessed StudOn via: {url[:50]}...")
                     return True  # Valid login!
             except Exception:
@@ -2704,6 +2754,7 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
         total_git_failed = 0
         successful_courses = 0
         session_expired = False
+        bot_blocked = False
         all_downloaded_files: List[str] = []
 
         for i, (metadata_path, source_url, course_folder) in enumerate(metadata_files, 1):
@@ -2728,6 +2779,11 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
                     session_expired = True
                     print("  Stopping: session expired. Will retry after login.")
                     break
+                if isinstance(e, BotCheckError):
+                    # Every course gets the same page; the remaining ones are not tried.
+                    bot_blocked = True
+                    print("  Stopping: StudOn serves its bot-protection page. Nothing was changed.")
+                    break
                 continue
             except Exception as e:
                 print(f"  — error: {e}")
@@ -2736,6 +2792,8 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
 
         if session_expired:
             return False, 0, 0, True, []
+        if bot_blocked:
+            return False, 0, 0, False, []
 
         # Pull all git repos in the entire downloads folder (catches repos not inside any tracked course)
         git_pulled, git_failed = pull_git_repos(DOWNLOAD_FOLDER)
@@ -3013,13 +3071,24 @@ def _notify_login_required(login_url: str, attempt_key: str) -> None:
     if attempt_key == _login_prompt.get("last_key"):
         return  # already notified for this fetch attempt
     _login_prompt["last_key"] = attempt_key
+    if _bot_check_state["seen"]:
+        # Not a login problem: say so instead of asking for a login.
+        title, body, label = (
+            "StudOn blockiert den Abruf",
+            "StudOn zeigt dem Client seine Bot-Schutz-Seite. Sync pausiert, "
+            "ein Login behebt das nicht. Klicken öffnet StudOn in Firefox.",
+            "StudOn in Firefox öffnen")
+    else:
+        title, body, label = (
+            "StudOn-Login abgelaufen",
+            "Sync pausiert. Klicken zum Einloggen — verschwindet nach 2 Min "
+            "(oder das StudOn-Tray-Icon nutzen); der Sync holt danach automatisch nach.",
+            "In Firefox einloggen")
     try:
         proc = subprocess.Popen(
             _notify_actions_argv(
-                "StudOn-Login abgelaufen",
-                "Sync pausiert. Klicken zum Einloggen — verschwindet nach 2 Min "
-                "(oder das StudOn-Tray-Icon nutzen); der Sync holt danach automatisch nach.",
-                "dialog-password", 120000, [["login", "In Firefox einloggen", None]]),
+                title, body,
+                "dialog-password", 120000, [["login", label, None]]),
             env=_notify_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
     except Exception as e:

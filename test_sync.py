@@ -469,3 +469,62 @@ def test_notification_targets_several_folders(tmp_path):
 
 def test_notification_targets_skip_missing_files(tmp_path):
     assert s._notification_open_targets([str(tmp_path / "gone.zip")]) == []
+
+
+# --- The bot-protection page is not a course -------------------------------
+
+_BOT_PAGE = ("<html><head><title>Making sure you&#39;re not a bot!</title></head>"
+             '<body><h1 id="title">Making sure you&#39;re not a bot!</h1></body></html>')
+
+
+class _BotCheckSession:
+    """Answers every request with HTTP 200 and the bot-protection page."""
+
+    def __init__(self):
+        self.calls, self.cookies, self.headers = 0, {}, {}
+
+    def get(self, url, **kwargs):
+        self.calls += 1
+        page = _FakePage(url, _BOT_PAGE)
+        page.status_code = 200
+        return page
+
+
+def test_bot_check_page_is_recognised():
+    course = ('<html><body><h1 class="il-page-content-header">Werkstoffsimulation</h1>'
+              "<p>Forum: Making sure you're not a bot!</p></body></html>")
+    assert s._is_bot_check_page(_BOT_PAGE)
+    assert not s._is_bot_check_page(course)
+    assert not s._is_bot_check_page("")
+
+
+def test_bot_check_page_stops_the_sync_and_keeps_metadata(tmp_path, monkeypatch):
+    """Its <h1> was once written into every METADATA.md as the course title."""
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    folders = [_make_course(tmp_path, name) for name in ("Some Course", "Other Course")]
+    session = _BotCheckSession()
+
+    for call in (lambda: s.extract_course_title(COURSE_URL, session),
+                 lambda: s.discover_items_recursive(COURSE_URL, str(tmp_path), session, [])):
+        try:
+            call()
+        except s.BotCheckError:
+            pass
+        else:
+            raise AssertionError("the bot-protection page was taken for a course page")
+
+    session.calls = 0
+    assert s.update_all_courses(session=session) == (False, 0, 0, False, [])
+    assert session.calls == 1, "the remaining courses must not be tried"
+    assert [(f / "METADATA.md").read_text(encoding="utf-8") for f in folders] == ["", ""]
+
+
+def test_bot_check_page_is_not_a_valid_login(tmp_path, monkeypatch):
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    monkeypatch.setattr(s, "_bot_check_state", {"seen": False, "last_warned": 0.0})
+    monkeypatch.setattr(s.browser_cookie3, "firefox", lambda **kwargs: {})
+    monkeypatch.setattr(s.requests, "Session", _BotCheckSession)
+    _make_course(tmp_path, metadata="Last fetched: 2026-11-16 14:02:00\n")
+
+    assert s.can_access_studon() is False
+    assert s._bot_check_state["seen"] is True
