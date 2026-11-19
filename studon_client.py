@@ -3252,6 +3252,19 @@ def _last_sync_label(st):
     return "Letzter Sync: " + text
 
 
+def _hover_text(st, state):
+    """One line for the icon's hover text: the last and the next sync."""
+    human = st.get("last_sync_human")
+    parts = ["StudOn", "Letzter Sync: " + (str(human) if human else "noch keiner")]
+    if state == "waiting_login":
+        parts.append("Login erforderlich")
+    elif st.get("next_fire_human"):
+        parts.append("Naechster Sync: " + str(st.get("next_fire_human")))
+    else:
+        parts.append("Naechster Sync: nicht geplant")
+    return " | ".join(parts)
+
+
 class StudonTray:
     def __init__(self):
         self.ind = AppIndicator3.Indicator.new_with_path(
@@ -3260,6 +3273,7 @@ class StudonTray:
         self.ind.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
         self.ind.set_attention_icon_full(ICON_ATTENTION, "StudOn-Login erforderlich")
         self.ind.set_title("StudOn client")
+        self._hover = None
 
         self.menu = Gtk.Menu()
         self.status_item = Gtk.MenuItem(label="StudOn: ...")
@@ -3321,6 +3335,14 @@ class StudonTray:
             label = "StudOn: bereit"
         self.status_item.set_label(label)
         self.last_item.set_label(_last_sync_label(st))
+        # The indicator has no tooltip of its own; desktops show the title on hover.
+        hover = _hover_text(st, state)
+        if hover != self._hover:
+            self._hover = hover
+            try:
+                self.ind.set_title(hover)
+            except Exception:
+                pass
         self.login_item.set_sensitive(bool(st.get("login_url")))
         can_spawn = bool(st.get("venv_python") and st.get("script_path"))
         self.gui_item.set_sensitive(can_spawn)
