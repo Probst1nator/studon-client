@@ -151,7 +151,7 @@ class BotCheckError(StudOnError):
         super().__init__(
             "Bot check — StudOn served its bot-protection page instead of the course"
             + (f": {url}" if url else "."),
-            "Open StudOn in Firefox and log in, then retry. Nothing was downloaded or changed."
+            "Open StudOn in Firefox and log in, then retry. Nothing from this page was saved."
         )
 
 class NetworkError(StudOnError):
@@ -2246,6 +2246,9 @@ def can_access_studon() -> bool:
     Tries to access the 3 most recently updated courses.
     Returns True if any course is accessible.
     """
+    # The flag describes this probe only: an expired login after an earlier
+    # bot page must get the login prompt again.
+    _bot_check_state["seen"] = False
     try:
         # Load Firefox cookies
         cj = browser_cookie3.firefox(domain_name=STUDON_DOMAIN)
@@ -2782,7 +2785,8 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
                 if isinstance(e, BotCheckError):
                     # Every course gets the same page; the remaining ones are not tried.
                     bot_blocked = True
-                    print("  Stopping: StudOn serves its bot-protection page. Nothing was changed.")
+                    print("  Stopping: StudOn serves its bot-protection page. "
+                          "This course and the ones after it were not synced.")
                     break
                 continue
             except Exception as e:
@@ -2793,7 +2797,8 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
         if session_expired:
             return False, 0, 0, True, []
         if bot_blocked:
-            return False, 0, 0, False, []
+            # Courses before the blocked one may have downloaded files: report them.
+            return False, total_downloaded, total_extracted, False, all_downloaded_files
 
         # Pull all git repos in the entire downloads folder (catches repos not inside any tracked course)
         git_pulled, git_failed = pull_git_repos(DOWNLOAD_FOLDER)

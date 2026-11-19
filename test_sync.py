@@ -530,6 +530,25 @@ def test_bot_check_page_is_not_a_valid_login(tmp_path, monkeypatch):
     assert s._bot_check_state["seen"] is True
 
 
+def test_an_expired_login_after_a_bot_check_asks_for_the_login_again(tmp_path, monkeypatch):
+    """The flag describes the latest probe only."""
+
+    class _LoginRedirectSession(_BotCheckSession):
+        def get(self, url, **kwargs):
+            page = _FakePage("https://www.studon.fau.de/studon/login.php", "<html></html>")
+            page.status_code = 200
+            return page
+
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    monkeypatch.setattr(s, "_bot_check_state", {"seen": True, "last_warned": 0.0})
+    monkeypatch.setattr(s.browser_cookie3, "firefox", lambda **kwargs: {})
+    monkeypatch.setattr(s.requests, "Session", _LoginRedirectSession)
+    _make_course(tmp_path, metadata="Last fetched: 2026-11-16 14:02:00\n")
+
+    assert s.can_access_studon() is False
+    assert s._bot_check_state["seen"] is False
+
+
 def test_daily_sync_waits_for_firefox_on_the_bot_check_page(monkeypatch):
     """Handled like an expired login: one popup, the wait, then the sync goes on."""
     popups, probes, waits = [], [], []
