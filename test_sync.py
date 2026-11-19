@@ -573,3 +573,29 @@ def test_daily_sync_waits_for_firefox_on_the_bot_check_page(monkeypatch):
     s.run_daily_sync()
 
     assert (len(probes), len(popups), len(waits)) == (2, 1, 1)
+
+
+def test_daily_sync_announces_files_fetched_before_a_stopped_run(monkeypatch):
+    """A run that stops part-way reports its files once; the retry would not."""
+    notes, runs = [], []
+
+    def update():
+        runs.append(1)
+        return False, 2, 0, False, ["a.pdf", "b.pdf"]
+
+    monkeypatch.setattr(s, "can_access_studon", lambda: True)
+    monkeypatch.setattr(s, "check_platform_compatibility", lambda: None)
+    monkeypatch.setattr(s, "load_state", lambda: s.UpdateState(last_update=None))
+    monkeypatch.setattr(s, "was_updated_today", lambda state: False)
+    monkeypatch.setattr(s, "_write_tray_status", lambda **kwargs: None)
+    monkeypatch.setattr(s, "_dismiss_login_prompt", lambda: None)
+    monkeypatch.setattr(s, "_fleet_synced_today", lambda: bool(runs))  # ends the run on the retry
+    monkeypatch.setattr(s, "_acquire_sync_lock", lambda *args, **kwargs: True)
+    monkeypatch.setattr(s, "_release_sync_lock", lambda: None)
+    monkeypatch.setattr(s, "update_all_courses", update)
+    monkeypatch.setattr(s, "_send_desktop_notification", lambda n, e, files: notes.append((n, files)))
+    monkeypatch.setattr(s.time, "sleep", lambda seconds: None)
+
+    s.run_daily_sync()
+
+    assert (len(runs), notes) == (1, [(2, ["a.pdf", "b.pdf"])])

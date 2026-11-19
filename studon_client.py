@@ -2798,6 +2798,9 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
             return False, 0, 0, True, []
         if bot_blocked:
             # Courses before the blocked one may have downloaded files: report them.
+            if total_downloaded:
+                print(f"Before the stop: {total_downloaded} new "
+                      f"file{'s' if total_downloaded != 1 else ''} downloaded.")
             return False, total_downloaded, total_extracted, False, all_downloaded_files
 
         # Pull all git repos in the entire downloads folder (catches repos not inside any tracked course)
@@ -3869,6 +3872,10 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                     _record_tray_sync("Daily sync")
                     _send_desktop_notification(n_downloaded, n_extracted, downloaded_files)
                     return
+                if downloaded_files:
+                    # A run that stopped part-way still fetched these. The retry
+                    # finds them on disk and would never announce them.
+                    _send_desktop_notification(n_downloaded, n_extracted, downloaded_files)
             finally:
                 _release_sync_lock()
 
