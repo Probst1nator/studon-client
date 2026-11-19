@@ -530,17 +530,14 @@ def test_bot_check_page_is_not_a_valid_login(tmp_path, monkeypatch):
     assert s._bot_check_state["seen"] is True
 
 
-def test_daily_sync_gives_up_on_the_bot_check_page(monkeypatch):
-    """One popup, then the run ends: no login wait and no second request."""
-    popups, probes = [], []
+def test_daily_sync_waits_for_firefox_on_the_bot_check_page(monkeypatch):
+    """Handled like an expired login: one popup, the wait, then the sync goes on."""
+    popups, probes, waits = [], [], []
 
     def probe():
         probes.append(1)
-        s._bot_check_state["seen"] = True
-        return False
-
-    def no_wait(*args, **kwargs):
-        raise AssertionError("the daily sync must not wait or poll here")
+        s._bot_check_state["seen"] = len(probes) == 1
+        return len(probes) > 1
 
     monkeypatch.setattr(s, "_bot_check_state", {"seen": False, "last_warned": 0.0})
     monkeypatch.setattr(s, "can_access_studon", probe)
@@ -549,10 +546,11 @@ def test_daily_sync_gives_up_on_the_bot_check_page(monkeypatch):
     monkeypatch.setattr(s, "was_updated_today", lambda state: False)
     monkeypatch.setattr(s, "_get_first_course_url", lambda: COURSE_URL)
     monkeypatch.setattr(s, "_notify_login_required", lambda url, attempt_key: popups.append(attempt_key))
-    monkeypatch.setattr(s, "_wait_for_login_via_tray", no_wait)
-    monkeypatch.setattr(s, "_write_tray_status", no_wait)
-    monkeypatch.setattr(s.time, "sleep", no_wait)
+    monkeypatch.setattr(s, "_wait_for_login_via_tray", lambda url: waits.append(url) or True)
+    monkeypatch.setattr(s, "_write_tray_status", lambda **kwargs: None)
+    monkeypatch.setattr(s, "_dismiss_login_prompt", lambda: None)
+    monkeypatch.setattr(s, "_fleet_synced_today", lambda: True)  # ends the run after the wait
 
     s.run_daily_sync()
 
-    assert len(probes) == 1 and len(popups) == 1
+    assert (len(probes), len(popups), len(waits)) == (2, 1, 1)

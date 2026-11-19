@@ -151,7 +151,7 @@ class BotCheckError(StudOnError):
         super().__init__(
             "Bot check — StudOn served its bot-protection page instead of the course"
             + (f": {url}" if url else "."),
-            "Open StudOn in Firefox to see whether it loads there. Nothing was downloaded or changed."
+            "Open StudOn in Firefox and log in, then retry. Nothing was downloaded or changed."
         )
 
 class NetworkError(StudOnError):
@@ -979,7 +979,7 @@ def _warn_bot_check(url: str) -> None:
         _bot_check_state["last_warned"] = now
         logger.warning(
             "StudOn serves its bot-protection page instead of the course (%s). "
-            "No sync until StudOn answers normally; a login does not fix this.", url[:80])
+            "Open StudOn in Firefox and log in; the sync retries.", url[:80])
 
 
 def extract_course_title(page_url: str, session: requests.Session, debug: bool = False) -> Optional[str]:
@@ -3072,11 +3072,11 @@ def _notify_login_required(login_url: str, attempt_key: str) -> None:
         return  # already notified for this fetch attempt
     _login_prompt["last_key"] = attempt_key
     if _bot_check_state["seen"]:
-        # Not a login problem: say so instead of asking for a login.
+        # Name what StudOn answered; opening StudOn in Firefox is the way out here too.
         title, body, label = (
             "StudOn blockiert den Abruf",
-            "StudOn zeigt dem Client seine Bot-Schutz-Seite. Sync pausiert, "
-            "ein Login behebt das nicht. Klicken öffnet StudOn in Firefox.",
+            "StudOn zeigt dem Client seine Bot-Schutz-Seite. Sync pausiert. "
+            "StudOn in Firefox öffnen und einloggen, danach holt der Sync nach.",
             "StudOn in Firefox öffnen")
     else:
         title, body, label = (
@@ -3766,15 +3766,6 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                     login_url = _get_first_course_url()
                 except Exception:
                     pass
-                if _bot_check_state["seen"]:
-                    # A login does not help and polling would only repeat the
-                    # request: one popup, then this run ends.
-                    _notify_login_required(
-                        login_url, attempt_key=f"daily:{date.today().isoformat()}")
-                    logger.warning(
-                        "Daily sync: StudOn serves its bot-protection page; giving up "
-                        "for this run. Will retry on next @reboot.")
-                    return
                 if not waiting_logged:
                     logger.info(
                         "Daily sync: waiting for StudOn login (%s)",
@@ -4186,7 +4177,7 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
             if not can_access_studon():
                 login_url = course.source_url or f"https://{STUDON_DOMAIN}"
                 if _bot_check_state["seen"]:
-                    # Not a login problem: one popup per lecture window, no wait.
+                    # One popup per lecture window; the next fire retries.
                     _notify_login_required(
                         login_url,
                         attempt_key=(f"lecture:{os.path.basename(course.course_folder)}:"
