@@ -519,6 +519,31 @@ def test_bot_check_page_stops_the_sync_and_keeps_metadata(tmp_path, monkeypatch)
     assert [(f / "METADATA.md").read_text(encoding="utf-8") for f in folders] == ["", ""]
 
 
+def test_bot_check_after_a_synced_course_returns_that_course_s_files(tmp_path, monkeypatch):
+    """The run stops, but the files of the courses before the block are reported."""
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    for name in ("Some Course", "Other Course"):
+        _make_course(tmp_path, name)
+    calls = []
+
+    def process(url, session, folder, **kwargs):
+        calls.append(folder)
+        if len(calls) == 1:
+            return 1, 0, [os.path.join(folder, "new.pdf")]
+        raise s.BotCheckError(url)
+
+    def no_git_pull(folder):
+        raise AssertionError("a stopped run must not go on to the git pulls")
+
+    monkeypatch.setattr(s, "process_single_url", process)
+    monkeypatch.setattr(s, "pull_git_repos", no_git_pull)
+
+    result = s.update_all_courses(session=_BotCheckSession())
+
+    assert len(calls) == 2
+    assert result == (False, 1, 0, False, [os.path.join(calls[0], "new.pdf")])
+
+
 def test_bot_check_page_is_not_a_valid_login(tmp_path, monkeypatch):
     monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
     monkeypatch.setattr(s, "_bot_check_state", {"seen": False, "last_warned": 0.0})
