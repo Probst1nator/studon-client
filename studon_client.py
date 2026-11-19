@@ -961,10 +961,10 @@ _bot_check_state = {"seen": False, "last_warned": 0.0}
 def _is_bot_check_page(html: Optional[str]) -> bool:
     """True when a response is StudOn's bot-protection page, not an ILIAS page.
 
-    Since 2026-11-17 a course URL can answer HTTP 200 with a page titled
-    "Making sure you're not a bot!". It has no login redirect, so the session
-    checks pass, and its <h1> was once taken for the course title. A page that
-    carries the ILIAS page header is never treated as the bot check.
+    A course URL can answer HTTP 200 with a page titled "Making sure you're
+    not a bot!". It has no login redirect, so a check for the login page alone
+    passes, and its <h1> is not a course title. A page that carries the ILIAS
+    page header is never treated as the bot check.
     """
     if not html or 'il-page-content-header' in html:
         return False
@@ -3766,6 +3766,15 @@ def run_daily_sync(check_interval_seconds: int = 300) -> None:
                     login_url = _get_first_course_url()
                 except Exception:
                     pass
+                if _bot_check_state["seen"]:
+                    # A login does not help and polling would only repeat the
+                    # request: one popup, then this run ends.
+                    _notify_login_required(
+                        login_url, attempt_key=f"daily:{date.today().isoformat()}")
+                    logger.warning(
+                        "Daily sync: StudOn serves its bot-protection page; giving up "
+                        "for this run. Will retry on next @reboot.")
+                    return
                 if not waiting_logged:
                     logger.info(
                         "Daily sync: waiting for StudOn login (%s)",
@@ -4176,6 +4185,16 @@ def run_lecture_sync(once: bool = False, tray_wait_seconds: int = 120) -> None:
 
             if not can_access_studon():
                 login_url = course.source_url or f"https://{STUDON_DOMAIN}"
+                if _bot_check_state["seen"]:
+                    # Not a login problem: one popup per lecture window, no wait.
+                    _notify_login_required(
+                        login_url,
+                        attempt_key=(f"lecture:{os.path.basename(course.course_folder)}:"
+                                     f"{lecture_start.isoformat()}"))
+                    logger.info(
+                        f"Lecture sync: StudOn serves its bot-protection page at fire "
+                        f"{fire_time.isoformat()}; skipping this fire.")
+                    continue
                 _write_tray_status(state="waiting_login", login_url=login_url)
                 logger.info(
                     f"Lecture sync: not logged in at fire {fire_time.isoformat()}; "
@@ -4481,7 +4500,10 @@ def run_discover_from_timetable(debug: bool = False) -> None:
             continue
 
         # Pin the verbatim timetable title onto the freshly-created course.
-        course_title = extract_course_title(final_url, studon_session, debug=debug)
+        try:
+            course_title = extract_course_title(final_url, studon_session, debug=debug)
+        except BotCheckError:
+            course_title = None
         if course_title:
             meta_path = os.path.join(DOWNLOAD_FOLDER, course_title, "METADATA.md")
             if os.path.exists(meta_path):
@@ -8243,7 +8265,11 @@ def run_add_courses(targets: List[str], fetch: bool = True) -> None:
             continue
         source_url = course_url(ref_id)
         # Same title source as process_single_url, so the background fetch lands in this folder.
-        course_title = extract_course_title(source_url, session)
+        try:
+            course_title = extract_course_title(source_url, session)
+        except BotCheckError as e:
+            print(e)
+            return
         if not course_title:
             print(f"❌ {ref_id}: could not read the course title.")
             continue
@@ -9513,4 +9539,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BotCheckError as e:
+        print(e)
+        sys.exit(1)
