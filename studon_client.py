@@ -2794,14 +2794,12 @@ def update_all_courses(debug: bool = False, session: Optional[requests.Session] 
                 logger.error(f"Error processing {source_url}: {e}")
                 continue
 
-        if session_expired:
-            return False, 0, 0, True, []
-        if bot_blocked:
-            # Courses before the blocked one may have downloaded files: report them.
+        if session_expired or bot_blocked:
+            # Courses before the stop may have downloaded files: report them.
             if total_downloaded:
                 print(f"Before the stop: {total_downloaded} new "
                       f"file{'s' if total_downloaded != 1 else ''} downloaded.")
-            return False, total_downloaded, total_extracted, False, all_downloaded_files
+            return False, total_downloaded, total_extracted, session_expired, all_downloaded_files
 
         # Pull all git repos in the entire downloads folder (catches repos not inside any tracked course)
         git_pulled, git_failed = pull_git_repos(DOWNLOAD_FOLDER)

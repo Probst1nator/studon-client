@@ -544,6 +544,26 @@ def test_bot_check_after_a_synced_course_returns_that_course_s_files(tmp_path, m
     assert result == (False, 1, 0, False, [os.path.join(calls[0], "new.pdf")])
 
 
+def test_expired_login_after_a_synced_course_returns_that_course_s_files(tmp_path, monkeypatch):
+    """Same as the bot check: the files fetched before the stop are reported."""
+    monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
+    for name in ("Some Course", "Other Course"):
+        _make_course(tmp_path, name)
+    calls = []
+
+    def process(url, session, folder, **kwargs):
+        calls.append(folder)
+        if len(calls) == 1:
+            return 1, 0, [os.path.join(folder, "new.pdf")]
+        raise s.StudOnError("Session expired — redirected to login page.")
+
+    monkeypatch.setattr(s, "process_single_url", process)
+
+    result = s.update_all_courses(session=_BotCheckSession())
+
+    assert result == (False, 1, 0, True, [os.path.join(calls[0], "new.pdf")])
+
+
 def test_bot_check_page_is_not_a_valid_login(tmp_path, monkeypatch):
     monkeypatch.setattr(s, "DOWNLOAD_FOLDER", str(tmp_path))
     monkeypatch.setattr(s, "_bot_check_state", {"seen": False, "last_warned": 0.0})
